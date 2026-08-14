@@ -97,11 +97,11 @@ The launcher is a compact, draggable utility button with a generic usage/activit
 
 The expanded panel is approximately 400px wide with `max-width: calc(100vw - 24px)` and a `max-height` near 70vh. It stays within the viewport after dragging. Its structure is:
 
-1. Header: `用量与额度`, update/status text, refresh, and collapse controls.
+1. Header: `用量与额度`, update/status text, refresh, official Analytics icon, conditionally discovered official Usage icon, and collapse control.
 2. Compact account summary: identity and plan badge in one block, with no redundant full-width “signed in” row.
 3. Quota windows: primary and additional windows, percentages when known, progress, reset time, countdown, and state.
 4. Analytics: selected range, metric summary, client distribution, and a native CSS/SVG daily trend.
-5. Footer actions: refresh settings and official links at secondary priority.
+5. Footer: diagnostics and necessary explanatory notices only; automatic refresh is fixed at five minutes and has no settings UI.
 6. Diagnostics: collapsed by default and safe to copy.
 
 The panel should use a small number of clear sections rather than a stack of visually heavy cards. A two-column metric grid is preferred for compact statistics; it may collapse to one column when the available width requires it.
@@ -109,16 +109,16 @@ The panel should use a small number of clear sections rather than a stack of vis
 ## Components
 
 - **Launcher:** generic usage/gauge/activity icon, `currentColor`, `viewBox="0 0 24 24"`, round line caps and joins, plus a text-accessible status label.
-- **Header:** one clear title, a low-emphasis update state, and icon buttons with accessible names.
+- **Header:** one clear title, a low-emphasis update state, manual refresh, official Analytics, conditionally discovered official Usage, and collapse; every icon control has an accessible name.
 - **Account summary:** display name and masked email together when available; show a plan badge beside that identity; omit missing fields rather than leaving blank rows.
 - **Quota window:** name, primary/additional context, used and remaining values, progressbar, reset information, and textual state.
 - **Badge and indicator:** compact semantic status, never status by color alone.
 - **Metric grid:** Tokens, Credits, Threads, and Turns first; token subtypes and date count are secondary detail.
 - **Client distribution:** client name, token share, and a compact secondary metrics line; avoid an unreadable sentence of equal-weight numbers.
-- **Daily trend:** native CSS or SVG only, with useful hover/focus descriptions and a clear zero/empty state; no charting dependency.
+- **Daily trend:** native CSS only; each bar is the actual Analytics value for one UTC date bucket, with a custom Tooltip for hover, focus, and touch that preserves Credits precision and does not estimate missing dates as zero.
 - **Range selector:** compact keyboard-operable control for current cycle, month, 7 days, 30 days, and custom.
 - **Custom date editor:** native date inputs with labels, inclusive end-date language, inline validation, apply/cancel, and an `aria-live` error region.
-- **Footer and diagnostics:** low-priority links/settings and a safe, collapsed diagnostic disclosure.
+- **Footer and diagnostics:** necessary explanatory notices and a safe, collapsed diagnostic disclosure; no settings or official-link footer.
 
 ## Theme behavior
 
@@ -167,6 +167,10 @@ Use only generic activity, usage, gauge, chart, refresh, settings, and collapse 
 - Requesting analytics once per day or once per range bucket; one requested range must not become a per-day request loop.
 - Showing empty metric cards, fabricated percentages, or a gray “completed” bar when the source value is unknown.
 - Making hover the only way to discover status, controls, or explanations.
+- Destroying panel scroll position when the selected analytics range or loading state changes.
+- Adding `totals` and top-level fields from the same API object instead of applying field-level fallback.
+- Relying on the native `title` attribute as the only daily trend value display.
+- Repeating official links or automatic-refresh settings in a bottom footer.
 - Using a large primary “manual refresh” block that competes with account and quota data.
 - Building a custom calendar, adding a chart library, adding a remote dependency, or introducing a broad permission solely for visual polish.
 - Depending only on `prefers-color-scheme`, creating a new host on each theme change, or attaching duplicate listeners during SPA navigation.

@@ -25,11 +25,11 @@ The compact view is only an icon with an optional health dot; it does not show t
 - optional Credits and spend-control fields only when the server supplies values, without treating missing or `null` values as zero;
 - current quota period, month, last 7 days, and last 30 days, including credits, token classes, threads, turns, and dates with data;
 - client aggregates sorted by tokens and a native CSS bar chart for the selected daily metric;
-- a manual refresh, minute-based refresh selection, official Analytics link, conditionally discovered official Usage link, and safe diagnostics.
+- a manual refresh, fixed five-minute refresh, title-bar links to official Analytics and conditionally discovered official Usage, and safe diagnostics.
 
 ## UI design and product boundary
 
-The launcher is a 44–48px draggable utility button with a generic usage/activity inline SVG, a subtle border and shadow, and a status indicator. A small pointer movement does not open the panel after a drag. The expanded panel uses the local `wt-` design tokens, a compact account summary, quota-window sections, analytics, secondary actions, and collapsed diagnostics. It is sized for approximately 400px while remaining usable at narrow viewports.
+The launcher is a 44–48px draggable utility button with a generic usage/activity inline SVG, a subtle border and shadow, and a status indicator. A small pointer movement does not open the panel after a drag. The expanded panel uses the local `wt-` design tokens, a compact account summary, quota-window sections, analytics, title-bar icon actions, and collapsed diagnostics. It is sized for approximately 400px while remaining usable at narrow viewports.
 
 The visual direction is a local adaptation of public [OpenAI Apps SDK UI](DESIGN.md#official-references) patterns. This is an unofficial userscript, not an OpenAI, ChatGPT, or Codex product. It does not use the OpenAI Logo, Blossom, wordmark, or other OpenAI marks; launcher icons are generic usage/activity symbols. See [`DESIGN.md`](DESIGN.md) for the complete site-level specification.
 
@@ -48,7 +48,7 @@ The display mapping keeps product labels readable without treating a plan label 
 
 ## Analytics ranges and privacy boundary
 
-Analytics supports the current cycle, current month, last 7 days, last 30 days, and a custom range. The 7-day range means today plus the previous 6 UTC calendar days; the 30-day range means today plus the previous 29 UTC calendar days. Each range therefore contains at most 7 or 30 UTC date buckets, respectively.
+Analytics supports the current cycle, current month, last 7 days, last 30 days, and a custom range. The 7-day range means today plus the previous 6 UTC calendar days; the 30-day range means today plus the previous 29 UTC calendar days. Each range therefore contains at most 7 or 30 UTC date buckets, respectively. Each daily trend bar is the actual aggregate returned for one UTC date bucket by ChatGPT Analytics; the data may be delayed and is not a real-time streaming counter. Hover, keyboard focus, or touch reveals the date, metric, and unestimated value. Missing dates are not inserted as zeroes.
 
 Custom dates use UTC date buckets and an inclusive UI end date: `2026-08-01 — 2026-08-14` includes August 14. The request boundary converts that end date to the next UTC date for exclusive filtering. A custom range must be valid, must not end in the future, and is limited to a maximum of 366 days as a project-side defensive limit, not an OpenAI API limit.
 
@@ -56,13 +56,13 @@ Daily analytics rows and derived client/metric aggregates are kept in memory onl
 
 ## Privacy and security
 
-The script only sends requests to `chatgpt.com`. It does not upload account or usage data, add telemetry, call third-party services, or perform account mutations. It does not persist tokens, cookies, account IDs, session objects, email addresses, usernames, raw payloads, or usage snapshots. Only non-sensitive UI preferences are saved: panel position, collapsed state, selected range, refresh interval, email visibility, chart metric, and custom start/end dates. Authentication values are never placed in the DOM, console, clipboard, or error text.
+The script only sends requests to `chatgpt.com`. It does not upload account or usage data, add telemetry, call third-party services, or perform account mutations. It does not persist tokens, cookies, account IDs, session objects, email addresses, usernames, raw payloads, or usage snapshots. Only non-sensitive UI preferences are saved: panel position, collapsed state, selected range, email visibility, chart metric, and custom start/end dates. Refresh is always fixed at five minutes and has no saved setting. Authentication values are never placed in the DOM, console, clipboard, or error text.
 
 ## Known limitations
 
 - `/backend-api/wham/*` is an internal ChatGPT interface and may change without notice. Unknown fields are ignored and recognized fields remain best-effort.
 - `plan_type` is a plan label, not proof of the complete billing or subscription lifecycle. The panel does not infer subscription validity from a plan name.
-- Analytics data may be delayed or unavailable for an account or plan. Daily aggregation uses UTC date buckets where possible.
+- Analytics data may be delayed or unavailable for an account or plan. Daily aggregation uses UTC date buckets where possible; the trend does not estimate or interpolate values.
 - When a current quota period is represented as daily rows, the reset day can include data from outside the exact quota boundary.
 - Percentages are shown only when supplied or safely derived from the other percentage; unknown percentages use an empty track and an explicit notice rather than a fabricated grey fill. The script does not invent an official total quota, message count, or token total.
 - A real signed-in browser session is required for live account data. This repository validation cannot guarantee access to a user's private ChatGPT session.
@@ -77,8 +77,9 @@ On a disposable browser profile or a signed-in ChatGPT session, verify:
 4. Light and dark themes, narrow viewports, keyboard focus, reduced motion, and screen-reader labels remain usable.
 5. Signed-out, 401/403, 404, 429, timeout, empty-analytics, and partial-schema states remain understandable.
 6. A usage response with missing, `null`, unknown, snake_case, camelCase, single-window, array, object, and additional-window shapes renders without an uncaught exception.
-7. Analytics ranges and client aggregates derive from one daily request, and the official Analytics link works.
-8. The console and copied diagnostics contain no token, cookie, account ID, raw response, or full email.
+7. Analytics ranges and client aggregates derive from one daily request, the daily trend Tooltip matches the returned row value, and the title-bar Analytics link works.
+8. The title bar shows Usage only when a safe same-origin Usage URL is discovered; no footer settings/link block is rendered.
+9. The console and copied diagnostics contain no token, cookie, account ID, raw response, or full email.
 
 ## Maintenance notes
 

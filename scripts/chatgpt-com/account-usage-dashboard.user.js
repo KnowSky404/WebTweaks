@@ -2,7 +2,7 @@
 // @name         ChatGPT Account Usage Dashboard
 // @name:zh-CN   ChatGPT 账户用量浮窗
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.2.0
+// @version      1.2.1
 // @description  Display the current ChatGPT account plan, Codex limits, credits, and usage analytics in a private floating dashboard.
 // @description:zh-CN 在 ChatGPT 页面显示当前账号套餐、Codex 额度、Credits 与使用统计。
 // @author       KnowSky404
@@ -18,15 +18,17 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.2.0';
+  const VERSION = '1.2.1';
   const HOST_ID = 'wt-chatgpt-account-usage-host';
   const SESSION_ENDPOINT = '/api/auth/session';
   const USAGE_ENDPOINT = '/backend-api/wham/usage';
   const ANALYTICS_ENDPOINT = '/backend-api/wham/analytics/daily-workspace-usage-counts';
   const ANALYTICS_URL = 'https://chatgpt.com/codex/cloud/settings/analytics';
   const REQUEST_TIMEOUT_MS = 8000;
-  const REFRESH_OPTIONS = [0, 60_000, 300_000, 600_000, 1_800_000];
+  const AUTO_REFRESH_INTERVAL_MS = 300_000;
+  const LEGACY_REFRESH_PREF_KEY = 'wt-chatgpt-account-usage:refresh-interval';
   const MAX_CUSTOM_RANGE_DAYS = 366;
+  const METRIC_KEYS = Object.freeze(['credits', 'tokens', 'cachedInputTokens', 'uncachedInputTokens', 'outputTokens', 'threads', 'turns']);
   // OpenAI Codex exposes ProLite and Pro plan types; this product surface names them Pro 5X and Pro 20X.
   // These are tier names, not a quota calculator. The server window remains authoritative.
   const PLAN_DISPLAY = Object.freeze({
@@ -54,7 +56,6 @@
     position: 'wt-chatgpt-account-usage:position',
     collapsed: 'wt-chatgpt-account-usage:collapsed',
     range: 'wt-chatgpt-account-usage:range',
-    refresh: 'wt-chatgpt-account-usage:refresh-interval',
     email: 'wt-chatgpt-account-usage:show-email',
     metric: 'wt-chatgpt-account-usage:chart-metric',
     customStart: 'wt-chatgpt-account-usage:custom-start',
@@ -64,7 +65,6 @@
     position: null,
     collapsed: true,
     range: 'cycle',
-    refresh: 300_000,
     email: true,
     metric: 'tokens',
     customStart: null,
@@ -89,7 +89,12 @@
     originalReplaceState: null,
     visibilityHandler: null,
     analyticsPromise: null,
-    lastUsageHeaders: {}
+    lastUsageHeaders: {},
+    ui: {
+      panelSession: 0,
+      pendingPanelState: null,
+      tooltipTimer: null
+    }
   };
 
   function createInitialState() {
@@ -232,11 +237,6 @@
     return seconds ? `还有 ${formatDuration(seconds)}` : '即将重置';
   }
 
-  function formatRefresh(value) {
-    if (!value) return '关闭';
-    return `${Math.round(value / 60_000)} 分钟`;
-  }
-
   function dateKeyUTC(timestamp) {
     const date = new Date(timestamp);
     return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
@@ -293,8 +293,18 @@
 
   function mergeMetricValues(left, right) {
     const result = {};
-    for (const key of ['credits', 'tokens', 'cachedInputTokens', 'uncachedInputTokens', 'outputTokens', 'threads', 'turns']) {
+    for (const key of METRIC_KEYS) {
       result[key] = sumOptional([left && left[key], right && right[key]]);
+    }
+    return result;
+  }
+
+  function coalesceMetricValues(primary, fallback) {
+    const result = {};
+    for (const key of METRIC_KEYS) {
+      result[key] = primary?.[key] !== null && primary?.[key] !== undefined
+        ? primary[key]
+        : fallback?.[key] ?? null;
     }
     return result;
   }
@@ -303,7 +313,7 @@
     const source = isRecord(value) ? value : {};
     const metrics = {
       credits: numberOrNull(firstDefined(source, ['credits', 'total_credits', 'totalCredits'])),
-      tokens: numberOrNull(firstDefined(source, ['tokens', 'total_tokens', 'totalTokens'])),
+      tokens: numberOrNull(firstDefined(source, ['tokens', 'total_tokens', 'totalTokens', 'text_total_tokens', 'textTotalTokens'])),
       cachedInputTokens: numberOrNull(firstDefined(source, ['cached_input_tokens', 'cachedInputTokens', 'cached_text_input_tokens'])),
       uncachedInputTokens: numberOrNull(firstDefined(source, ['uncached_input_tokens', 'uncachedInputTokens', 'uncached_text_input_tokens'])),
       outputTokens: numberOrNull(firstDefined(source, ['output_tokens', 'outputTokens', 'text_output_tokens'])),
@@ -333,13 +343,21 @@
     }
   }
 
+  function removePreference(key) {
+    try {
+      localStorage.removeItem(key);
+    } catch (_error) {
+      // Private browsing and disabled storage are valid environments.
+    }
+  }
+
   function loadPreferences() {
+    removePreference(LEGACY_REFRESH_PREF_KEY);
     const position = readPreference(PREF_KEYS.position, DEFAULT_PREFS.position);
     return {
       position: isRecord(position) && numberOrNull(position.left) !== null && numberOrNull(position.top) !== null ? position : null,
       collapsed: readPreference(PREF_KEYS.collapsed, DEFAULT_PREFS.collapsed) !== false,
       range: RANGE_OPTIONS.includes(readPreference(PREF_KEYS.range, DEFAULT_PREFS.range)) ? readPreference(PREF_KEYS.range, DEFAULT_PREFS.range) : DEFAULT_PREFS.range,
-      refresh: REFRESH_OPTIONS.includes(numberOrNull(readPreference(PREF_KEYS.refresh, DEFAULT_PREFS.refresh))) ? numberOrNull(readPreference(PREF_KEYS.refresh, DEFAULT_PREFS.refresh)) : DEFAULT_PREFS.refresh,
       email: readPreference(PREF_KEYS.email, DEFAULT_PREFS.email) !== false,
       metric: readPreference(PREF_KEYS.metric, DEFAULT_PREFS.metric) === 'credits' ? 'credits' : 'tokens',
       customStart: typeof readPreference(PREF_KEYS.customStart, DEFAULT_PREFS.customStart) === 'string' ? readPreference(PREF_KEYS.customStart, DEFAULT_PREFS.customStart) : null,
@@ -622,10 +640,10 @@
       if (!isRecord(item)) return null;
       const rawDate = firstDefined(item, ['date', 'day', 'usage_date', 'usageDate']);
       const date = typeof rawDate === 'string' && /^\d{4}-\d{2}-\d{2}/.test(rawDate) ? rawDate.slice(0, 10) : dateKeyUTC(parseTimestamp(rawDate));
-      const totals = mergeMetricValues(normalizeMetrics(firstDefined(item, ['totals', 'total'])), normalizeMetrics(item));
+      const totals = coalesceMetricValues(normalizeMetrics(firstDefined(item, ['totals', 'total'])), normalizeMetrics(item));
       const clients = asArray(firstDefined(item, ['clients', 'client_usage', 'clientUsage'])).map((client) => {
         if (!isRecord(client)) return null;
-        return { clientId: String(firstDefined(client, ['client_id', 'clientId', 'id', 'name']) || 'UNKNOWN'), metrics: mergeMetricValues(normalizeMetrics(firstDefined(client, ['totals', 'total'])), normalizeMetrics(client)) };
+        return { clientId: String(firstDefined(client, ['client_id', 'clientId', 'id', 'name']) || 'UNKNOWN'), metrics: coalesceMetricValues(normalizeMetrics(firstDefined(client, ['totals', 'total'])), normalizeMetrics(client)) };
       }).filter(Boolean);
       return date ? { date, metrics: totals, clients } : null;
     }).filter(Boolean);
@@ -1028,7 +1046,7 @@
     const range = analytics.ranges[runtime.prefs.range] || analytics.ranges[analytics.lastGoodRange] || analytics.ranges['30d'];
     if (analytics.loading) node.append(el('p', 'wt-notice wt-notice-info', '正在读取所选日期范围，当前统计仍可使用。'));
     if (analytics.error) {
-      node.append(el('p', 'wt-notice wt-notice-warning', analytics.error), linkButton(ANALYTICS_URL, '打开官方 Analytics'));
+      node.append(el('p', 'wt-notice wt-notice-warning', `${analytics.error}；可通过标题栏 Analytics 图标查看官方页面。`));
       if (!range?.stats) return node;
     }
     if (!range || !range.stats || (!analytics.dailyRows.length && !analytics.loading)) {
@@ -1156,21 +1174,114 @@
       return wrapper;
     }
     const max = Math.max(...values.map((item) => item.value), 1);
-    const chart = el('div', 'wt-chart');
+    const metricLabel = runtime.prefs.metric === 'credits' ? 'Credits' : 'Tokens';
+    const chartShell = el('div', 'wt-chart-shell');
+    const chart = el('div', 'wt-chart-scroll');
+    const tooltip = setAttributes(el('div', 'wt-chart-tooltip'), { role: 'tooltip', hidden: 'true', 'aria-hidden': 'true' });
+    const tooltipDate = el('span', 'wt-chart-tooltip-date');
+    const tooltipValue = el('strong', 'wt-chart-tooltip-value');
+    tooltip.append(tooltipDate, tooltipValue);
+
+    const hideTooltip = () => {
+      if (runtime.ui.tooltipTimer) {
+        clearTimeout(runtime.ui.tooltipTimer);
+        runtime.ui.tooltipTimer = null;
+      }
+      tooltip.hidden = true;
+      tooltip.setAttribute('aria-hidden', 'true');
+    };
+    const showTooltip = (column, temporary = false) => {
+      if (runtime.ui.tooltipTimer) clearTimeout(runtime.ui.tooltipTimer);
+      tooltipDate.textContent = column.dataset.tooltipDate || '';
+      tooltipValue.textContent = column.dataset.tooltipValue || '';
+      tooltip.hidden = false;
+      tooltip.setAttribute('aria-hidden', 'false');
+      const columnRect = column.getBoundingClientRect();
+      const shellRect = chartShell.getBoundingClientRect();
+      const gap = 8;
+      let left = columnRect.left - shellRect.left + columnRect.width / 2;
+      let top = columnRect.top - shellRect.top - gap;
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${top}px`;
+      tooltip.style.transform = 'translate(-50%, -100%)';
+      const halfWidth = tooltip.offsetWidth / 2;
+      left = Math.max(halfWidth + 4, Math.min(shellRect.width - halfWidth - 4, left));
+      if (top - tooltip.offsetHeight < 4) {
+        top = columnRect.bottom - shellRect.top + gap;
+        tooltip.style.transform = 'translateX(-50%)';
+      }
+      top = Math.max(4, Math.min(shellRect.height - tooltip.offsetHeight - 4, top));
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${top}px`;
+      if (temporary) runtime.ui.tooltipTimer = setTimeout(hideTooltip, 2200);
+    };
+
     for (const item of values) {
       const column = el('div', 'wt-chart-column');
+      const formattedValue = formatChartMetricValue(runtime.prefs.metric, item.value);
+      setAttributes(column, {
+        tabindex: 0,
+        role: 'img',
+        'aria-label': `${item.date}，${metricLabel} ${formattedValue}`,
+        'data-tooltip-date': item.date,
+        'data-tooltip-value': `${metricLabel} ${formattedValue}`
+      });
       const bar = el('div', 'wt-chart-bar');
       bar.style.height = `${Math.max(3, item.value / max * 100)}%`;
-      bar.title = `${item.date}: ${formatNumber(item.value)}`;
       column.append(bar, el('span', 'wt-chart-label', item.date.slice(5)));
+      column.addEventListener('pointerenter', () => showTooltip(column));
+      column.addEventListener('pointerleave', hideTooltip);
+      column.addEventListener('focus', () => showTooltip(column));
+      column.addEventListener('blur', hideTooltip);
+      column.addEventListener('click', () => showTooltip(column, true));
+      column.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        event.preventDefault();
+        hideTooltip();
+      });
       chart.append(column);
     }
-    wrapper.append(chart);
+    chart.addEventListener('scroll', hideTooltip, { passive: true });
+    chartShell.addEventListener('click', (event) => {
+      if (!event.target.closest?.('.wt-chart-column')) hideTooltip();
+    });
+    chartShell.append(chart, tooltip);
+    wrapper.append(chartShell);
     return wrapper;
   }
 
-  function linkButton(href, label) {
-    return setAttributes(el('a', 'wt-link', label), { href, target: '_blank', rel: 'noopener noreferrer' });
+  function formatChartMetricValue(metric, value) {
+    const number = numberOrNull(value);
+    if (number === null) return '未提供';
+    return new Intl.NumberFormat('zh-CN', {
+      maximumFractionDigits: metric === 'credits' ? 6 : 0,
+      minimumFractionDigits: 0,
+      useGrouping: true
+    }).format(metric === 'credits' ? number : Math.round(number));
+  }
+
+  function analyticsIcon() {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    setAttributes(svg, { viewBox: '0 0 24 24', 'aria-hidden': 'true', focusable: 'false' });
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    setAttributes(path, { d: 'M4 19V5m0 14h16M7 16v-5m4 5V8m4 8v-3m4 3V4', fill: 'none', stroke: 'currentColor', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'stroke-width': '1.7' });
+    svg.append(path);
+    return svg;
+  }
+
+  function officialUsageIcon() {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    setAttributes(svg, { viewBox: '0 0 24 24', 'aria-hidden': 'true', focusable: 'false' });
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    setAttributes(path, { d: 'M5 5h6v2H7v10h10v-4h2v6H5V5Zm8 0h6v6h-2V8.41l-6.29 6.3-1.42-1.42L15.59 7H13V5Z', fill: 'currentColor' });
+    svg.append(path);
+    return svg;
+  }
+
+  function officialLink(href, label, icon) {
+    const link = setAttributes(el('a', 'wt-icon-button wt-header-link'), { href, target: '_blank', rel: 'noopener noreferrer', 'aria-label': label, title: label });
+    link.append(icon());
+    return link;
   }
 
   function findOfficialUsageHref() {
@@ -1272,10 +1383,14 @@
     const refreshButton = setAttributes(el('button', `wt-icon-button${refreshBusy ? ' wt-icon-button-loading' : ''}`), { type: 'button', 'aria-label': '刷新账户用量', title: refreshBusy ? '正在刷新账户用量' : '刷新账户用量', 'aria-busy': refreshBusy, disabled: refreshBusy ? 'true' : null });
     refreshButton.append(refreshIcon());
     refreshButton.dataset.action = 'refresh';
+    controls.append(refreshButton);
+    controls.append(officialLink(ANALYTICS_URL, '打开官方 Analytics', analyticsIcon));
+    const usageHref = findOfficialUsageHref();
+    if (usageHref) controls.append(officialLink(usageHref, '打开官方 Usage', officialUsageIcon));
     const toggle = setAttributes(el('button', 'wt-icon-button'), { type: 'button', 'aria-label': '收起账户用量面板', title: '收起账户用量面板', 'aria-expanded': 'true' });
     toggle.append(el('span', 'wt-close-icon', '×'));
     toggle.dataset.action = 'toggle';
-    controls.append(refreshButton, toggle);
+    controls.append(toggle);
     header.append(title, controls);
     shell.append(header);
     const body = el('div', 'wt-body');
@@ -1291,29 +1406,87 @@
       if (credits) body.append(credits);
       body.append(renderAnalytics(runtime.state.data));
     }
-    const actions = el('section', 'wt-footer-settings');
-    const settings = el('details', 'wt-settings');
-    settings.append(el('summary', '设置与链接'));
-    const refresh = el('div', 'wt-action-row');
-    const refreshSelect = setAttributes(el('select', 'wt-select'), { 'aria-label': '自动刷新间隔' });
-    for (const value of REFRESH_OPTIONS) { const option = setAttributes(el('option', '', `自动刷新：${formatRefresh(value)}`), { value }); option.selected = runtime.prefs.refresh === value; refreshSelect.append(option); }
-    refreshSelect.addEventListener('change', () => { runtime.prefs.refresh = Number(refreshSelect.value); writePreference(PREF_KEYS.refresh, runtime.prefs.refresh); scheduleRefresh(); });
-    refresh.append(el('span', 'wt-settings-label', '自动刷新'), refreshSelect); settings.append(refresh);
-    settings.append(linkButton(ANALYTICS_URL, '打开官方 Analytics'));
-    const usageHref = findOfficialUsageHref(); if (usageHref) settings.append(linkButton(usageHref, '打开官方 Usage'));
-    actions.append(settings);
-    body.append(actions, renderDiagnostics());
+    body.addEventListener('scroll', () => {
+      const tooltip = runtime.shadow?.querySelector('.wt-chart-tooltip');
+      if (tooltip) {
+        tooltip.hidden = true;
+        tooltip.setAttribute('aria-hidden', 'true');
+      }
+    }, { passive: true });
+    body.append(renderDiagnostics());
     shell.append(body);
     return shell;
   }
 
+  function captureExpandedPanelState() {
+    const body = runtime.shadow?.querySelector('.wt-body');
+    if (!body || runtime.host?.getAttribute('data-wt-mode') !== 'expanded') return null;
+    const active = runtime.shadow.activeElement;
+    let focus = null;
+    if (active && body.contains(active)) {
+      if (active.dataset.range) focus = { type: 'range', value: active.dataset.range };
+      else if (active.dataset.action) focus = { type: 'action', value: active.dataset.action };
+      else if (active.classList.contains('wt-chart-select')) focus = { type: 'metric', value: active.value };
+      else if (active.name) focus = { type: 'name', value: active.name };
+      else if (active.tagName === 'SUMMARY') focus = { type: 'summary' };
+    }
+    return {
+      session: runtime.ui.panelSession,
+      scrollTop: body.scrollTop,
+      focus,
+      details: [...body.querySelectorAll('details')].map((detail) => detail.open)
+    };
+  }
+
+  function restoreExpandedPanelState(state) {
+    if (!state || state.session !== runtime.ui.panelSession || runtime.prefs.collapsed) return;
+    const body = runtime.shadow?.querySelector('.wt-body');
+    if (!body) return;
+    const maxScrollTop = Math.max(0, body.scrollHeight - body.clientHeight);
+    body.scrollTop = Math.min(Math.max(0, state.scrollTop), maxScrollTop);
+    [...body.querySelectorAll('details')].forEach((detail, index) => {
+      if (state.details[index] !== undefined) detail.open = state.details[index];
+    });
+    const focus = state.focus;
+    if (!focus) return;
+    let target = null;
+    if (focus.type === 'range') target = [...body.querySelectorAll('[data-range]')].find((node) => node.dataset.range === focus.value);
+    if (focus.type === 'action') target = [...body.querySelectorAll('[data-action]')].find((node) => node.dataset.action === focus.value);
+    if (focus.type === 'metric') target = body.querySelector('.wt-chart-select');
+    if (focus.type === 'name') target = [...body.querySelectorAll('[name]')].find((node) => node.name === focus.value);
+    if (focus.type === 'summary') target = body.querySelector('summary');
+    target?.focus({ preventScroll: true });
+  }
+
   function render() {
     if (!runtime.app || !runtime.host) return;
+    clearTimeout(runtime.ui.tooltipTimer);
+    runtime.ui.tooltipTimer = null;
+    const wasExpanded = runtime.host.getAttribute('data-wt-mode') === 'expanded';
+    const willBeExpanded = !runtime.prefs.collapsed;
+    const capturedState = wasExpanded && willBeExpanded ? captureExpandedPanelState() : null;
+    const preservedState = willBeExpanded && runtime.ui.pendingPanelState?.session === runtime.ui.panelSession
+      ? runtime.ui.pendingPanelState
+      : capturedState;
+    if (!wasExpanded && willBeExpanded) runtime.ui.panelSession += 1;
+    if (!willBeExpanded) {
+      runtime.ui.pendingPanelState = null;
+      if (runtime.ui.tooltipTimer) clearTimeout(runtime.ui.tooltipTimer);
+      runtime.ui.tooltipTimer = null;
+    }
     runtime.app.replaceChildren();
     syncTheme();
     runtime.host.setAttribute('data-wt-mode', runtime.prefs.collapsed ? 'collapsed' : 'expanded');
     runtime.app.append(runtime.prefs.collapsed ? renderCollapsedLauncher() : renderExpandedPanel());
     applyPosition();
+    if (preservedState) {
+      runtime.ui.pendingPanelState = preservedState;
+      requestAnimationFrame(() => {
+        const state = runtime.ui.pendingPanelState;
+        runtime.ui.pendingPanelState = null;
+        restoreExpandedPanelState(state);
+      });
+    }
   }
 
   function detectPageTheme() {
@@ -1427,12 +1600,8 @@
 
   function scheduleRefresh() {
     clearTimeout(runtime.refreshTimer);
-    if (!runtime.prefs.refresh) {
-      runtime.refreshTimer = null;
-      return;
-    }
     const backoff = runtime.state.diagnostics.usageStatus === 429 || runtime.state.diagnostics.analyticsStatus === 429 ? 600_000 : 0;
-    runtime.refreshTimer = setTimeout(() => refresh(), Math.max(runtime.prefs.refresh, backoff));
+    runtime.refreshTimer = setTimeout(() => refresh(), Math.max(AUTO_REFRESH_INTERVAL_MS, backoff));
   }
 
   function createStyle() {
@@ -1442,21 +1611,21 @@
       :host([data-wt-theme="dark"]) { --wt-color-bg: #202123; --wt-color-surface: #2a2b2f; --wt-color-surface-secondary: #34353a; --wt-color-text: #f7f7f8; --wt-color-text-secondary: #b5b5bd; --wt-color-text-tertiary: #8f9198; --wt-color-border: #4a4b52; --wt-color-border-subtle: #38393e; --wt-color-primary: #f7f7f8; --wt-color-primary-hover: #ffffff; --wt-color-primary-text: #202123; --wt-color-focus: #70a7ff; --wt-color-success: #48c774; --wt-color-warning: #f1ad42; --wt-color-danger: #ff7b72; --wt-color-chart: #75a7ff; --wt-shadow: 0 18px 48px rgba(0,0,0,.52); }
       :host([data-wt-mode="collapsed"]) { height: 46px; width: 46px; } :host([data-wt-mode="expanded"]) { max-width: calc(100vw - 24px); }
       .wt-shell { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 16px; box-shadow: var(--wt-shadow); max-width: 100%; overflow: hidden; }
-      .wt-header { align-items: center; background: var(--wt-color-bg); border-bottom: 1px solid var(--wt-color-border-subtle); cursor: grab; display: flex; gap: 12px; justify-content: space-between; padding: 14px 16px 12px; user-select: none; } .wt-header:active { cursor: grabbing; } .wt-title-group { min-width: 0; } .wt-title { display: block; font-size: 15px; font-weight: 600; letter-spacing: -.01em; } .wt-title-status { color: var(--wt-color-text-tertiary); display: block; font-size: 11px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .wt-header-controls { align-items: center; display: flex; gap: 4px; }
+      .wt-header { align-items: center; background: var(--wt-color-bg); border-bottom: 1px solid var(--wt-color-border-subtle); cursor: grab; display: flex; gap: 12px; justify-content: space-between; padding: 14px 16px 12px; user-select: none; } .wt-header:active { cursor: grabbing; } .wt-title-group { flex: 1 1 auto; min-width: 0; } .wt-title { display: block; font-size: 15px; font-weight: 600; letter-spacing: -.01em; } .wt-title-status { color: var(--wt-color-text-tertiary); display: block; font-size: 11px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .wt-header-controls { align-items: center; display: flex; flex: 0 0 auto; gap: 4px; }
       button, select, input, a { font: inherit; } button, a, select, input { -webkit-tap-highlight-color: transparent; } button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--wt-color-focus); outline-offset: 2px; }
-      .wt-icon-button, .wt-button, .wt-link, .wt-select { border: 1px solid var(--wt-color-border); border-radius: 8px; cursor: pointer; min-height: 40px; padding: 6px 10px; text-decoration: none; } .wt-icon-button { align-items: center; background: transparent; color: var(--wt-color-text-secondary); display: inline-flex; justify-content: center; min-height: 40px; min-width: 40px; padding: 8px; } .wt-icon-button:hover { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-icon-button svg { height: 18px; width: 18px; } .wt-icon-button-loading svg { animation: wt-spin .8s linear infinite; } .wt-close-icon { font-size: 22px; font-weight: 300; line-height: 1; } .wt-button { background: var(--wt-color-primary); border-color: var(--wt-color-primary); color: var(--wt-color-primary-text); } .wt-button:hover { background: var(--wt-color-primary-hover); } .wt-button-secondary, .wt-select { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-button-quiet { background: transparent; border-color: transparent; color: var(--wt-color-text-secondary); } .wt-link { background: transparent; border-color: transparent; color: var(--wt-color-text-secondary); display: inline-block; padding-left: 0; padding-right: 0; } .wt-link:hover { color: var(--wt-color-text); text-decoration: underline; }
+      .wt-icon-button, .wt-button, .wt-select { border: 1px solid var(--wt-color-border); border-radius: 8px; cursor: pointer; min-height: 40px; padding: 6px 10px; text-decoration: none; } .wt-icon-button { align-items: center; background: transparent; color: var(--wt-color-text-secondary); display: inline-flex; justify-content: center; min-height: 40px; min-width: 40px; padding: 8px; } .wt-icon-button:hover { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-icon-button svg { height: 18px; width: 18px; } .wt-icon-button-loading svg { animation: wt-spin .8s linear infinite; } .wt-close-icon { font-size: 22px; font-weight: 300; line-height: 1; } .wt-button { background: var(--wt-color-primary); border-color: var(--wt-color-primary); color: var(--wt-color-primary-text); } .wt-button:hover { background: var(--wt-color-primary-hover); } .wt-button-secondary, .wt-select { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-button-quiet { background: transparent; border-color: transparent; color: var(--wt-color-text-secondary); } .wt-header-link { flex: 0 0 40px; }
       .wt-launcher { align-items: center; background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 13px; box-shadow: 0 5px 18px rgba(0,0,0,.14); color: var(--wt-color-text); cursor: grab; display: inline-flex; height: 46px; justify-content: center; padding: 0; position: relative; touch-action: none; user-select: none; width: 46px; } .wt-launcher:hover { background: var(--wt-color-surface); } .wt-launcher:active { cursor: grabbing; } .wt-launcher svg { height: 23px; width: 23px; } .wt-status-dot { border: 2px solid var(--wt-color-bg); border-radius: 50%; bottom: 4px; height: 8px; position: absolute; right: 4px; width: 8px; } .wt-status-dot-ok { background: var(--wt-color-success); } .wt-status-dot-warning { background: var(--wt-color-warning); } .wt-status-dot-danger { background: var(--wt-color-danger); }
       .wt-body { max-height: 70vh; overflow: auto; padding: 0 16px 16px; } .wt-section { border-top: 1px solid var(--wt-color-border-subtle); padding: 16px 0 0; } .wt-section-title, .wt-subtitle { font-size: 13px; font-weight: 600; margin: 0 0 10px; } .wt-subtitle { color: var(--wt-color-text-secondary); font-size: 12px; }
       .wt-account-summary { align-items: center; display: grid; gap: 4px 10px; grid-template-columns: minmax(0, 1fr) auto; padding: 16px 0 14px; } .wt-identity-block { align-items: center; display: flex; gap: 10px; min-width: 0; } .wt-avatar { align-items: center; background: var(--wt-color-surface-secondary); border-radius: 50%; color: var(--wt-color-text-secondary); display: inline-flex; flex: 0 0 34px; font-size: 15px; font-weight: 600; height: 34px; justify-content: center; width: 34px; } .wt-identity-copy { display: flex; flex-direction: column; min-width: 0; } .wt-account-name, .wt-account-email { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .wt-account-name { font-size: 13px; font-weight: 600; } .wt-account-email { color: var(--wt-color-text-secondary); font-size: 11px; margin-top: 2px; } .wt-account-side { align-items: flex-end; display: flex; flex-direction: column; gap: 5px; } .wt-account-meta { color: var(--wt-color-text-tertiary); font-size: 11px; grid-column: 1 / -1; padding-left: 44px; } .wt-account-status { align-items: center; color: var(--wt-color-text-secondary); display: inline-flex; font-size: 11px; gap: 5px; } .wt-account-status-ok { color: var(--wt-color-success); } .wt-account-status-warning { color: var(--wt-color-warning); } .wt-account-status-danger { color: var(--wt-color-danger); } .wt-status-dot-inline { background: currentColor; border-radius: 50%; height: 7px; width: 7px; }
       .wt-field-grid { display: grid; gap: 8px 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); } .wt-field { display: flex; flex-direction: column; min-width: 0; } .wt-field-label { color: var(--wt-color-text-secondary); font-size: 11px; } .wt-field-value { overflow-wrap: anywhere; }
       .wt-badge { background: var(--wt-color-surface-secondary); border-radius: 9999px; color: var(--wt-color-text-secondary); display: inline-block; font-size: 11px; font-weight: 500; padding: 4px 8px; white-space: nowrap; } .wt-badge-plan { background: var(--wt-color-surface-secondary); color: var(--wt-color-text); } .wt-badge-ok { color: var(--wt-color-success); } .wt-badge-warning { color: var(--wt-color-warning); } .wt-badge-danger { color: var(--wt-color-danger); }
-      .wt-window { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border-subtle); border-radius: 11px; margin: 8px 0; padding: 12px; } .wt-window-heading, .wt-subsection-heading, .wt-action-row, .wt-client-heading { align-items: center; display: flex; gap: 8px; justify-content: space-between; } .wt-window-meta, .wt-empty, .wt-notice, .wt-loading, .wt-range-caption { color: var(--wt-color-text-secondary); font-size: 12px; margin: 6px 0; } .wt-progress-wrap { margin: 9px 0; } .wt-progress { background: var(--wt-color-surface-secondary); border-radius: 9999px; height: 6px; overflow: hidden; position: relative; } .wt-progress::after { background: var(--wt-color-chart); border-radius: inherit; content: ''; display: block; height: 100%; width: var(--wt-progress, 0%); } .wt-window-percent-unknown { color: var(--wt-color-warning); }
+      .wt-window { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border-subtle); border-radius: 11px; margin: 8px 0; padding: 12px; } .wt-window-heading, .wt-subsection-heading, .wt-client-heading { align-items: center; display: flex; gap: 8px; justify-content: space-between; } .wt-window-meta, .wt-empty, .wt-notice, .wt-loading, .wt-range-caption { color: var(--wt-color-text-secondary); font-size: 12px; margin: 6px 0; } .wt-progress-wrap { margin: 9px 0; } .wt-progress { background: var(--wt-color-surface-secondary); border-radius: 9999px; height: 6px; overflow: hidden; position: relative; } .wt-progress::after { background: var(--wt-color-chart); border-radius: inherit; content: ''; display: block; height: 100%; width: var(--wt-progress, 0%); } .wt-window-percent-unknown { color: var(--wt-color-warning); }
       .wt-notice { border: 1px solid var(--wt-color-border-subtle); border-radius: 10px; padding: 10px; } .wt-notice-warning { color: var(--wt-color-warning); } .wt-notice-danger { color: var(--wt-color-danger); } .wt-notice-info { color: var(--wt-color-text-secondary); } .wt-subsection { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 16px; padding-top: 12px; } .wt-client-row { border-bottom: 1px solid var(--wt-color-border-subtle); padding: 9px 0; } .wt-client-name, .wt-client-value { display: block; } .wt-client-share { color: var(--wt-color-text-secondary); font-size: 11px; } .wt-client-value { color: var(--wt-color-text-secondary); font-size: 11px; margin-top: 3px; }
-      .wt-metric-grid { border: 1px solid var(--wt-color-border-subtle); border-radius: 11px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: hidden; } .wt-metric { border-bottom: 1px solid var(--wt-color-border-subtle); display: flex; flex-direction: column; min-width: 0; padding: 11px; } .wt-metric:nth-child(odd) { border-right: 1px solid var(--wt-color-border-subtle); } .wt-metric:nth-last-child(-n+2) { border-bottom: 0; } .wt-metric-label { color: var(--wt-color-text-secondary); font-size: 11px; } .wt-metric-value { font-size: 17px; font-weight: 600; margin-top: 3px; } .wt-secondary-metrics { border-top: 1px solid var(--wt-color-border-subtle); grid-column: 1 / -1; padding: 9px 11px; } .wt-secondary-metrics summary, .wt-settings summary, .wt-diagnostics summary { color: var(--wt-color-text-secondary); cursor: pointer; font-size: 12px; font-weight: 500; }
+      .wt-metric-grid { border: 1px solid var(--wt-color-border-subtle); border-radius: 11px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: hidden; } .wt-metric { border-bottom: 1px solid var(--wt-color-border-subtle); display: flex; flex-direction: column; min-width: 0; padding: 11px; } .wt-metric:nth-child(odd) { border-right: 1px solid var(--wt-color-border-subtle); } .wt-metric:nth-last-child(-n+2) { border-bottom: 0; } .wt-metric-label { color: var(--wt-color-text-secondary); font-size: 11px; } .wt-metric-value { font-size: 17px; font-weight: 600; margin-top: 3px; } .wt-secondary-metrics { border-top: 1px solid var(--wt-color-border-subtle); grid-column: 1 / -1; padding: 9px 11px; } .wt-secondary-metrics summary, .wt-diagnostics summary { color: var(--wt-color-text-secondary); cursor: pointer; font-size: 12px; font-weight: 500; }
       .wt-range-selector { display: flex; gap: 3px; margin-bottom: 10px; max-width: 100%; overflow-x: auto; padding: 2px; scrollbar-width: thin; } .wt-range-button { background: transparent; border: 1px solid transparent; border-radius: 8px; color: var(--wt-color-text-secondary); cursor: pointer; flex: 0 0 auto; min-height: 36px; padding: 6px 10px; white-space: nowrap; } .wt-range-button:hover { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-range-button-active { background: var(--wt-color-surface-secondary); border-color: var(--wt-color-border); color: var(--wt-color-text); font-weight: 600; }
       .wt-custom-range { background: var(--wt-color-surface); border-radius: 10px; margin-bottom: 10px; padding: 10px; } .wt-date-fields { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); } .wt-date-label { color: var(--wt-color-text-secondary); display: flex; flex-direction: column; font-size: 11px; gap: 4px; } .wt-date-input { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 8px; color: var(--wt-color-text); min-height: 38px; min-width: 0; padding: 7px; } .wt-date-hint { color: var(--wt-color-text-tertiary); font-size: 11px; margin: 7px 0 0; } .wt-date-error { color: var(--wt-color-danger); font-size: 11px; min-height: 16px; margin: 5px 0 0; } .wt-custom-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-      .wt-chart { align-items: end; border-bottom: 1px solid var(--wt-color-border); display: flex; gap: 4px; height: 132px; overflow-x: auto; padding: 8px 2px 0; } .wt-chart-column { align-items: center; display: flex; flex: 1 0 16px; flex-direction: column; height: 100%; justify-content: end; min-width: 16px; } .wt-chart-bar { background: var(--wt-color-chart); border-radius: 3px 3px 0 0; min-height: 3px; width: 100%; } .wt-chart-label { color: var(--wt-color-text-tertiary); font-size: 9px; margin-top: 4px; white-space: nowrap; }
-      .wt-action-row { justify-content: flex-start; margin-top: 8px; } .wt-settings-label { color: var(--wt-color-text-secondary); font-size: 12px; } .wt-footer-settings { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 16px; padding-top: 12px; } .wt-settings { display: grid; gap: 7px; } .wt-diagnostics { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 12px; padding-top: 10px; } .wt-diagnostics summary { margin-bottom: 8px; } .wt-diagnostics .wt-field { margin: 6px 0; } .wt-loading { min-height: 120px; padding-top: 18px; } .wt-chart-select { margin-left: auto; }
+      .wt-chart-shell { position: relative; } .wt-chart-scroll { align-items: end; border-bottom: 1px solid var(--wt-color-border); display: flex; gap: 4px; height: 132px; overflow-x: auto; padding: 8px 2px 0; } .wt-chart-column { align-items: center; border-radius: 4px; display: flex; flex: 1 0 16px; flex-direction: column; height: 100%; justify-content: end; min-width: 16px; } .wt-chart-column:focus-visible { outline: 2px solid var(--wt-color-focus); outline-offset: 2px; } .wt-chart-bar { background: var(--wt-color-chart); border-radius: 3px 3px 0 0; min-height: 3px; width: 100%; } .wt-chart-label { color: var(--wt-color-text-tertiary); font-size: 9px; margin-top: 4px; white-space: nowrap; } .wt-chart-tooltip { background: var(--wt-color-surface); border: 1px solid var(--wt-color-border); border-radius: 8px; box-shadow: 0 8px 24px rgb(0 0 0 / 18%); color: var(--wt-color-text); display: flex; flex-direction: column; font-size: 11px; max-width: calc(100% - 8px); padding: 7px 9px; pointer-events: none; position: absolute; white-space: nowrap; z-index: 2; } .wt-chart-tooltip[hidden] { display: none; } .wt-chart-tooltip-date { color: var(--wt-color-text-secondary); } .wt-chart-tooltip-value { font-variant-numeric: tabular-nums; margin-top: 2px; }
+      .wt-diagnostics { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 12px; padding-top: 10px; } .wt-diagnostics summary { margin-bottom: 8px; } .wt-diagnostics .wt-field { margin: 6px 0; } .wt-loading { min-height: 120px; padding-top: 18px; } .wt-chart-select { margin-left: auto; }
       @keyframes wt-spin { to { transform: rotate(360deg); } } @media (max-width: 480px) { :host([data-wt-mode="expanded"]) { width: calc(100vw - 24px); } .wt-body { max-height: 68vh; padding-left: 12px; padding-right: 12px; } .wt-header { padding-left: 12px; padding-right: 12px; } } @media (max-width: 340px) { .wt-account-summary { align-items: start; } .wt-account-side { align-items: flex-start; grid-column: 1 / -1; padding-left: 44px; } .wt-date-fields { grid-template-columns: 1fr; } .wt-range-button { padding-left: 8px; padding-right: 8px; } }
       @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; } }
     `;
@@ -1496,7 +1665,7 @@
     history.replaceState = function (...args) { const result = runtime.originalReplaceState.apply(this, args); window.dispatchEvent(new Event('wt-chatgpt-route-change')); return result; };
     window.addEventListener('popstate', onRouteChange);
     window.addEventListener('wt-chatgpt-route-change', onRouteChange);
-    runtime.visibilityHandler = () => { if (document.visibilityState === 'visible' && runtime.state.fetchedAt && Date.now() - runtime.state.fetchedAt > 120_000) refresh(); };
+    runtime.visibilityHandler = () => { if (document.visibilityState === 'visible' && runtime.state.fetchedAt && Date.now() - runtime.state.fetchedAt >= AUTO_REFRESH_INTERVAL_MS) refresh(); };
     document.addEventListener('visibilitychange', runtime.visibilityHandler);
     window.addEventListener('resize', applyPosition, { passive: true });
     const themeObserver = new MutationObserver(() => syncTheme());
@@ -1523,6 +1692,8 @@
 
   function cleanup() {
     clearTimeout(runtime.refreshTimer);
+    clearTimeout(runtime.ui.tooltipTimer);
+    runtime.ui.tooltipTimer = null;
     runtime.abortController?.abort();
     runtime.observers.forEach((observer) => observer.disconnect());
     runtime.bodyObserver?.disconnect();
