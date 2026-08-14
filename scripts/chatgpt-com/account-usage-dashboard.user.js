@@ -2,7 +2,7 @@
 // @name         ChatGPT Account Usage Dashboard
 // @name:zh-CN   ChatGPT 账户用量浮窗
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.0.0
+// @version      1.1.0
 // @description  Display the current ChatGPT account plan, Codex limits, credits, and usage analytics in a private floating dashboard.
 // @description:zh-CN 在 ChatGPT 页面显示当前账号套餐、Codex 额度、Credits 与使用统计。
 // @author       KnowSky404
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   const HOST_ID = 'wt-chatgpt-account-usage-host';
   const SESSION_ENDPOINT = '/api/auth/session';
   const USAGE_ENDPOINT = '/backend-api/wham/usage';
@@ -77,6 +77,9 @@
         analyticsStatus: null,
         usageMode: 'cookie-only',
         windowCount: 0,
+        primaryWindowCount: 0,
+        additionalWindowCount: 0,
+        windows: [],
         dailyRows: 0,
         clientTypes: [],
         unknownFields: [],
@@ -355,6 +358,22 @@
     return labels[key] || (rawType ? prettyName(String(rawType)) : '未提供');
   }
 
+  function planDescription(rawType) {
+    const key = typeof rawType === 'string' ? rawType.toLowerCase() : '';
+    const descriptions = {
+      prolite: 'Pro 较低用量档',
+      pro: 'Pro 高用量档',
+      plus: 'Plus 订阅档',
+      free: '免费档位',
+      go: 'Go 订阅档',
+      business: 'Business 工作区档位',
+      team: 'Business 工作区档位',
+      enterprise: 'Enterprise 工作区档位',
+      edu: 'Edu 教育档位'
+    };
+    return descriptions[key] || null;
+  }
+
   function durationSeconds(source) {
     const seconds = numberOrNull(firstDefined(source, ['limit_window_seconds', 'limitWindowSeconds', 'duration_seconds', 'durationSeconds', 'window_seconds', 'windowSeconds']));
     if (seconds !== null) return seconds;
@@ -362,89 +381,138 @@
     return minutes === null ? null : minutes * 60;
   }
 
-  function windowLabel(source, scope, index) {
-    const duration = durationSeconds(source);
-    const explicit = firstDefined(source, ['label', 'name', 'title', 'feature']);
-    if (explicit) return String(explicit);
-    if (duration !== null && duration >= 4 * 3600 && duration <= 6 * 3600) return '约 5 小时窗口';
-    if (duration !== null && duration >= 6 * 86400 && duration <= 8 * 86400) return '约 7 天窗口';
-    if (duration !== null && duration >= 86400) return `${Math.round(duration / 86400)} 天窗口`;
-    if (duration !== null) return `${Math.round(duration / 3600)} 小时窗口`;
-    return `${scope === 'additional' ? '额外额度' : '额度窗口'} ${index + 1}`;
+  const WINDOW_FIELDS = [
+    'used_percent', 'usedPercent', 'remaining_percent', 'remainingPercent',
+    'limit_window_seconds', 'limitWindowSeconds', 'window_minutes', 'windowMinutes',
+    'reset_at', 'resetAt', 'reset_after_seconds', 'resetAfterSeconds'
+  ];
+
+  function hasWindowField(value) {
+    return isRecord(value) && WINDOW_FIELDS.some((key) => Object.prototype.hasOwnProperty.call(value, key));
   }
 
-  function normalizeWindow(source, scope, index, sourcePath) {
-    if (!isRecord(source)) return null;
-    let used = clampPercent(firstDefined(source, ['used_percent', 'usedPercent', 'usage_percent', 'usagePercent']));
+  function readBoolean(source, paths) {
+    return boolOrNull(firstDefined(source, paths));
+  }
+
+  function limitContext(source, context) {
+    if (!isRecord(source)) return context;
+    return {
+      ...context,
+      feature: firstDefined(source, ['metered_feature', 'meteredFeature', 'feature', 'feature_name', 'featureName', 'limit_id', 'limitId']) || context.feature || null,
+      label: firstDefined(source, ['limit_name', 'limitName', 'label', 'name', 'title']) || context.label || null,
+      parentAllowed: readBoolean(source, ['allowed', 'is_allowed', 'isAllowed']) ?? context.parentAllowed ?? null,
+      parentLimitReached: readBoolean(source, ['limit_reached', 'limitReached']) ?? context.parentLimitReached ?? null
+    };
+  }
+
+  function periodLabel(duration) {
+    if (duration === null) return null;
+    if (duration >= 4 * 3600 && duration <= 6 * 3600) return '5 小时额度';
+    if (duration >= 6 * 86400 && duration <= 8 * 86400) return '7 天额度';
+    if (duration >= 86400) return `${Math.max(1, Math.round(duration / 86400))} 天额度`;
+    return `${Math.max(1, Math.round(duration / 3600))} 小时额度`;
+  }
+
+  function windowLabel(source, context) {
+    const durationLabel = periodLabel(durationSeconds(source));
+    if (context.scope === 'additional') return `${context.label || '额外额度'}${durationLabel ? ` · ${durationLabel}` : ''}`;
+    return durationLabel || context.label || '主额度';
+  }
+
+  function normalizeWindow(source, context, now = Date.now()) {
+    if (!hasWindowField(source)) return null;
+    let used = clampPercent(firstDefined(source, ['used_percent', 'usedPercent']));
     let remaining = clampPercent(firstDefined(source, ['remaining_percent', 'remainingPercent']));
     if (used === null && remaining !== null) used = 100 - remaining;
     if (remaining === null && used !== null) remaining = 100 - used;
     const duration = durationSeconds(source);
-    const resetAt = parseTimestamp(firstDefined(source, ['reset_at', 'resetAt', 'reset_time', 'resetTime']));
     const resetAfter = numberOrNull(firstDefined(source, ['reset_after_seconds', 'resetAfterSeconds']));
+    const explicitReset = parseTimestamp(firstDefined(source, ['reset_at', 'resetAt']));
+    const resetAt = explicitReset === null && resetAfter !== null ? now + resetAfter * 1000 : explicitReset;
     return {
-      id: `${scope}-${index}-${sourcePath}`,
-      scope,
-      feature: firstDefined(source, ['feature', 'feature_name', 'featureName']),
-      label: windowLabel(source, scope, index),
+      id: `${context.scope}:${context.feature || ''}:${context.sourcePath}:${duration || ''}:${resetAt || ''}`,
+      scope: context.scope,
+      feature: firstDefined(source, ['feature', 'feature_name', 'featureName']) || context.feature || null,
+      label: windowLabel(source, context),
       durationSeconds: duration,
       usedPercent: used,
       remainingPercent: remaining,
       resetAt,
       resetAfterSeconds: resetAfter,
-      limitReached: boolOrNull(firstDefined(source, ['limit_reached', 'limitReached'])),
-      allowed: boolOrNull(firstDefined(source, ['allowed', 'is_allowed', 'isAllowed'])),
-      sourcePath
+      limitReached: readBoolean(source, ['limit_reached', 'limitReached']) ?? context.parentLimitReached ?? null,
+      allowed: readBoolean(source, ['allowed', 'is_allowed', 'isAllowed']) ?? context.parentAllowed ?? null,
+      sourcePath: context.sourcePath
     };
   }
 
-  function looksLikeWindow(value) {
-    return isRecord(value) && [
-      'used_percent', 'usedPercent', 'remaining_percent', 'remainingPercent', 'limit_window_seconds', 'limitWindowSeconds',
-      'window_minutes', 'windowMinutes', 'reset_at', 'resetAt', 'reset_after_seconds', 'resetAfterSeconds', 'allowed', 'limit_reached'
-    ].some((key) => Object.prototype.hasOwnProperty.call(value, key));
+  function collectWindowPair(container, context, windows, now) {
+    if (!isRecord(container)) return;
+    const pair = [
+      ['primary_window', 'primaryWindow'],
+      ['secondary_window', 'secondaryWindow']
+    ];
+    for (const [snake, camel] of pair) {
+      const key = Object.prototype.hasOwnProperty.call(container, snake) ? snake : camel;
+      if (!Object.prototype.hasOwnProperty.call(container, key) || !isRecord(container[key])) continue;
+      const windowContext = { ...context, sourcePath: `${context.sourcePath}.${key}` };
+      const normalized = normalizeWindow(container[key], windowContext, now);
+      if (normalized) windows.push(normalized);
+    }
   }
 
-  function collectWindows(usage) {
+  function collectLimitContainer(container, context, windows, now) {
+    if (Array.isArray(container)) {
+      container.forEach((item, index) => collectLimitContainer(item, { ...context, sourcePath: `${context.sourcePath}[${index}]` }, windows, now));
+      return;
+    }
+    if (!isRecord(container)) return;
+    const nextContext = limitContext(container, context);
+    const hasPair = ['primary_window', 'primaryWindow', 'secondary_window', 'secondaryWindow'].some((key) => Object.prototype.hasOwnProperty.call(container, key));
+    collectWindowPair(container, nextContext, windows, now);
+    if (hasPair) return;
+    const nestedKey = Object.prototype.hasOwnProperty.call(container, 'rate_limit') ? 'rate_limit' : Object.prototype.hasOwnProperty.call(container, 'rateLimit') ? 'rateLimit' : null;
+    if (nestedKey && isRecord(container[nestedKey])) {
+      collectLimitContainer(container[nestedKey], { ...nextContext, sourcePath: `${context.sourcePath}.${nestedKey}` }, windows, now);
+      return;
+    }
+    if (hasWindowField(container)) {
+      const normalized = normalizeWindow(container, nextContext, now);
+      if (normalized) windows.push(normalized);
+      return;
+    }
+    for (const [key, value] of Object.entries(container)) {
+      if (!isRecord(value) && !Array.isArray(value)) continue;
+      collectLimitContainer(value, { ...context, sourcePath: `${context.sourcePath}.${key}` }, windows, now);
+    }
+  }
+
+  function collectUsageWindows(usage, now = Date.now()) {
     const windows = [];
-    const primary = firstDefined(usage, ['primary_window', 'primaryWindow']);
-    const secondary = firstDefined(usage, ['secondary_window', 'secondaryWindow']);
-    if (primary) windows.push(normalizeWindow(primary, 'primary', 0, 'primary_window'));
-    if (secondary) windows.push(normalizeWindow(secondary, 'primary', 1, 'secondary_window'));
-    const rates = firstDefined(usage, ['rate_limits', 'rateLimits', 'rate_limit', 'rateLimit']);
-    if (Array.isArray(rates)) rates.forEach((item, index) => windows.push(normalizeWindow(item, 'primary', index, 'rate_limits')));
-    else if (looksLikeWindow(rates)) windows.push(normalizeWindow(rates, 'primary', 0, 'rate_limit'));
-    else if (isRecord(rates)) {
-      for (const [key, value] of Object.entries(rates)) {
-        if (isRecord(value)) windows.push(normalizeWindow(value, 'primary', windows.length, `rate_limits.${key}`));
-      }
-    }
+    collectWindowPair(usage, { scope: 'primary', feature: null, label: null, sourcePath: 'usage', parentAllowed: null, parentLimitReached: null }, windows, now);
+    const rateLimit = firstDefined(usage, ['rate_limit', 'rateLimit']);
+    if (rateLimit) collectLimitContainer(rateLimit, { scope: 'primary', feature: null, label: null, sourcePath: 'rate_limit', parentAllowed: null, parentLimitReached: null }, windows, now);
+    const rateLimits = firstDefined(usage, ['rate_limits', 'rateLimits']);
+    if (rateLimits) collectLimitContainer(rateLimits, { scope: 'primary', feature: null, label: null, sourcePath: 'rate_limits', parentAllowed: null, parentLimitReached: null }, windows, now);
     const additional = firstDefined(usage, ['additional_rate_limits', 'additionalRateLimits']);
-    if (Array.isArray(additional)) additional.forEach((item, index) => windows.push(normalizeWindow(item, 'additional', index, 'additional_rate_limits')));
-    else if (looksLikeWindow(additional)) windows.push(normalizeWindow(additional, 'additional', 0, 'additional_rate_limits'));
-    else if (isRecord(additional)) {
-      for (const [key, value] of Object.entries(additional)) {
-        if (isRecord(value)) windows.push(normalizeWindow(value, 'additional', indexSafe(windows), `additional_rate_limits.${key}`));
-      }
-    }
-    return windows.filter(Boolean).filter((item, index, all) => all.findIndex((candidate) => candidate.sourcePath === item.sourcePath && candidate.resetAt === item.resetAt && candidate.durationSeconds === item.durationSeconds) === index);
-  }
-
-  function indexSafe(value) {
-    return Number.isFinite(value) ? value : 0;
+    if (additional) collectLimitContainer(additional, { scope: 'additional', feature: null, label: null, sourcePath: 'additional_rate_limits', parentAllowed: null, parentLimitReached: null }, windows, now);
+    return windows.filter((item, index, all) => all.findIndex((candidate) => [candidate.scope, candidate.feature, candidate.sourcePath, candidate.durationSeconds, candidate.resetAt].join('|') === [item.scope, item.feature, item.sourcePath, item.durationSeconds, item.resetAt].join('|')) === index);
   }
 
   function normalizeUsage(payload, session, fetchedAt) {
     const usage = unwrapData(payload);
     if (!isRecord(usage)) throw new Error('schema');
     const identity = getSessionIdentity(session);
-    const windows = collectWindows(usage);
+    const windows = collectUsageWindows(usage, fetchedAt);
     const rawType = firstDefined(usage, ['plan_type', 'planType']);
     const credits = unwrapData(firstDefined(usage, ['credits', 'credit_status', 'creditStatus'])) || {};
     const resetCredits = unwrapData(firstDefined(usage, ['rate_limit_reset_credits', 'rateLimitResetCredits'])) || {};
     const spend = unwrapData(firstDefined(usage, ['spend_control', 'spendControl'])) || {};
-    const allowed = boolOrNull(firstDefined(usage, ['allowed', 'is_allowed', 'isAllowed']));
-    const limitReached = boolOrNull(firstDefined(usage, ['limit_reached', 'limitReached']));
+    const mainRateLimit = firstDefined(usage, ['rate_limit', 'rateLimit']);
+    const topAllowed = readBoolean(usage, ['allowed', 'is_allowed', 'isAllowed']);
+    const topLimitReached = readBoolean(usage, ['limit_reached', 'limitReached']);
+    const allowed = topAllowed ?? (isRecord(mainRateLimit) ? readBoolean(mainRateLimit, ['allowed', 'is_allowed', 'isAllowed']) : null) ?? windows.find((item) => item.scope === 'primary' && item.allowed !== null)?.allowed ?? null;
+    const limitReached = topLimitReached ?? (isRecord(mainRateLimit) ? readBoolean(mainRateLimit, ['limit_reached', 'limitReached']) : null) ?? windows.find((item) => item.scope === 'primary' && item.limitReached !== null)?.limitReached ?? null;
     const resetAt = parseTimestamp(firstDefined(spend, ['reset_at', 'resetAt']));
     const spendUsed = numberOrNull(firstDefined(spend, ['used']));
     const spendLimit = numberOrNull(firstDefined(spend, ['limit']));
@@ -616,6 +684,16 @@
       runtime.state.signedIn = identity.signedIn;
       if (sessionResult.status === 401) normalized.session.signedIn = false;
       runtime.state.diagnostics.unknownFields = unknownUsageFields(unwrapData(usageBundle.result.data));
+      runtime.state.diagnostics.windowCount = normalized.windows.length;
+      runtime.state.diagnostics.primaryWindowCount = normalized.windows.filter((item) => item.scope === 'primary').length;
+      runtime.state.diagnostics.additionalWindowCount = normalized.windows.filter((item) => item.scope === 'additional').length;
+      runtime.state.diagnostics.windows = normalized.windows.map((item) => ({
+        label: item.label,
+        sourcePath: item.sourcePath,
+        durationSeconds: item.durationSeconds,
+        hasUsedPercent: item.usedPercent !== null,
+        hasResetAt: item.resetAt !== null
+      }));
       const range = analyticsRequestRange(normalized.windows, startedAt);
       const query = new URLSearchParams({ start_date: range.start, end_date: range.end, group_by: 'day' });
       const analyticsResult = await requestJSON(`${ANALYTICS_ENDPOINT}?${query.toString()}`, { controller: runtime.abortController, headers: usageBundle.headers });
@@ -680,6 +758,14 @@
     return row;
   }
 
+  function hasValue(value) {
+    return value !== null && value !== undefined && value !== '';
+  }
+
+  function appendFieldIfValue(parent, label, value, className = '') {
+    if (hasValue(value)) parent.append(field(label, value, className));
+  }
+
   function statusBadge(text, kind = '') {
     return el('span', `wt-badge ${kind ? `wt-badge-${kind}` : ''}`.trim(), text);
   }
@@ -691,8 +777,6 @@
     if (percent !== null) {
       bar.style.setProperty('--wt-progress', `${percent}%`);
       bar.setAttribute('aria-valuenow', String(percent));
-    } else {
-      bar.classList.add('wt-progress-unknown');
     }
     wrapper.append(bar);
     return wrapper;
@@ -702,26 +786,49 @@
     const card = el('article', 'wt-window');
     const heading = el('div', 'wt-window-heading');
     heading.append(el('strong', 'wt-window-label', window.label), statusBadge(window.limitReached === true ? '已达到限制' : window.allowed === false ? '不可用' : '可用', window.limitReached === true ? 'danger' : 'ok'));
-    card.append(heading, el('div', 'wt-window-meta', `${window.scope === 'additional' ? '额外额度' : '主额度'} · 周期 ${formatDuration(window.durationSeconds)}`));
+    const meta = `${window.scope === 'additional' ? '额外额度' : '主额度'}${window.durationSeconds !== null ? ` · 周期 ${formatDuration(window.durationSeconds)}` : ''}`;
+    card.append(heading, el('div', 'wt-window-meta', meta));
+    if (window.usedPercent === null && window.remainingPercent === null) {
+      card.append(el('p', 'wt-window-meta wt-window-percent-unknown', '接口未提供使用比例'));
+    }
     card.append(createProgress(window.usedPercent, `${window.label} 已使用百分比`));
     const grid = el('div', 'wt-field-grid');
-    grid.append(field('已使用', formatPercent(window.usedPercent)), field('剩余', formatPercent(window.remainingPercent)), field('重置时间', formatDate(window.resetAt)), field('倒计时', formatCountdown(window.resetAt)));
+    appendFieldIfValue(grid, '已使用', window.usedPercent === null ? null : formatPercent(window.usedPercent));
+    appendFieldIfValue(grid, '剩余', window.remainingPercent === null ? null : formatPercent(window.remainingPercent));
+    appendFieldIfValue(grid, '重置时间', window.resetAt === null ? null : formatDate(window.resetAt));
+    appendFieldIfValue(grid, '倒计时', window.resetAt === null ? null : formatCountdown(window.resetAt));
+    if (!grid.children.length && window.allowed === null && window.limitReached === null) grid.append(el('p', 'wt-empty', '接口未提供可显示的窗口详情'));
     card.append(grid);
     return card;
   }
 
   function renderAccount(data) {
     const node = section('当前账户');
-    node.append(field('登录状态', data.session.signedIn === null ? '未提供' : data.session.signedIn ? '已登录' : '未登录'), field('显示名', data.session.displayName));
-    if (runtime.prefs.email) node.append(field('邮箱（脱敏）', data.session.maskedEmail));
-    node.append(field('套餐', data.plan.label), field('原始 plan_type', data.plan.rawType), field('用量允许', data.plan.allowed === null ? '未提供' : data.plan.allowed ? '是' : '否'), field('达到限制', data.plan.limitReached === null ? '未提供' : data.plan.limitReached ? '是' : '否'), field('最后更新时间', formatDate(data.fetchedAt)));
+    appendFieldIfValue(node, '登录状态', data.session.signedIn === null ? '状态未提供' : data.session.signedIn ? '已登录' : '未登录');
+    appendFieldIfValue(node, '显示名', data.session.displayName);
+    if (runtime.prefs.email) appendFieldIfValue(node, '邮箱（脱敏）', data.session.maskedEmail);
+    appendFieldIfValue(node, '套餐', data.plan.label);
+    appendFieldIfValue(node, '套餐说明', planDescription(data.plan.rawType));
+    const usageStatus = data.plan.limitReached === true ? '已达到限制' : data.plan.allowed === false ? '不可用' : data.plan.allowed === true ? '可用' : '状态未提供';
+    appendFieldIfValue(node, '用量状态', usageStatus);
+    appendFieldIfValue(node, '最后更新时间', formatDate(data.fetchedAt));
     return node;
   }
 
   function renderCredits(data) {
+    const values = [data.credits.hasCredits, data.credits.unlimited, data.credits.balance, data.credits.resetCreditsAvailable, data.spendControl.reached, data.spendControl.used, data.spendControl.limit, data.spendControl.usedPercent, data.spendControl.remainingPercent, data.spendControl.resetAt];
+    if (!values.some(hasValue)) return null;
     const node = section('Credits 和账户用量状态');
     const grid = el('div', 'wt-field-grid');
-    grid.append(field('has_credits', data.credits.hasCredits === null ? '未提供' : data.credits.hasCredits ? '是' : '否'), field('unlimited', data.credits.unlimited === null ? '未提供' : data.credits.unlimited ? '是' : '否'), field('balance', formatNumber(data.credits.balance)), field('可用重置券', formatNumber(data.credits.resetCreditsAvailable)), field('spend_control', data.spendControl.reached === null ? '未提供' : data.spendControl.reached ? '已达到' : '未达到'), field('spend 已用', formatNumber(data.spendControl.used)), field('spend 限额', formatNumber(data.spendControl.limit)), field('spend 已用百分比', formatPercent(data.spendControl.usedPercent)), field('spend 剩余百分比', formatPercent(data.spendControl.remainingPercent)), field('spend 重置时间', formatDate(data.spendControl.resetAt)), field('allowed', data.plan.allowed === null ? '未提供' : data.plan.allowed ? '是' : '否'), field('limit_reached', data.plan.limitReached === null ? '未提供' : data.plan.limitReached ? '是' : '否'));
+    appendFieldIfValue(grid, 'Credits 余额', data.credits.balance === null ? null : formatNumber(data.credits.balance));
+    appendFieldIfValue(grid, '无限 Credits', data.credits.unlimited === null ? null : data.credits.unlimited ? '是' : '否');
+    appendFieldIfValue(grid, '可用重置券', data.credits.resetCreditsAvailable === null ? null : formatNumber(data.credits.resetCreditsAvailable));
+    appendFieldIfValue(grid, '消费限额状态', data.spendControl.reached === null ? null : data.spendControl.reached ? '已达到' : '未达到');
+    appendFieldIfValue(grid, '消费限额', data.spendControl.limit === null ? null : formatNumber(data.spendControl.limit));
+    appendFieldIfValue(grid, '已使用', data.spendControl.used === null ? null : formatNumber(data.spendControl.used));
+    appendFieldIfValue(grid, '剩余比例', data.spendControl.remainingPercent === null ? data.spendControl.usedPercent === null ? null : formatPercent(100 - data.spendControl.usedPercent) : formatPercent(data.spendControl.remainingPercent));
+    appendFieldIfValue(grid, '已使用比例', data.spendControl.usedPercent === null ? null : formatPercent(data.spendControl.usedPercent));
+    appendFieldIfValue(grid, '重置时间', data.spendControl.resetAt === null ? null : formatDate(data.spendControl.resetAt));
     node.append(grid);
     return node;
   }
@@ -840,10 +947,14 @@
       ['脚本版本', VERSION], ['当前路径', location.pathname], ['Usage HTTP 状态', runtime.state.diagnostics.usageStatus || '未请求'],
       ['Analytics HTTP 状态', runtime.state.diagnostics.analyticsStatus || '未请求'], ['请求模式', runtime.state.diagnostics.usageMode],
       ['获取时间', formatDate(runtime.state.fetchedAt)], ['原始 plan_type', runtime.state.data && runtime.state.data.plan.rawType],
-      ['额度窗口数量', runtime.state.data ? runtime.state.data.windows.length : 0], ['每日数据行数', runtime.state.diagnostics.dailyRows],
+      ['成功解析窗口数量', runtime.state.diagnostics.windowCount], ['主额度窗口数量', runtime.state.diagnostics.primaryWindowCount], ['额外额度窗口数量', runtime.state.diagnostics.additionalWindowCount], ['每日数据行数', runtime.state.diagnostics.dailyRows],
       ['客户端类型', runtime.state.diagnostics.clientTypes.join(', ') || '未提供'], ['未识别顶层字段', runtime.state.diagnostics.unknownFields.join(', ') || '无'], ['错误代码', runtime.state.diagnostics.errors.join(', ') || '无']
     ];
     for (const [label, value] of lines) details.append(field(label, value));
+    for (const window of runtime.state.diagnostics.windows) {
+      const summary = `${window.label} · ${window.sourcePath}`;
+      details.append(field('窗口', `${summary} · 周期 ${window.durationSeconds === null ? '未提供' : `${window.durationSeconds} 秒`} · used ${window.hasUsedPercent ? '已识别' : '未提供'} · resetAt ${window.hasResetAt ? '已识别' : '未提供'}`));
+    }
     const copy = el('button', 'wt-button wt-button-secondary', '复制诊断信息');
     copy.type = 'button';
     copy.dataset.action = 'copy-diagnostics';
@@ -856,67 +967,93 @@
       `脚本版本: ${VERSION}`, `当前路径: ${location.pathname}`, `Usage HTTP 状态: ${runtime.state.diagnostics.usageStatus || '未请求'}`,
       `Analytics HTTP 状态: ${runtime.state.diagnostics.analyticsStatus || '未请求'}`, `请求模式: ${runtime.state.diagnostics.usageMode}`,
       `获取时间: ${formatDate(runtime.state.fetchedAt)}`, `原始 plan_type: ${runtime.state.data ? runtime.state.data.plan.rawType || '未提供' : '未提供'}`,
-      `额度窗口数量: ${runtime.state.data ? runtime.state.data.windows.length : 0}`, `每日数据行数: ${runtime.state.diagnostics.dailyRows}`,
+      `成功解析窗口数量: ${runtime.state.diagnostics.windowCount}`, `主额度窗口数量: ${runtime.state.diagnostics.primaryWindowCount}`, `额外额度窗口数量: ${runtime.state.diagnostics.additionalWindowCount}`, `每日数据行数: ${runtime.state.diagnostics.dailyRows}`,
       `客户端类型: ${runtime.state.diagnostics.clientTypes.join(', ') || '未提供'}`, `未识别顶层字段: ${runtime.state.diagnostics.unknownFields.join(', ') || '无'}`, `错误代码: ${runtime.state.diagnostics.errors.join(', ') || '无'}`
     ];
+    for (const window of runtime.state.diagnostics.windows) {
+      lines.push(`窗口: ${window.label} | ${window.sourcePath} | durationSeconds=${window.durationSeconds === null ? 'null' : window.durationSeconds} | usedPercent=${window.hasUsedPercent ? 'present' : 'missing'} | resetAt=${window.hasResetAt ? 'present' : 'missing'}`);
+    }
     return lines.join('\n');
   }
 
-  function render() {
-    if (!runtime.app) return;
-    runtime.app.replaceChildren();
-    const shell = el('div', `wt-shell ${runtime.prefs.collapsed ? 'wt-shell-collapsed' : ''}`.trim());
+  function usageIcon() {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    setAttributes(svg, { viewBox: '0 0 24 24', 'aria-hidden': 'true', focusable: 'false' });
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    setAttributes(path, { d: 'M4 19V5m0 14h16M7 16v-4m4 4V8m4 8v-6m4 6V4', fill: 'none', stroke: 'currentColor', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'stroke-width': '1.8' });
+    svg.append(path);
+    return svg;
+  }
+
+  function statusKind() {
+    if (runtime.state.error || runtime.state.data?.windows.some((item) => item.limitReached === true)) return 'danger';
+    if (runtime.state.stale || runtime.state.analyticsError || runtime.state.loading || runtime.state.data?.windows.some((item) => item.allowed === null || item.resetAt === null)) return 'warning';
+    return 'ok';
+  }
+
+  function renderCollapsedLauncher() {
+    const launcher = setAttributes(el('button', 'wt-launcher wt-drag-handle'), { type: 'button', 'aria-label': '打开账户用量面板', title: '账户用量' });
+    launcher.append(usageIcon(), el('span', `wt-status-dot wt-status-dot-${statusKind()}`));
+    return launcher;
+  }
+
+  function renderExpandedPanel() {
+    const shell = el('div', 'wt-shell');
     const header = el('div', 'wt-header wt-drag-handle');
     const title = el('div', 'wt-title-group');
     title.append(el('strong', 'wt-title', '账户用量'), el('span', 'wt-title-status', runtime.state.stale ? '数据可能已过期' : runtime.state.loading ? '读取中…' : runtime.state.error ? runtime.state.error : '就绪'));
-    const toggle = setAttributes(el('button', 'wt-icon-button', runtime.prefs.collapsed ? '展开' : '收起'), { type: 'button', 'aria-label': runtime.prefs.collapsed ? '展开账户用量面板' : '收起账户用量面板', 'aria-expanded': String(!runtime.prefs.collapsed) });
+    const toggle = setAttributes(el('button', 'wt-icon-button'), { type: 'button', 'aria-label': '收起账户用量面板', title: '收起账户用量面板', 'aria-expanded': 'true' });
+    toggle.append(usageIcon());
     toggle.dataset.action = 'toggle';
     header.append(title, toggle);
     shell.append(header);
-    if (runtime.prefs.collapsed) {
-      const compact = el('button', 'wt-compact wt-drag-handle');
-      compact.type = 'button';
-      compact.dataset.action = 'toggle';
-      const data = runtime.state.data;
-      compact.append(el('strong', 'wt-compact-plan', data ? data.plan.label : runtime.state.loading ? '读取中…' : 'ChatGPT 用量'), statusBadge(data && data.windows[0] ? formatPercent(data.windows[0].usedPercent) : '未提供', data && data.windows[0] && data.windows[0].limitReached ? 'danger' : ''), el('span', 'wt-compact-reset', data && data.windows[0] ? formatCountdown(data.windows[0].resetAt) : (runtime.state.error || '点击查看')));
-      shell.append(compact);
-    } else {
-      const body = el('div', 'wt-body');
-      if (runtime.state.loading && !runtime.state.data) body.append(el('div', 'wt-loading', '正在读取账户与额度…'));
-      if (runtime.state.error && !runtime.state.data) body.append(el('div', 'wt-notice wt-notice-danger', runtime.state.error));
-      if (runtime.state.data) {
-        body.append(renderAccount(runtime.state.data), renderCredits(runtime.state.data));
-        const windows = section('额度窗口');
-        if (runtime.state.data.windows.length) runtime.state.data.windows.forEach((item) => windows.append(renderWindow(item)));
-        else windows.append(el('p', 'wt-empty', '接口未提供有效额度窗口'));
-        body.append(windows, renderAnalytics(runtime.state.data));
-      }
-      const actions = section('操作');
-      const refresh = el('div', 'wt-action-row');
-      const refreshButton = el('button', 'wt-button', '手动刷新'); refreshButton.type = 'button'; refreshButton.dataset.action = 'refresh';
-      const refreshSelect = setAttributes(el('select', 'wt-select'), { 'aria-label': '自动刷新间隔' });
-      for (const value of REFRESH_OPTIONS) { const option = setAttributes(el('option', '', `自动刷新：${formatRefresh(value)}`), { value }); option.selected = runtime.prefs.refresh === value; refreshSelect.append(option); }
-      refreshSelect.addEventListener('change', () => { runtime.prefs.refresh = Number(refreshSelect.value); writePreference(PREF_KEYS.refresh, runtime.prefs.refresh); scheduleRefresh(); });
-      refresh.append(refreshButton, refreshSelect); actions.append(refresh);
-      actions.append(linkButton(ANALYTICS_URL, '打开官方 Analytics'));
-      const usageHref = findOfficialUsageHref(); if (usageHref) actions.append(linkButton(usageHref, '打开官方 Usage'));
-      body.append(actions, renderDiagnostics());
-      shell.append(body);
+    const body = el('div', 'wt-body');
+    if (runtime.state.loading && !runtime.state.data) body.append(el('div', 'wt-loading', '正在读取账户与额度…'));
+    if (runtime.state.error && !runtime.state.data) body.append(el('div', 'wt-notice wt-notice-danger', runtime.state.error));
+    if (runtime.state.data) {
+      const credits = renderCredits(runtime.state.data);
+      body.append(renderAccount(runtime.state.data));
+      if (credits) body.append(credits);
+      const windows = section('额度窗口');
+      if (runtime.state.data.windows.length) runtime.state.data.windows.forEach((item) => windows.append(renderWindow(item)));
+      else windows.append(el('p', 'wt-empty', '接口未提供有效额度窗口'));
+      body.append(windows, renderAnalytics(runtime.state.data));
     }
-    runtime.app.append(shell);
+    const actions = section('操作');
+    const refresh = el('div', 'wt-action-row');
+    const refreshButton = el('button', 'wt-button', '手动刷新'); refreshButton.type = 'button'; refreshButton.dataset.action = 'refresh';
+    const refreshSelect = setAttributes(el('select', 'wt-select'), { 'aria-label': '自动刷新间隔' });
+    for (const value of REFRESH_OPTIONS) { const option = setAttributes(el('option', '', `自动刷新：${formatRefresh(value)}`), { value }); option.selected = runtime.prefs.refresh === value; refreshSelect.append(option); }
+    refreshSelect.addEventListener('change', () => { runtime.prefs.refresh = Number(refreshSelect.value); writePreference(PREF_KEYS.refresh, runtime.prefs.refresh); scheduleRefresh(); });
+    refresh.append(refreshButton, refreshSelect); actions.append(refresh);
+    actions.append(linkButton(ANALYTICS_URL, '打开官方 Analytics'));
+    const usageHref = findOfficialUsageHref(); if (usageHref) actions.append(linkButton(usageHref, '打开官方 Usage'));
+    body.append(actions, renderDiagnostics());
+    shell.append(body);
+    return shell;
+  }
+
+  function render() {
+    if (!runtime.app || !runtime.host) return;
+    runtime.app.replaceChildren();
+    runtime.host.setAttribute('data-wt-mode', runtime.prefs.collapsed ? 'collapsed' : 'expanded');
+    runtime.app.append(runtime.prefs.collapsed ? renderCollapsedLauncher() : renderExpandedPanel());
     applyPosition();
   }
 
   function viewportPosition(position) {
-    const width = runtime.host ? runtime.host.offsetWidth : 400;
-    const height = runtime.host ? runtime.host.offsetHeight : 200;
-    return { left: Math.max(12, Math.min(window.innerWidth - width - 12, numberOrNull(position.left) || 12)), top: Math.max(12, Math.min(window.innerHeight - height - 12, numberOrNull(position.top) || 12)) };
+    const width = runtime.host ? runtime.host.getBoundingClientRect().width || runtime.host.offsetWidth : 400;
+    const height = runtime.host ? runtime.host.getBoundingClientRect().height || runtime.host.offsetHeight : 200;
+    const maxLeft = Math.max(12, window.innerWidth - width - 12);
+    const maxTop = Math.max(12, window.innerHeight - height - 12);
+    return { left: Math.max(12, Math.min(maxLeft, numberOrNull(position.left) ?? 12)), top: Math.max(12, Math.min(maxTop, numberOrNull(position.top) ?? 12)) };
   }
 
   function applyPosition() {
     if (!runtime.host) return;
     if (runtime.prefs.position) {
       const position = viewportPosition(runtime.prefs.position);
+      runtime.prefs.position = position;
       runtime.host.style.left = `${position.left}px`;
       runtime.host.style.top = `${position.top}px`;
       runtime.host.style.right = 'auto';
@@ -926,26 +1063,47 @@
     }
   }
 
-  function startDrag(event) {
+  function startDrag(event, dragSurface = event.currentTarget) {
     if (event.button !== undefined && event.button !== 0) return;
-    if (event.target.closest && event.target.closest('button, a, select, input, summary')) return;
     if (!runtime.host) return;
-    event.preventDefault();
+    const surface = dragSurface;
+    const isLauncher = surface.classList.contains('wt-launcher');
+    if (!isLauncher && event.target.closest && event.target.closest('button, a, select, input, summary')) return;
     const rect = runtime.host.getBoundingClientRect();
-    const offsetX = event.clientX - rect.left;
-    const offsetY = event.clientY - rect.top;
-    const surface = event.currentTarget;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const offsetX = startX - rect.left;
+    const offsetY = startY - rect.top;
+    let moved = false;
+    let ended = false;
     surface.setPointerCapture?.(event.pointerId);
     const move = (moveEvent) => {
+      if (ended) return;
+      const distance = Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY);
+      if (!moved && distance < 5) return;
+      if (!moved) {
+        moved = true;
+        moveEvent.preventDefault();
+      }
       const position = viewportPosition({ left: moveEvent.clientX - offsetX, top: moveEvent.clientY - offsetY });
       runtime.prefs.position = position;
       applyPosition();
     };
     const end = () => {
+      if (ended) return;
+      ended = true;
       surface.removeEventListener('pointermove', move);
       surface.removeEventListener('pointerup', end);
       surface.removeEventListener('pointercancel', end);
-      writePreference(PREF_KEYS.position, runtime.prefs.position);
+      surface.releasePointerCapture?.(event.pointerId);
+      if (moved) {
+        writePreference(PREF_KEYS.position, runtime.prefs.position);
+        runtime.dragSuppressUntil = Date.now() + 250;
+      } else if (isLauncher) {
+        runtime.prefs.collapsed = false;
+        writePreference(PREF_KEYS.collapsed, false);
+        render();
+      }
     };
     surface.addEventListener('pointermove', move);
     surface.addEventListener('pointerup', end, { once: true });
@@ -957,6 +1115,7 @@
     if (!actionTarget) return;
     const action = actionTarget.dataset.action;
     if (action === 'toggle') {
+      if (runtime.dragSuppressUntil && Date.now() < runtime.dragSuppressUntil) return;
       runtime.prefs.collapsed = !runtime.prefs.collapsed; writePreference(PREF_KEYS.collapsed, runtime.prefs.collapsed); render();
     } else if (action === 'refresh') {
       refresh();
@@ -982,21 +1141,23 @@
   function createStyle() {
     const style = document.createElement('style');
     style.textContent = `
-      :host { --wt-bg: #ffffff; --wt-panel: #f7f7f8; --wt-text: #202123; --wt-muted: #6b7280; --wt-border: #d9d9e0; --wt-accent: #10a37f; --wt-danger: #c2410c; --wt-shadow: 0 16px 50px rgba(0,0,0,.22); color: var(--wt-text); display: block; font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; position: fixed; width: min(420px, calc(100vw - 24px)); z-index: 100000; }
+      :host { --wt-bg: #ffffff; --wt-panel: #f7f7f8; --wt-text: #202123; --wt-muted: #6b7280; --wt-border: #d9d9e0; --wt-accent: #10a37f; --wt-danger: #c2410c; --wt-warning: #b45309; --wt-shadow: 0 16px 50px rgba(0,0,0,.22); color: var(--wt-text); display: block; font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; position: fixed; width: min(400px, calc(100vw - 24px)); z-index: 100000; }
+      :host([data-wt-mode="collapsed"]) { height: 48px; width: 48px; }
+      :host([data-wt-mode="expanded"]) { max-width: calc(100vw - 24px); }
       @media (prefers-color-scheme: dark) { :host { --wt-bg: #202123; --wt-panel: #2b2c2f; --wt-text: #f7f7f8; --wt-muted: #b5b5bd; --wt-border: #4a4b52; --wt-shadow: 0 16px 50px rgba(0,0,0,.55); } }
-      .wt-shell { background: var(--wt-bg); border: 1px solid var(--wt-border); border-radius: 16px; box-shadow: var(--wt-shadow); overflow: hidden; }
+      .wt-shell { background: var(--wt-bg); border: 1px solid var(--wt-border); border-radius: 16px; box-shadow: var(--wt-shadow); max-width: 100%; overflow: hidden; }
       .wt-header { align-items: center; background: var(--wt-panel); cursor: grab; display: flex; gap: 10px; justify-content: space-between; padding: 11px 12px; user-select: none; }
       .wt-header:active { cursor: grabbing; } .wt-title-group { min-width: 0; } .wt-title { display: block; font-size: 14px; } .wt-title-status { color: var(--wt-muted); display: block; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       button, select, a { font: inherit; } button, a, select { -webkit-tap-highlight-color: transparent; } button:focus-visible, a:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--wt-accent); outline-offset: 2px; }
-      .wt-icon-button, .wt-button, .wt-link, .wt-select { border: 1px solid var(--wt-border); border-radius: 8px; cursor: pointer; padding: 6px 9px; text-decoration: none; } .wt-icon-button { background: transparent; color: var(--wt-text); } .wt-button { background: var(--wt-accent); border-color: var(--wt-accent); color: #fff; } .wt-button-secondary, .wt-select { background: var(--wt-panel); color: var(--wt-text); } .wt-link { background: transparent; color: var(--wt-accent); display: inline-block; margin: 4px 0; }
-      .wt-compact { align-items: center; background: var(--wt-bg); border: 0; color: var(--wt-text); cursor: pointer; display: grid; gap: 3px; grid-template-columns: 1fr auto; padding: 10px 12px; text-align: left; width: 100%; } .wt-compact-reset { color: var(--wt-muted); font-size: 11px; grid-column: 1 / -1; } .wt-compact-plan { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .wt-icon-button, .wt-button, .wt-link, .wt-select { border: 1px solid var(--wt-border); border-radius: 8px; cursor: pointer; padding: 6px 9px; text-decoration: none; } .wt-icon-button { align-items: center; background: transparent; color: var(--wt-text); display: inline-flex; justify-content: center; } .wt-icon-button svg { height: 18px; width: 18px; } .wt-button { background: var(--wt-accent); border-color: var(--wt-accent); color: #fff; } .wt-button-secondary, .wt-select { background: var(--wt-panel); color: var(--wt-text); } .wt-link { background: transparent; color: var(--wt-accent); display: inline-block; margin: 4px 0; }
+      .wt-launcher { align-items: center; background: var(--wt-bg); border: 1px solid var(--wt-border); border-radius: 14px; box-shadow: 0 5px 18px rgba(0,0,0,.16); color: var(--wt-accent); cursor: grab; display: inline-flex; height: 48px; justify-content: center; padding: 0; position: relative; touch-action: none; user-select: none; width: 48px; } .wt-launcher:active { cursor: grabbing; } .wt-launcher svg { height: 24px; width: 24px; } .wt-status-dot { border: 2px solid var(--wt-bg); border-radius: 50%; bottom: 4px; height: 8px; position: absolute; right: 4px; width: 8px; } .wt-status-dot-ok { background: var(--wt-accent); } .wt-status-dot-warning { background: var(--wt-warning); } .wt-status-dot-danger { background: var(--wt-danger); }
       .wt-body { max-height: 70vh; overflow: auto; padding: 0 12px 12px; } .wt-section { border-top: 1px solid var(--wt-border); padding: 12px 0 0; } .wt-section-title, .wt-subtitle { font-size: 13px; margin: 0 0 9px; } .wt-subtitle { color: var(--wt-muted); font-size: 12px; }
       .wt-field-grid { display: grid; gap: 7px 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); } .wt-field { display: flex; flex-direction: column; min-width: 0; } .wt-field-label { color: var(--wt-muted); font-size: 11px; } .wt-field-value { overflow-wrap: anywhere; }
       .wt-badge { background: var(--wt-panel); border-radius: 999px; color: var(--wt-muted); display: inline-block; font-size: 10px; padding: 2px 7px; white-space: nowrap; } .wt-badge-ok { color: var(--wt-accent); } .wt-badge-danger { color: var(--wt-danger); }
-      .wt-window { background: var(--wt-panel); border: 1px solid var(--wt-border); border-radius: 10px; margin: 8px 0; padding: 9px; } .wt-window-heading, .wt-subsection-heading, .wt-action-row { align-items: center; display: flex; gap: 8px; justify-content: space-between; } .wt-window-meta, .wt-empty, .wt-notice, .wt-loading { color: var(--wt-muted); font-size: 12px; margin: 5px 0; } .wt-progress-wrap { margin: 8px 0; } .wt-progress { background: var(--wt-border); border-radius: 999px; height: 6px; overflow: hidden; position: relative; } .wt-progress::after { background: var(--wt-accent); border-radius: inherit; content: ''; display: block; height: 100%; width: var(--wt-progress, 0%); } .wt-progress-unknown::after { background: var(--wt-muted); width: 35%; }
+      .wt-window { background: var(--wt-panel); border: 1px solid var(--wt-border); border-radius: 10px; margin: 8px 0; padding: 9px; } .wt-window-heading, .wt-subsection-heading, .wt-action-row { align-items: center; display: flex; gap: 8px; justify-content: space-between; } .wt-window-meta, .wt-empty, .wt-notice, .wt-loading { color: var(--wt-muted); font-size: 12px; margin: 5px 0; } .wt-progress-wrap { margin: 8px 0; } .wt-progress { background: var(--wt-border); border-radius: 999px; height: 6px; overflow: hidden; position: relative; } .wt-progress::after { background: var(--wt-accent); border-radius: inherit; content: ''; display: block; height: 100%; width: var(--wt-progress, 0%); } .wt-window-percent-unknown { color: var(--wt-warning); }
       .wt-notice { border: 1px solid var(--wt-border); border-radius: 8px; padding: 8px; } .wt-notice-warning { color: #b45309; } .wt-notice-danger { color: var(--wt-danger); } .wt-subsection { border-top: 1px solid var(--wt-border); margin-top: 12px; padding-top: 10px; } .wt-client-row { border-bottom: 1px solid var(--wt-border); padding: 7px 0; } .wt-client-name, .wt-client-value { display: block; } .wt-client-value { color: var(--wt-muted); font-size: 11px; }
       .wt-chart { align-items: end; display: flex; gap: 3px; height: 130px; overflow-x: auto; padding-top: 8px; } .wt-chart-column { align-items: center; display: flex; flex: 1 0 14px; flex-direction: column; height: 100%; justify-content: end; min-width: 14px; } .wt-chart-bar { background: var(--wt-accent); border-radius: 3px 3px 0 0; min-height: 3px; width: 100%; } .wt-chart-label { color: var(--wt-muted); font-size: 9px; margin-top: 3px; transform: rotate(-45deg); transform-origin: top center; white-space: nowrap; }
-      .wt-action-row { justify-content: flex-start; margin-bottom: 5px; } .wt-diagnostics { border-top: 1px solid var(--wt-border); margin-top: 12px; padding-top: 10px; } .wt-diagnostics summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; } .wt-diagnostics .wt-field { margin: 6px 0; } .wt-loading { min-height: 120px; padding-top: 18px; } .wt-chart-select { margin-left: auto; } @media (max-width: 480px) { :host { width: calc(100vw - 24px); } .wt-body { max-height: 68vh; } }
+      .wt-action-row { justify-content: flex-start; margin-bottom: 5px; } .wt-diagnostics { border-top: 1px solid var(--wt-border); margin-top: 12px; padding-top: 10px; } .wt-diagnostics summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; } .wt-diagnostics .wt-field { margin: 6px 0; } .wt-loading { min-height: 120px; padding-top: 18px; } .wt-chart-select { margin-left: auto; } @media (max-width: 480px) { :host([data-wt-mode="expanded"]) { width: calc(100vw - 24px); } .wt-body { max-height: 68vh; } }
       @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
     `;
     return style;
@@ -1013,7 +1174,10 @@
     document.documentElement.append(host);
     runtime.host = host; runtime.shadow = shadow; runtime.app = app;
     app.addEventListener('click', handleAction);
-    app.addEventListener('pointerdown', (event) => { if (event.target.closest?.('.wt-drag-handle')) startDrag(event); });
+    app.addEventListener('pointerdown', (event) => {
+      const surface = event.target.closest?.('.wt-drag-handle');
+      if (surface) startDrag(event, surface);
+    });
     applyPosition();
     render();
     if (!runtime.state.data && !runtime.refreshPromise) refresh();

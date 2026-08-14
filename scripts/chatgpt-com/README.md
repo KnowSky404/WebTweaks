@@ -1,6 +1,6 @@
 # ChatGPT Account Usage Dashboard
 
-`account-usage-dashboard.user.js` adds a collapsible, draggable account-usage panel to `chatgpt.com`. It is a standalone Tampermonkey/Violentmonkey userscript and does not require a build step, package manager, or remote dependency.
+`account-usage-dashboard.user.js` adds a small floating usage icon to `chatgpt.com`. Click it to open the full, draggable account-usage panel. It is a standalone Tampermonkey/Violentmonkey userscript and does not require a build step, package manager, or remote dependency.
 
 ## Installation
 
@@ -14,15 +14,15 @@ The script only makes same-origin, read-only GET requests to the current ChatGPT
 - `/backend-api/wham/usage` supplies the plan, rate-limit windows, credits, and usage state.
 - `/backend-api/wham/analytics/daily-workspace-usage-counts` supplies one date range of optional daily statistics, which is then filtered and aggregated in memory for the displayed ranges.
 
-The usage request first uses cookie-only credentials. A 401/403 response may trigger a session lookup and one authenticated retry using an access token and account ID held only in memory. Analytics is optional: a 403, 404, timeout, empty response, or schema change leaves the account and quota sections available and marks only the analytics area as unavailable or partial.
+The usage request first uses cookie-only credentials. A 401/403 response may trigger a session lookup and one authenticated retry using an access token and account ID held only in memory. Analytics is optional: a 403, 404, timeout, empty response, or schema change leaves the account and quota sections available and marks only the analytics area as unavailable or partial. The normalizer understands primary/secondary windows inside `rate_limit`, arrays and maps under `rate_limits`, and wrapped `additional_rate_limits` entries.
 
 ## Displayed fields
 
-The compact view shows the plan, the primary available percentage, the nearest reset, and the current data state. The expanded panel can show:
+The compact view is only an icon with an optional health dot; it does not show the plan, percentages, or countdown. The expanded panel can show:
 
-- signed-in state, display name, masked email, raw `plan_type`, allowed/limit-reached state, and update time;
+- signed-in state, display name, masked email, plan context (including `Pro Lite` as a plan tier), usage status, and update time;
 - every recognized primary and additional rate-limit window, with duration, used/remaining percentages, progress, reset time, countdown, and limit state;
-- optional credits, reset-credit availability, and spend-control fields without treating missing or `null` values as zero;
+- optional Credits and spend-control fields only when the server supplies values, without treating missing or `null` values as zero;
 - current quota period, month, last 7 days, and last 30 days, including credits, token classes, threads, turns, and dates with data;
 - client aggregates sorted by tokens and a native CSS bar chart for the selected daily metric;
 - a manual refresh, minute-based refresh selection, official Analytics link, conditionally discovered official Usage link, and safe diagnostics.
@@ -37,7 +37,7 @@ The script only sends requests to `chatgpt.com`. It does not upload account or u
 - `plan_type` is a plan label, not proof of the complete billing or subscription lifecycle. The panel does not infer subscription validity from a plan name.
 - Analytics data may be delayed or unavailable for an account or plan. Daily aggregation uses UTC date buckets where possible.
 - When a current quota period is represented as daily rows, the reset day can include data from outside the exact quota boundary.
-- Percentages are shown only when supplied or safely derived from the other percentage; the script does not invent an official total quota or convert credits to dollars.
+- Percentages are shown only when supplied or safely derived from the other percentage; unknown percentages use an empty track and an explicit notice rather than a fabricated grey fill. The script does not invent an official total quota, message count, or token total.
 - A real signed-in browser session is required for live account data. This repository validation cannot guarantee access to a user's private ChatGPT session.
 
 ## Manual test checklist
