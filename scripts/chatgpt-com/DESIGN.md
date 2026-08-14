@@ -97,7 +97,7 @@ The launcher is a compact, draggable utility button with a generic usage/activit
 
 The expanded panel is approximately 400px wide with `max-width: calc(100vw - 24px)` and a `max-height` near 70vh. It stays within the viewport after dragging. Its structure is:
 
-1. Header: `用量与额度`, update/status text, refresh, official Analytics icon, conditionally discovered official Usage icon, and collapse control.
+1. Header: `用量与额度`, update/status text, refresh, official Analytics icon, and collapse control.
 2. Compact account summary: identity and plan badge in one block, with no redundant full-width “signed in” row.
 3. Quota windows: primary and additional windows, percentages when known, progress, reset time, countdown, and state.
 4. Analytics: selected range, metric summary, client distribution, and a native CSS/SVG daily trend.
@@ -109,7 +109,7 @@ The panel should use a small number of clear sections rather than a stack of vis
 ## Components
 
 - **Launcher:** generic usage/gauge/activity icon, `currentColor`, `viewBox="0 0 24 24"`, round line caps and joins, plus a text-accessible status label.
-- **Header:** one clear title, a low-emphasis update state, manual refresh, official Analytics, conditionally discovered official Usage, and collapse; every icon control has an accessible name.
+- **Header:** one clear title, a low-emphasis update state, manual refresh, official Analytics, and collapse; every icon control has an accessible name. The header has exactly three controls, each using the same 40 × 40px border-box. Analytics is the only retained official navigation link, and its visual dimensions match the button controls. The dashboard does not dynamically discover or display an official Usage shortcut.
 - **Account summary:** display name and masked email together when available; show a plan badge beside that identity; omit missing fields rather than leaving blank rows.
 - **Quota window:** name, primary/additional context, used and remaining values, progressbar, reset information, and textual state.
 - **Badge and indicator:** compact semantic status, never status by color alone.

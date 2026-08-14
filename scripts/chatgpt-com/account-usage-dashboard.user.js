@@ -2,7 +2,7 @@
 // @name         ChatGPT Account Usage Dashboard
 // @name:zh-CN   ChatGPT 账户用量浮窗
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.2.1
+// @version      1.2.2
 // @description  Display the current ChatGPT account plan, Codex limits, credits, and usage analytics in a private floating dashboard.
 // @description:zh-CN 在 ChatGPT 页面显示当前账号套餐、Codex 额度、Credits 与使用统计。
 // @author       KnowSky404
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.2.1';
+  const VERSION = '1.2.2';
   const HOST_ID = 'wt-chatgpt-account-usage-host';
   const SESSION_ENDPOINT = '/api/auth/session';
   const USAGE_ENDPOINT = '/backend-api/wham/usage';
@@ -1269,33 +1269,10 @@
     return svg;
   }
 
-  function officialUsageIcon() {
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    setAttributes(svg, { viewBox: '0 0 24 24', 'aria-hidden': 'true', focusable: 'false' });
-    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    setAttributes(path, { d: 'M5 5h6v2H7v10h10v-4h2v6H5V5Zm8 0h6v6h-2V8.41l-6.29 6.3-1.42-1.42L15.59 7H13V5Z', fill: 'currentColor' });
-    svg.append(path);
-    return svg;
-  }
-
   function officialLink(href, label, icon) {
-    const link = setAttributes(el('a', 'wt-icon-button wt-header-link'), { href, target: '_blank', rel: 'noopener noreferrer', 'aria-label': label, title: label });
+    const link = setAttributes(el('a', 'wt-icon-button'), { href, target: '_blank', rel: 'noopener noreferrer', 'aria-label': label, title: label });
     link.append(icon());
     return link;
-  }
-
-  function findOfficialUsageHref() {
-    for (const anchor of document.querySelectorAll('a[href]')) {
-      const text = `${anchor.textContent || ''} ${anchor.getAttribute('aria-label') || ''}`.trim();
-      const href = anchor.href;
-      if (!/usage/i.test(text) || !href || /^(javascript:|#)/i.test(href)) continue;
-      try {
-        if (new URL(href, location.href).origin === location.origin) return href;
-      } catch (_error) {
-        // An unexpected anchor URL must not affect the dashboard.
-      }
-    }
-    return null;
   }
 
   function renderDiagnostics() {
@@ -1385,8 +1362,6 @@
     refreshButton.dataset.action = 'refresh';
     controls.append(refreshButton);
     controls.append(officialLink(ANALYTICS_URL, '打开官方 Analytics', analyticsIcon));
-    const usageHref = findOfficialUsageHref();
-    if (usageHref) controls.append(officialLink(usageHref, '打开官方 Usage', officialUsageIcon));
     const toggle = setAttributes(el('button', 'wt-icon-button'), { type: 'button', 'aria-label': '收起账户用量面板', title: '收起账户用量面板', 'aria-expanded': 'true' });
     toggle.append(el('span', 'wt-close-icon', '×'));
     toggle.dataset.action = 'toggle';
@@ -1613,7 +1588,7 @@
       .wt-shell { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 16px; box-shadow: var(--wt-shadow); max-width: 100%; overflow: hidden; }
       .wt-header { align-items: center; background: var(--wt-color-bg); border-bottom: 1px solid var(--wt-color-border-subtle); cursor: grab; display: flex; gap: 12px; justify-content: space-between; padding: 14px 16px 12px; user-select: none; } .wt-header:active { cursor: grabbing; } .wt-title-group { flex: 1 1 auto; min-width: 0; } .wt-title { display: block; font-size: 15px; font-weight: 600; letter-spacing: -.01em; } .wt-title-status { color: var(--wt-color-text-tertiary); display: block; font-size: 11px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .wt-header-controls { align-items: center; display: flex; flex: 0 0 auto; gap: 4px; }
       button, select, input, a { font: inherit; } button, a, select, input { -webkit-tap-highlight-color: transparent; } button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--wt-color-focus); outline-offset: 2px; }
-      .wt-icon-button, .wt-button, .wt-select { border: 1px solid var(--wt-color-border); border-radius: 8px; cursor: pointer; min-height: 40px; padding: 6px 10px; text-decoration: none; } .wt-icon-button { align-items: center; background: transparent; color: var(--wt-color-text-secondary); display: inline-flex; justify-content: center; min-height: 40px; min-width: 40px; padding: 8px; } .wt-icon-button:hover { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-icon-button svg { height: 18px; width: 18px; } .wt-icon-button-loading svg { animation: wt-spin .8s linear infinite; } .wt-close-icon { font-size: 22px; font-weight: 300; line-height: 1; } .wt-button { background: var(--wt-color-primary); border-color: var(--wt-color-primary); color: var(--wt-color-primary-text); } .wt-button:hover { background: var(--wt-color-primary-hover); } .wt-button-secondary, .wt-select { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-button-quiet { background: transparent; border-color: transparent; color: var(--wt-color-text-secondary); } .wt-header-link { flex: 0 0 40px; }
+      .wt-icon-button, .wt-button, .wt-select { border: 1px solid var(--wt-color-border); border-radius: 8px; cursor: pointer; min-height: 40px; padding: 6px 10px; text-decoration: none; } .wt-icon-button { align-items: center; background: transparent; box-sizing: border-box; color: var(--wt-color-text-secondary); display: inline-flex; flex: 0 0 40px; height: 40px; justify-content: center; min-height: 40px; min-width: 40px; padding: 0; width: 40px; } .wt-icon-button:hover { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-icon-button svg { flex: 0 0 18px; height: 18px; width: 18px; } .wt-icon-button-loading svg { animation: wt-spin .8s linear infinite; } .wt-close-icon { font-size: 22px; font-weight: 300; line-height: 1; } .wt-button { background: var(--wt-color-primary); border-color: var(--wt-color-primary); color: var(--wt-color-primary-text); } .wt-button:hover { background: var(--wt-color-primary-hover); } .wt-button-secondary, .wt-select { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-button-quiet { background: transparent; border-color: transparent; color: var(--wt-color-text-secondary); }
       .wt-launcher { align-items: center; background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 13px; box-shadow: 0 5px 18px rgba(0,0,0,.14); color: var(--wt-color-text); cursor: grab; display: inline-flex; height: 46px; justify-content: center; padding: 0; position: relative; touch-action: none; user-select: none; width: 46px; } .wt-launcher:hover { background: var(--wt-color-surface); } .wt-launcher:active { cursor: grabbing; } .wt-launcher svg { height: 23px; width: 23px; } .wt-status-dot { border: 2px solid var(--wt-color-bg); border-radius: 50%; bottom: 4px; height: 8px; position: absolute; right: 4px; width: 8px; } .wt-status-dot-ok { background: var(--wt-color-success); } .wt-status-dot-warning { background: var(--wt-color-warning); } .wt-status-dot-danger { background: var(--wt-color-danger); }
       .wt-body { max-height: 70vh; overflow: auto; padding: 0 16px 16px; } .wt-section { border-top: 1px solid var(--wt-color-border-subtle); padding: 16px 0 0; } .wt-section-title, .wt-subtitle { font-size: 13px; font-weight: 600; margin: 0 0 10px; } .wt-subtitle { color: var(--wt-color-text-secondary); font-size: 12px; }
       .wt-account-summary { align-items: center; display: grid; gap: 4px 10px; grid-template-columns: minmax(0, 1fr) auto; padding: 16px 0 14px; } .wt-identity-block { align-items: center; display: flex; gap: 10px; min-width: 0; } .wt-avatar { align-items: center; background: var(--wt-color-surface-secondary); border-radius: 50%; color: var(--wt-color-text-secondary); display: inline-flex; flex: 0 0 34px; font-size: 15px; font-weight: 600; height: 34px; justify-content: center; width: 34px; } .wt-identity-copy { display: flex; flex-direction: column; min-width: 0; } .wt-account-name, .wt-account-email { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .wt-account-name { font-size: 13px; font-weight: 600; } .wt-account-email { color: var(--wt-color-text-secondary); font-size: 11px; margin-top: 2px; } .wt-account-side { align-items: flex-end; display: flex; flex-direction: column; gap: 5px; } .wt-account-meta { color: var(--wt-color-text-tertiary); font-size: 11px; grid-column: 1 / -1; padding-left: 44px; } .wt-account-status { align-items: center; color: var(--wt-color-text-secondary); display: inline-flex; font-size: 11px; gap: 5px; } .wt-account-status-ok { color: var(--wt-color-success); } .wt-account-status-warning { color: var(--wt-color-warning); } .wt-account-status-danger { color: var(--wt-color-danger); } .wt-status-dot-inline { background: currentColor; border-radius: 50%; height: 7px; width: 7px; }

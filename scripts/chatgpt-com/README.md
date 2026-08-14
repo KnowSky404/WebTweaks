@@ -25,7 +25,11 @@ The compact view is only an icon with an optional health dot; it does not show t
 - optional Credits and spend-control fields only when the server supplies values, without treating missing or `null` values as zero;
 - current quota period, month, last 7 days, and last 30 days, including credits, token classes, threads, turns, and dates with data;
 - client aggregates sorted by tokens and a native CSS bar chart for the selected daily metric;
-- a manual refresh, fixed five-minute refresh, title-bar links to official Analytics and conditionally discovered official Usage, and safe diagnostics.
+- manual refresh;
+- fixed five-minute automatic refresh;
+- opening official Analytics in a new tab;
+- collapsing the panel;
+- safe diagnostics.
 
 ## UI design and product boundary
 
@@ -78,7 +82,7 @@ On a disposable browser profile or a signed-in ChatGPT session, verify:
 5. Signed-out, 401/403, 404, 429, timeout, empty-analytics, and partial-schema states remain understandable.
 6. A usage response with missing, `null`, unknown, snake_case, camelCase, single-window, array, object, and additional-window shapes renders without an uncaught exception.
 7. Analytics ranges and client aggregates derive from one daily request, the daily trend Tooltip matches the returned row value, and the title-bar Analytics link works.
-8. The title bar shows Usage only when a safe same-origin Usage URL is discovered; no footer settings/link block is rendered.
+8. The title bar contains only refresh, official Analytics, and collapse; no footer settings/link block is rendered.
 9. The console and copied diagnostics contain no token, cookie, account ID, raw response, or full email.
 
 ## Maintenance notes
