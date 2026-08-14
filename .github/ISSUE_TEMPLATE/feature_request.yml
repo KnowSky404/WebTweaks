@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest a focused website optimization
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: input
+    id: website
+    attributes:
+      label: Target website
+      description: Which website should this affect?
+    validations:
+      required: true
+  - type: textarea
+    id: optimization
+    attributes:
+      label: Requested optimization
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Current problem
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: references
+    attributes:
+      label: References or screenshots
+      description: Remove private information before sharing.
