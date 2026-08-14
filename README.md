@@ -10,12 +10,9 @@ Install a compatible userscript manager, then open a script's raw `.user.js` fil
 
 ## Script index
 
-Scripts will be added as real site-specific needs arise. There are currently no scripts in the repository.
-
-Future entries use this format:
-
 | Website | Script | Description | Install |
 | --- | --- | --- | --- |
+| [chatgpt.com](https://chatgpt.com/) | ChatGPT Account Usage Dashboard | Private, read-only floating dashboard for the current plan, Codex limits, credits, and available usage analytics. | [Install raw script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/chatgpt-com/account-usage-dashboard.user.js) |
 
 ## Repository structure
 
