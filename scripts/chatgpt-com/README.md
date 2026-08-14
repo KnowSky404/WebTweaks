@@ -27,9 +27,36 @@ The compact view is only an icon with an optional health dot; it does not show t
 - client aggregates sorted by tokens and a native CSS bar chart for the selected daily metric;
 - a manual refresh, minute-based refresh selection, official Analytics link, conditionally discovered official Usage link, and safe diagnostics.
 
+## UI design and product boundary
+
+The launcher is a 44–48px draggable utility button with a generic usage/activity inline SVG, a subtle border and shadow, and a status indicator. A small pointer movement does not open the panel after a drag. The expanded panel uses the local `wt-` design tokens, a compact account summary, quota-window sections, analytics, secondary actions, and collapsed diagnostics. It is sized for approximately 400px while remaining usable at narrow viewports.
+
+The visual direction is a local adaptation of public [OpenAI Apps SDK UI](DESIGN.md#official-references) patterns. This is an unofficial userscript, not an OpenAI, ChatGPT, or Codex product. It does not use the OpenAI Logo, Blossom, wordmark, or other OpenAI marks; launcher icons are generic usage/activity symbols. See [`DESIGN.md`](DESIGN.md) for the complete site-level specification.
+
+## Plan labels and quota semantics
+
+The display mapping keeps product labels readable without treating a plan label as a quota calculator:
+
+| Server plan type | Display label |
+| --- | --- |
+| `prolite` | Pro Lite（Pro 5X） |
+| `pro` | Pro（Pro 20X） |
+| `plus` | Plus |
+| `free` | Free |
+
+`5X` and `20X` are tier descriptions only. They do not calculate absolute messages, override server values, prove billing or renewal status, or provide a hardcoded price. The current allowance, percentage, reset time, and limit state remain authoritative only when supplied by the server's quota window. Unknown future plan types are rendered as readable fallback text rather than silently assigned a known tier.
+
+## Analytics ranges and privacy boundary
+
+Analytics supports the current cycle, current month, last 7 days, last 30 days, and a custom range. The 7-day range means today plus the previous 6 UTC calendar days; the 30-day range means today plus the previous 29 UTC calendar days. Each range therefore contains at most 7 or 30 UTC date buckets, respectively.
+
+Custom dates use UTC date buckets and an inclusive UI end date: `2026-08-01 — 2026-08-14` includes August 14. The request boundary converts that end date to the next UTC date for exclusive filtering. A custom range must be valid, must not end in the future, and is limited to a maximum of 366 days as a project-side defensive limit, not an OpenAI API limit.
+
+Daily analytics rows and derived client/metric aggregates are kept in memory only. The dashboard does not persist usage history, raw analytics responses, tokens, Credits, account identifiers, or client aggregates in `localStorage` or IndexedDB. Non-sensitive UI preferences may be persisted separately.
+
 ## Privacy and security
 
-The script only sends requests to `chatgpt.com`. It does not upload account or usage data, add telemetry, call third-party services, or perform account mutations. It does not persist tokens, cookies, account IDs, session objects, email addresses, usernames, raw payloads, or usage snapshots. Only non-sensitive UI preferences are saved: panel position, collapsed state, selected range, refresh interval, email visibility, and chart metric. Authentication values are never placed in the DOM, console, clipboard, or error text.
+The script only sends requests to `chatgpt.com`. It does not upload account or usage data, add telemetry, call third-party services, or perform account mutations. It does not persist tokens, cookies, account IDs, session objects, email addresses, usernames, raw payloads, or usage snapshots. Only non-sensitive UI preferences are saved: panel position, collapsed state, selected range, refresh interval, email visibility, chart metric, and custom start/end dates. Authentication values are never placed in the DOM, console, clipboard, or error text.
 
 ## Known limitations
 

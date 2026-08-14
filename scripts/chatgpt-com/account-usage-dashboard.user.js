@@ -2,7 +2,7 @@
 // @name         ChatGPT Account Usage Dashboard
 // @name:zh-CN   ChatGPT 账户用量浮窗
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.1.0
+// @version      1.2.0
 // @description  Display the current ChatGPT account plan, Codex limits, credits, and usage analytics in a private floating dashboard.
 // @description:zh-CN 在 ChatGPT 页面显示当前账号套餐、Codex 额度、Credits 与使用统计。
 // @author       KnowSky404
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const HOST_ID = 'wt-chatgpt-account-usage-host';
   const SESSION_ENDPOINT = '/api/auth/session';
   const USAGE_ENDPOINT = '/backend-api/wham/usage';
@@ -26,14 +26,39 @@
   const ANALYTICS_URL = 'https://chatgpt.com/codex/cloud/settings/analytics';
   const REQUEST_TIMEOUT_MS = 8000;
   const REFRESH_OPTIONS = [0, 60_000, 300_000, 600_000, 1_800_000];
-  const RANGE_OPTIONS = ['cycle', 'month', '7d', '30d'];
+  const MAX_CUSTOM_RANGE_DAYS = 366;
+  // OpenAI Codex exposes ProLite and Pro plan types; this product surface names them Pro 5X and Pro 20X.
+  // These are tier names, not a quota calculator. The server window remains authoritative.
+  const PLAN_DISPLAY = Object.freeze({
+    free: { label: 'Free', hint: '有限 Codex 使用' },
+    go: { label: 'Go', hint: '扩展基础使用' },
+    plus: { label: 'Plus', hint: '扩展 Codex 用量' },
+    prolite: { label: 'Pro Lite（Pro 5X）', hint: 'Pro 5X 套餐档位' },
+    pro: { label: 'Pro（Pro 20X）', hint: 'Pro 20X 套餐档位' },
+    business: { label: 'Business', hint: 'Business 工作区档位' },
+    team: { label: 'Business', hint: 'Business 工作区档位' },
+    enterprise: { label: 'Enterprise', hint: 'Enterprise 工作区档位' },
+    enterprise_cbp: { label: 'Enterprise', hint: 'Enterprise 工作区档位' },
+    enterprise_cbp_usage_based: { label: 'Enterprise', hint: 'Enterprise 工作区档位' },
+    edu: { label: 'Edu', hint: 'Edu 教育档位' }
+  });
+  const RANGE_PRESETS = Object.freeze([
+    { id: 'cycle', label: '当前周期' },
+    { id: 'month', label: '本月' },
+    { id: '7d', label: '近 7 天' },
+    { id: '30d', label: '近 30 天' },
+    { id: 'custom', label: '自定义' }
+  ]);
+  const RANGE_OPTIONS = RANGE_PRESETS.map((range) => range.id);
   const PREF_KEYS = {
     position: 'wt-chatgpt-account-usage:position',
     collapsed: 'wt-chatgpt-account-usage:collapsed',
     range: 'wt-chatgpt-account-usage:range',
     refresh: 'wt-chatgpt-account-usage:refresh-interval',
     email: 'wt-chatgpt-account-usage:show-email',
-    metric: 'wt-chatgpt-account-usage:chart-metric'
+    metric: 'wt-chatgpt-account-usage:chart-metric',
+    customStart: 'wt-chatgpt-account-usage:custom-start',
+    customEnd: 'wt-chatgpt-account-usage:custom-end'
   };
   const DEFAULT_PREFS = {
     position: null,
@@ -41,7 +66,9 @@
     range: 'cycle',
     refresh: 300_000,
     email: true,
-    metric: 'tokens'
+    metric: 'tokens',
+    customStart: null,
+    customEnd: null
   };
 
   const runtime = {
@@ -60,7 +87,9 @@
     accountFingerprint: null,
     originalPushState: null,
     originalReplaceState: null,
-    visibilityHandler: null
+    visibilityHandler: null,
+    analyticsPromise: null,
+    lastUsageHeaders: {}
   };
 
   function createInitialState() {
@@ -72,6 +101,7 @@
       error: null,
       analyticsError: null,
       fetchedAt: null,
+      analytics: createAnalyticsState(),
       diagnostics: {
         usageStatus: null,
         analyticsStatus: null,
@@ -85,6 +115,21 @@
         unknownFields: [],
         errors: []
       }
+    };
+  }
+
+  function createAnalyticsState() {
+    return {
+      dailyRows: [],
+      clientRows: [],
+      ranges: {},
+      coverage: { start: null, end: null, segments: [] },
+      loading: false,
+      error: null,
+      lastRequest: null,
+      cacheHit: false,
+      selectedBucketCount: 0,
+      lastGoodRange: '30d'
     };
   }
 
@@ -207,8 +252,38 @@
     return date.toISOString().slice(0, 10);
   }
 
-  function daysFromNowUTC(days) {
-    return addDays(todayKeyUTC(), days);
+  function inclusiveRangeToExclusiveRange(startDate, endInclusive) {
+    return { start: startDate, end: addDays(endInclusive, 1) };
+  }
+
+  function lastNDaysRange(days) {
+    const today = todayKeyUTC();
+    return { start: addDays(today, -(days - 1)), end: addDays(today, 1) };
+  }
+
+  function dateDifferenceInDays(startDate, endDate) {
+    const start = new Date(`${startDate}T00:00:00Z`).getTime();
+    const end = new Date(`${endDate}T00:00:00Z`).getTime();
+    return Number.isFinite(start) && Number.isFinite(end) ? Math.round((end - start) / 86_400_000) : null;
+  }
+
+  function isValidDateKey(value) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) return false;
+    const date = new Date(`${value}T00:00:00Z`);
+    return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+  }
+
+  function validateCustomRange(startDate, endDate, now = Date.now()) {
+    const today = dateKeyUTC(now);
+    if (!startDate) return '请选择开始日期';
+    if (!endDate) return '请选择结束日期';
+    if (!isValidDateKey(startDate) || !isValidDateKey(endDate)) return '请选择有效日期';
+    if (startDate > endDate) return '开始日期不能晚于结束日期';
+    if (endDate > today) return '结束日期不能晚于今天';
+    const days = dateDifferenceInDays(startDate, endDate);
+    if (days === null || days < 0) return '日期范围无效';
+    if (days + 1 > MAX_CUSTOM_RANGE_DAYS) return `日期范围不能超过 ${MAX_CUSTOM_RANGE_DAYS} 天`;
+    return null;
   }
 
   function sumOptional(values) {
@@ -266,7 +341,9 @@
       range: RANGE_OPTIONS.includes(readPreference(PREF_KEYS.range, DEFAULT_PREFS.range)) ? readPreference(PREF_KEYS.range, DEFAULT_PREFS.range) : DEFAULT_PREFS.range,
       refresh: REFRESH_OPTIONS.includes(numberOrNull(readPreference(PREF_KEYS.refresh, DEFAULT_PREFS.refresh))) ? numberOrNull(readPreference(PREF_KEYS.refresh, DEFAULT_PREFS.refresh)) : DEFAULT_PREFS.refresh,
       email: readPreference(PREF_KEYS.email, DEFAULT_PREFS.email) !== false,
-      metric: readPreference(PREF_KEYS.metric, DEFAULT_PREFS.metric) === 'credits' ? 'credits' : 'tokens'
+      metric: readPreference(PREF_KEYS.metric, DEFAULT_PREFS.metric) === 'credits' ? 'credits' : 'tokens',
+      customStart: typeof readPreference(PREF_KEYS.customStart, DEFAULT_PREFS.customStart) === 'string' ? readPreference(PREF_KEYS.customStart, DEFAULT_PREFS.customStart) : null,
+      customEnd: typeof readPreference(PREF_KEYS.customEnd, DEFAULT_PREFS.customEnd) === 'string' ? readPreference(PREF_KEYS.customEnd, DEFAULT_PREFS.customEnd) : null
     };
   }
 
@@ -349,29 +426,13 @@
     return payload;
   }
 
-  function planLabel(rawType) {
+  function planDisplay(rawType) {
     const key = typeof rawType === 'string' ? rawType.toLowerCase() : '';
-    const labels = {
-      free: 'Free', go: 'Go', plus: 'Plus', pro: 'Pro', prolite: 'Pro Lite', business: 'Business', team: 'Business',
-      enterprise: 'Enterprise', enterprise_cbp: 'Enterprise', enterprise_cbp_usage_based: 'Enterprise', edu: 'Edu'
-    };
-    return labels[key] || (rawType ? prettyName(String(rawType)) : '未提供');
-  }
-
-  function planDescription(rawType) {
-    const key = typeof rawType === 'string' ? rawType.toLowerCase() : '';
-    const descriptions = {
-      prolite: 'Pro 较低用量档',
-      pro: 'Pro 高用量档',
-      plus: 'Plus 订阅档',
-      free: '免费档位',
-      go: 'Go 订阅档',
-      business: 'Business 工作区档位',
-      team: 'Business 工作区档位',
-      enterprise: 'Enterprise 工作区档位',
-      edu: 'Edu 教育档位'
-    };
-    return descriptions[key] || null;
+    if (PLAN_DISPLAY[key]) return PLAN_DISPLAY[key];
+    if (/self[-_ ]?serve.*business|business.*self[-_ ]?serve/.test(key)) return PLAN_DISPLAY.business;
+    if (/enterprise/.test(key)) return PLAN_DISPLAY.enterprise;
+    if (/business/.test(key)) return PLAN_DISPLAY.business;
+    return { label: rawType ? prettyName(String(rawType)) : '未提供', hint: '接口返回的未知套餐档位' };
   }
 
   function durationSeconds(source) {
@@ -520,7 +581,7 @@
     const spendRemainingPercent = clampPercent(firstDefined(spend, ['remaining_percent', 'remainingPercent']));
     return {
       session: { signedIn: identity.signedIn, displayName: identity.displayName, maskedEmail: maskEmail(identity.email) },
-      plan: { rawType: rawType === null ? null : String(rawType), label: planLabel(rawType), allowed, limitReached },
+      plan: { rawType: rawType === null ? null : String(rawType), ...planDisplay(rawType), allowed, limitReached },
       windows,
       credits: {
         hasCredits: boolOrNull(firstDefined(credits, ['has_credits', 'hasCredits'])),
@@ -578,15 +639,15 @@
 
   function deriveRanges(rows, windows, now = Date.now()) {
     const monthStart = `${new Date(now).getUTCFullYear()}-${String(new Date(now).getUTCMonth() + 1).padStart(2, '0')}-01`;
-    const thirtyStart = daysFromNowUTC(-30);
+    const seven = lastNDaysRange(7);
+    const thirty = lastNDaysRange(30);
     const longWindow = windows.filter((item) => item.durationSeconds && item.durationSeconds >= 24 * 3600).sort((a, b) => (b.durationSeconds || 0) - (a.durationSeconds || 0))[0] || windows[0];
-    const cycleStart = longWindow && longWindow.resetAt && longWindow.durationSeconds ? dateKeyUTC(longWindow.resetAt - longWindow.durationSeconds * 1000) : thirtyStart;
-    const end = daysFromNowUTC(1);
+    const cycleStart = longWindow && longWindow.resetAt && longWindow.durationSeconds ? dateKeyUTC(longWindow.resetAt - longWindow.durationSeconds * 1000) : thirty.start;
     return {
-      cycle: { label: '当前周期', start: cycleStart || thirtyStart, end, stats: aggregateRows(rows, cycleStart || thirtyStart, end) },
-      month: { label: '本月', start: monthStart, end, stats: aggregateRows(rows, monthStart, end) },
-      '7d': { label: '最近 7 天', start: daysFromNowUTC(-7), end, stats: aggregateRows(rows, daysFromNowUTC(-7), end) },
-      '30d': { label: '最近 30 天', start: thirtyStart, end, stats: aggregateRows(rows, thirtyStart, end) }
+      cycle: { label: '当前周期', start: cycleStart || thirty.start, end: thirty.end, stats: aggregateRows(rows, cycleStart || thirty.start, thirty.end) },
+      month: { label: '本月', start: monthStart, end: thirty.end, stats: aggregateRows(rows, monthStart, thirty.end) },
+      '7d': { label: '近 7 天', start: seven.start, end: seven.end, stats: aggregateRows(rows, seven.start, seven.end) },
+      '30d': { label: '近 30 天', start: thirty.start, end: thirty.end, stats: aggregateRows(rows, thirty.start, thirty.end) }
     };
   }
 
@@ -605,12 +666,93 @@
 
   function analyticsRequestRange(windows, now = Date.now()) {
     const monthStart = `${new Date(now).getUTCFullYear()}-${String(new Date(now).getUTCMonth() + 1).padStart(2, '0')}-01`;
-    const thirtyStart = daysFromNowUTC(-30);
+    const thirtyStart = lastNDaysRange(30).start;
     const starts = [monthStart, thirtyStart];
+    if (runtime.prefs.range === 'custom' && runtime.prefs.customStart && runtime.prefs.customEnd && !validateCustomRange(runtime.prefs.customStart, runtime.prefs.customEnd, now)) starts.push(runtime.prefs.customStart);
     for (const window of windows) {
       if (window.resetAt && window.durationSeconds) starts.push(dateKeyUTC(window.resetAt - window.durationSeconds * 1000));
     }
-    return { start: starts.filter(Boolean).sort()[0] || thirtyStart, end: daysFromNowUTC(1) };
+    return { start: starts.filter(Boolean).sort()[0] || thirtyStart, end: lastNDaysRange(30).end };
+  }
+
+  function mergeDailyRows(currentRows, incomingRows) {
+    const byDate = new Map(currentRows.map((row) => [row.date, row]));
+    incomingRows.forEach((row) => byDate.set(row.date, row));
+    return [...byDate.values()].sort((left, right) => left.date.localeCompare(right.date));
+  }
+
+  function mergeCoverage(coverage, start, end) {
+    const segments = [...coverage.segments, { start, end }].sort((left, right) => left.start.localeCompare(right.start));
+    const merged = [];
+    for (const segment of segments) {
+      const previous = merged[merged.length - 1];
+      if (previous && segment.start <= previous.end) previous.end = previous.end > segment.end ? previous.end : segment.end;
+      else merged.push({ ...segment });
+    }
+    coverage.segments = merged;
+    coverage.start = merged[0]?.start || null;
+    coverage.end = merged[merged.length - 1]?.end || null;
+  }
+
+  function isRangeCovered(start, endExclusive) {
+    return runtime.state.analytics.coverage.segments.some((segment) => segment.start <= start && segment.end >= endExclusive);
+  }
+
+  function rebuildAnalyticsRanges(now = Date.now()) {
+    const analytics = runtime.state.analytics;
+    const windows = runtime.state.data?.windows || [];
+    analytics.ranges = deriveRanges(analytics.dailyRows, windows, now);
+    if (runtime.prefs.customStart && runtime.prefs.customEnd && !validateCustomRange(runtime.prefs.customStart, runtime.prefs.customEnd, now)) {
+      const range = inclusiveRangeToExclusiveRange(runtime.prefs.customStart, runtime.prefs.customEnd);
+      analytics.ranges.custom = { label: `自定义 · ${runtime.prefs.customStart} — ${runtime.prefs.customEnd}`, start: range.start, end: range.end, stats: aggregateRows(analytics.dailyRows, range.start, range.end) };
+    }
+    const selected = analytics.ranges[runtime.prefs.range] || analytics.ranges[analytics.lastGoodRange] || analytics.ranges['30d'];
+    analytics.clientRows = selected ? aggregateClients(analytics.dailyRows, selected.start, selected.end) : [];
+    analytics.selectedBucketCount = selected?.stats?.dates || 0;
+  }
+
+  async function fetchAnalyticsRange(start, endExclusive, headers = {}) {
+    const analytics = runtime.state.analytics;
+    if (isRangeCovered(start, endExclusive)) {
+      analytics.cacheHit = true;
+      rebuildAnalyticsRanges();
+      return true;
+    }
+    if (runtime.analyticsPromise) {
+      await runtime.analyticsPromise;
+      return fetchAnalyticsRange(start, endExclusive, headers);
+    }
+    analytics.cacheHit = false;
+    analytics.loading = true;
+    analytics.error = null;
+    analytics.lastRequest = { start, end: endExclusive };
+    runtime.state.analyticsError = null;
+    render();
+    runtime.analyticsPromise = (async () => {
+      const query = new URLSearchParams({ start_date: start, end_date: endExclusive, group_by: 'day' });
+      const result = await requestJSON(`${ANALYTICS_ENDPOINT}?${query.toString()}`, { controller: runtime.abortController, headers });
+      runtime.state.diagnostics.analyticsStatus = result.status;
+      if (!result.ok || !result.data) {
+        analytics.error = errorMessage(result, true);
+        runtime.state.analyticsError = analytics.error;
+        runtime.state.diagnostics.errors = [result.status || result.error || 'analytics'];
+        return false;
+      }
+      const rows = normalizeDailyRows(result.data);
+      analytics.dailyRows = mergeDailyRows(analytics.dailyRows, rows);
+      mergeCoverage(analytics.coverage, start, endExclusive);
+      analytics.error = null;
+      runtime.state.analyticsError = null;
+      runtime.state.diagnostics.dailyRows = analytics.dailyRows.length;
+      rebuildAnalyticsRanges();
+      runtime.state.diagnostics.clientTypes = analytics.clientRows.map((item) => item.clientId);
+      return true;
+    })().finally(() => {
+      analytics.loading = false;
+      runtime.analyticsPromise = null;
+      render();
+    });
+    return runtime.analyticsPromise;
   }
 
   function errorMessage(result, analytics = false) {
@@ -642,7 +784,7 @@
   async function refresh() {
     if (runtime.refreshPromise) return runtime.refreshPromise;
     runtime.refreshPromise = (async () => {
-      runtime.state.loading = !runtime.state.data;
+      runtime.state.loading = true;
       runtime.state.error = null;
       render();
       if (runtime.abortController) runtime.abortController.abort();
@@ -660,6 +802,15 @@
         runtime.state.stale = Boolean(runtime.state.data);
         runtime.state.error = errorMessage(usageBundle.result);
         runtime.state.signedIn = usageBundle.result.status !== 401 && sessionResult.status !== 401 ? null : false;
+        if (runtime.state.signedIn === false) {
+          runtime.state.data = null;
+          runtime.state.analytics = createAnalyticsState();
+          runtime.state.analyticsError = null;
+          runtime.state.diagnostics.analyticsStatus = null;
+          runtime.state.diagnostics.dailyRows = 0;
+          runtime.state.diagnostics.clientTypes = [];
+          runtime.lastUsageHeaders = {};
+        }
         runtime.state.diagnostics.errors = [usageBundle.result.status || usageBundle.result.error || 'usage'];
         render();
         return;
@@ -679,8 +830,14 @@
       const fingerprint = accountId || firstDefined(session, ['user.id', 'user.sub']) || (identity.email ? `email:${identity.email}` : null);
       if (sessionResult.status === 401 || (runtime.accountFingerprint && fingerprint && runtime.accountFingerprint !== fingerprint)) {
         runtime.state.data = null;
+        runtime.state.analytics = createAnalyticsState();
+        runtime.state.analyticsError = null;
+        runtime.state.diagnostics.analyticsStatus = null;
+        runtime.state.diagnostics.dailyRows = 0;
+        runtime.state.diagnostics.clientTypes = [];
       }
       runtime.accountFingerprint = fingerprint;
+      runtime.lastUsageHeaders = usageBundle.headers;
       runtime.state.signedIn = identity.signedIn;
       if (sessionResult.status === 401) normalized.session.signedIn = false;
       runtime.state.diagnostics.unknownFields = unknownUsageFields(unwrapData(usageBundle.result.data));
@@ -694,31 +851,16 @@
         hasUsedPercent: item.usedPercent !== null,
         hasResetAt: item.resetAt !== null
       }));
-      const range = analyticsRequestRange(normalized.windows, startedAt);
-      const query = new URLSearchParams({ start_date: range.start, end_date: range.end, group_by: 'day' });
-      const analyticsResult = await requestJSON(`${ANALYTICS_ENDPOINT}?${query.toString()}`, { controller: runtime.abortController, headers: usageBundle.headers });
-      runtime.state.diagnostics.analyticsStatus = analyticsResult.status;
-      if (analyticsResult.ok && analyticsResult.data) {
-        const rows = normalizeDailyRows(analyticsResult.data);
-        normalized.analytics.dailyRows = rows;
-        normalized.analytics.ranges = deriveRanges(rows, normalized.windows, startedAt);
-        const selectedRange = normalized.analytics.ranges[runtime.prefs.range] || normalized.analytics.ranges['30d'];
-        normalized.analytics.clientRows = aggregateClients(rows, selectedRange.start, selectedRange.end);
-        runtime.state.analyticsError = null;
-        runtime.state.diagnostics.dailyRows = rows.length;
-        runtime.state.diagnostics.clientTypes = normalized.analytics.clientRows.map((item) => item.clientId);
-      } else {
-        normalized.partial = true;
-        normalized.errors.push(errorMessage(analyticsResult, true));
-        runtime.state.analyticsError = errorMessage(analyticsResult, true);
-        runtime.state.diagnostics.errors = [analyticsResult.status || analyticsResult.error || 'analytics'];
-      }
       runtime.state.data = normalized;
+      rebuildAnalyticsRanges(startedAt);
       runtime.state.fetchedAt = startedAt;
       runtime.state.loading = false;
       runtime.state.stale = false;
       runtime.state.error = null;
       render();
+      const range = analyticsRequestRange(normalized.windows, startedAt);
+      const analyticsLoaded = await fetchAnalyticsRange(range.start, range.end, usageBundle.headers);
+      if (!analyticsLoaded) normalized.partial = true;
     })().catch((error) => {
       if (error && error.name === 'AbortError') return;
       runtime.state.loading = false;
@@ -785,7 +927,8 @@
   function renderWindow(window) {
     const card = el('article', 'wt-window');
     const heading = el('div', 'wt-window-heading');
-    heading.append(el('strong', 'wt-window-label', window.label), statusBadge(window.limitReached === true ? '已达到限制' : window.allowed === false ? '不可用' : '可用', window.limitReached === true ? 'danger' : 'ok'));
+    const windowStatus = window.limitReached === true ? '已达到限制' : window.allowed === false ? '不可用' : window.allowed === true ? '可用' : '状态未提供';
+    heading.append(el('strong', 'wt-window-label', window.label), statusBadge(windowStatus, window.limitReached === true ? 'danger' : window.allowed === false ? 'warning' : window.allowed === true ? 'ok' : 'warning'));
     const meta = `${window.scope === 'additional' ? '额外额度' : '主额度'}${window.durationSeconds !== null ? ` · 周期 ${formatDuration(window.durationSeconds)}` : ''}`;
     card.append(heading, el('div', 'wt-window-meta', meta));
     if (window.usedPercent === null && window.remainingPercent === null) {
@@ -802,16 +945,39 @@
     return card;
   }
 
-  function renderAccount(data) {
-    const node = section('当前账户');
-    appendFieldIfValue(node, '登录状态', data.session.signedIn === null ? '状态未提供' : data.session.signedIn ? '已登录' : '未登录');
-    appendFieldIfValue(node, '显示名', data.session.displayName);
-    if (runtime.prefs.email) appendFieldIfValue(node, '邮箱（脱敏）', data.session.maskedEmail);
-    appendFieldIfValue(node, '套餐', data.plan.label);
-    appendFieldIfValue(node, '套餐说明', planDescription(data.plan.rawType));
-    const usageStatus = data.plan.limitReached === true ? '已达到限制' : data.plan.allowed === false ? '不可用' : data.plan.allowed === true ? '可用' : '状态未提供';
-    appendFieldIfValue(node, '用量状态', usageStatus);
-    appendFieldIfValue(node, '最后更新时间', formatDate(data.fetchedAt));
+  function avatarInitial(name) {
+    if (typeof name !== 'string' || !name.trim()) return '·';
+    const value = name.trim();
+    return /^[A-Za-z]/.test(value) ? value[0].toUpperCase() : value[0];
+  }
+
+  function formatUpdatedAt(value) {
+    const timestamp = parseTimestamp(value);
+    if (timestamp === null) return '更新时间未提供';
+    const date = new Date(timestamp);
+    const today = todayKeyUTC();
+    return dateKeyUTC(timestamp) === today
+      ? `更新于 ${new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(date)}`
+      : `更新于 ${new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date)}`;
+  }
+
+  function renderAccountSummary(data) {
+    if (data.session.signedIn === false) return el('div', 'wt-notice wt-notice-warning', '当前未登录 ChatGPT，登录后可查看账户用量。');
+    if (data.session.signedIn !== true) return el('div', 'wt-notice wt-notice-warning', '登录状态暂无法确认，请稍后刷新。');
+    const node = el('section', 'wt-account-summary');
+    const identity = el('div', 'wt-identity-block');
+    identity.append(el('span', 'wt-avatar', avatarInitial(data.session.displayName)));
+    const copy = el('div', 'wt-identity-copy');
+    if (hasValue(data.session.displayName)) copy.append(el('strong', 'wt-account-name', data.session.displayName));
+    if (runtime.prefs.email && hasValue(data.session.maskedEmail)) copy.append(el('span', 'wt-account-email', data.session.maskedEmail));
+    identity.append(copy);
+    const side = el('div', 'wt-account-side');
+    side.append(setAttributes(statusBadge(data.plan.label, 'plan'), { title: `${data.plan.hint}；实际当前额度以额度窗口为准` }));
+    const usageStatus = data.plan.limitReached === true ? '已达到额度限制' : data.plan.allowed === false ? '当前不可用' : data.plan.allowed === true ? '可用' : '状态未提供';
+    const status = el('span', `wt-account-status wt-account-status-${data.plan.limitReached === true || data.plan.allowed === false ? 'danger' : data.plan.allowed === true ? 'ok' : 'warning'}`);
+    status.append(el('span', 'wt-status-dot-inline'), el('span', '', usageStatus));
+    side.append(status);
+    node.append(identity, side, el('div', 'wt-account-meta', formatUpdatedAt(data.fetchedAt)));
     return node;
   }
 
@@ -834,43 +1000,123 @@
   }
 
   function renderStats(stats) {
-    const grid = el('div', 'wt-field-grid');
-    grid.append(field('Credits', formatNumber(stats.credits)), field('总 Tokens', formatNumber(stats.tokens)), field('Cached input', formatNumber(stats.cachedInputTokens)), field('Uncached input', formatNumber(stats.uncachedInputTokens)), field('Output tokens', formatNumber(stats.outputTokens)), field('Threads', formatNumber(stats.threads)), field('Turns', formatNumber(stats.turns)), field('有数据的日期', formatNumber(stats.dates)));
+    const grid = el('div', 'wt-metric-grid');
+    const metrics = [['tokens', 'Tokens'], ['credits', 'Credits'], ['threads', 'Threads'], ['turns', 'Turns']];
+    metrics.forEach(([key, label]) => {
+      if (!hasValue(stats[key])) return;
+      const card = el('div', 'wt-metric');
+      card.append(el('span', 'wt-metric-label', label), el('strong', 'wt-metric-value', formatNumber(stats[key])));
+      grid.append(card);
+    });
+    const secondary = [['cachedInputTokens', 'Cached input'], ['uncachedInputTokens', 'Uncached input'], ['outputTokens', 'Output tokens'], ['dates', '有数据的日期']].filter(([key]) => hasValue(stats[key]));
+    if (secondary.length) {
+      const details = el('details', 'wt-secondary-metrics');
+      details.append(el('summary', '更多统计'));
+      const detailGrid = el('div', 'wt-field-grid');
+      secondary.forEach(([key, label]) => detailGrid.append(field(label, formatNumber(stats[key]))));
+      details.append(detailGrid);
+      grid.append(details);
+    }
     return grid;
   }
 
   function renderAnalytics(data) {
+    const analytics = runtime.state.analytics;
     const node = section('使用统计');
-    const select = setAttributes(el('select', 'wt-select'), { 'aria-label': '统计范围' });
-    for (const key of RANGE_OPTIONS) {
-      const range = data.analytics.ranges[key];
-      if (!range) continue;
-      const option = setAttributes(el('option', '', range.label), { value: key });
-      option.selected = runtime.prefs.range === key;
-      select.append(option);
+    node.append(renderRangeSelector());
+    if (runtime.prefs.range === 'custom') node.append(renderCustomRangeEditor());
+    const range = analytics.ranges[runtime.prefs.range] || analytics.ranges[analytics.lastGoodRange] || analytics.ranges['30d'];
+    if (analytics.loading) node.append(el('p', 'wt-notice wt-notice-info', '正在读取所选日期范围，当前统计仍可使用。'));
+    if (analytics.error) {
+      node.append(el('p', 'wt-notice wt-notice-warning', analytics.error), linkButton(ANALYTICS_URL, '打开官方 Analytics'));
+      if (!range?.stats) return node;
     }
-    select.addEventListener('change', () => {
-      runtime.prefs.range = select.value;
-      writePreference(PREF_KEYS.range, select.value);
-      if (data.analytics.dailyRows.length) {
-        const range = data.analytics.ranges[select.value];
-        data.analytics.clientRows = aggregateClients(data.analytics.dailyRows, range.start, range.end);
-      }
-      render();
-    });
-    node.append(select);
-    if (runtime.state.analyticsError) {
-      const notice = el('p', 'wt-notice wt-notice-warning', runtime.state.analyticsError);
-      node.append(notice, linkButton(ANALYTICS_URL, '打开官方 Analytics'));
-      return node;
-    }
-    const range = data.analytics.ranges[runtime.prefs.range] || data.analytics.ranges['30d'];
-    if (!range || !range.stats || !data.analytics.dailyRows.length) {
+    if (!range || !range.stats || (!analytics.dailyRows.length && !analytics.loading)) {
       node.append(el('p', 'wt-empty', '当前账号或套餐未提供详细 Analytics'));
       return node;
     }
-    node.append(renderStats(range.stats), renderClientRows(data.analytics.clientRows, range.stats.tokens), renderChart(range.stats.rows));
+    node.append(el('p', 'wt-range-caption', `当前范围：${range.label}`), renderStats(range.stats), renderClientRows(analytics.clientRows, range.stats.tokens), renderChart(range.stats.rows));
     return node;
+  }
+
+  function renderRangeSelector() {
+    const group = setAttributes(el('div', 'wt-range-selector'), { role: 'tablist', 'aria-label': '统计范围' });
+    RANGE_PRESETS.forEach((preset, index) => {
+      const active = runtime.prefs.range === preset.id;
+      const button = setAttributes(el('button', `wt-range-button${active ? ' wt-range-button-active' : ''}`, preset.id === 'custom' && runtime.prefs.customStart && runtime.prefs.customEnd ? '自定义' : preset.label.replace('近 ', '')), { type: 'button', role: 'tab', 'aria-selected': active, tabindex: active ? 0 : -1, 'data-range': preset.id });
+      button.addEventListener('click', () => selectAnalyticsRange(preset.id));
+      button.addEventListener('keydown', (event) => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? RANGE_PRESETS.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + RANGE_PRESETS.length) % RANGE_PRESETS.length;
+        const next = group.querySelectorAll('[data-range]')[nextIndex];
+        next?.focus();
+        selectAnalyticsRange(RANGE_PRESETS[nextIndex].id);
+      });
+      group.append(button);
+    });
+    return group;
+  }
+
+  function renderCustomRangeEditor() {
+    const form = el('form', 'wt-custom-range');
+    const fields = el('div', 'wt-date-fields');
+    const startLabel = el('label', 'wt-date-label', '开始日期');
+    const start = setAttributes(el('input', 'wt-date-input'), { type: 'date', name: 'start', required: 'true', value: runtime.prefs.customStart || '', max: todayKeyUTC() });
+    startLabel.append(start);
+    const endLabel = el('label', 'wt-date-label', '结束日期');
+    const end = setAttributes(el('input', 'wt-date-input'), { type: 'date', name: 'end', required: 'true', value: runtime.prefs.customEnd || '', max: todayKeyUTC() });
+    endLabel.append(end);
+    fields.append(startLabel, endLabel);
+    const error = setAttributes(el('p', 'wt-date-error'), { 'aria-live': 'polite' });
+    const hint = el('p', 'wt-date-hint', '结束日期包含当天；范围按 UTC 日期桶统计。');
+    const actions = el('div', 'wt-custom-actions');
+    const apply = setAttributes(el('button', 'wt-button', '应用'), { type: 'submit' });
+    const cancel = setAttributes(el('button', 'wt-button wt-button-secondary', '取消'), { type: 'button' });
+    const clear = setAttributes(el('button', 'wt-button wt-button-quiet', '清除并恢复默认'), { type: 'button' });
+    cancel.addEventListener('click', () => { runtime.prefs.range = runtime.state.analytics.lastGoodRange; render(); });
+    clear.addEventListener('click', () => { runtime.prefs.customStart = null; runtime.prefs.customEnd = null; writePreference(PREF_KEYS.customStart, null); writePreference(PREF_KEYS.customEnd, null); runtime.prefs.range = DEFAULT_PREFS.range; runtime.state.analytics.lastGoodRange = DEFAULT_PREFS.range; writePreference(PREF_KEYS.range, DEFAULT_PREFS.range); render(); });
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const message = validateCustomRange(start.value, end.value);
+      error.textContent = message || '';
+      if (message) return;
+      const previous = runtime.state.analytics.lastGoodRange;
+      runtime.prefs.customStart = start.value;
+      runtime.prefs.customEnd = end.value;
+      writePreference(PREF_KEYS.customStart, start.value);
+      writePreference(PREF_KEYS.customEnd, end.value);
+      const range = inclusiveRangeToExclusiveRange(start.value, end.value);
+      const loaded = await fetchAnalyticsRange(range.start, range.end, runtime.lastUsageHeaders || {});
+      if (loaded) {
+        runtime.prefs.range = 'custom';
+        runtime.state.analytics.lastGoodRange = 'custom';
+        rebuildAnalyticsRanges();
+      } else {
+        runtime.prefs.range = previous;
+      }
+      render();
+    });
+    actions.append(apply, cancel, clear);
+    form.append(fields, hint, error, actions);
+    return form;
+  }
+
+  async function selectAnalyticsRange(id) {
+    if (id === 'custom') {
+      runtime.prefs.range = 'custom';
+      writePreference(PREF_KEYS.range, 'custom');
+      render();
+      return;
+    }
+    const range = runtime.state.analytics.ranges[id];
+    if (!range) return;
+    runtime.prefs.range = id;
+    runtime.state.analytics.lastGoodRange = id;
+    runtime.state.analytics.cacheHit = isRangeCovered(range.start, range.end);
+    writePreference(PREF_KEYS.range, id);
+    rebuildAnalyticsRanges();
+    render();
   }
 
   function renderClientRows(rows, totalTokens) {
@@ -882,8 +1128,9 @@
     }
     for (const row of rows) {
       const item = el('div', 'wt-client-row');
-      item.append(el('strong', 'wt-client-name', prettyName(row.clientId, '其他未知客户端')));
-      item.append(el('span', 'wt-client-value', `Tokens ${formatNumber(row.tokens)} · Credits ${formatNumber(row.credits)} · Threads ${formatNumber(row.threads)} · Turns ${formatNumber(row.turns)} · 占比 ${formatPercent(row.tokenShare)}`));
+      const heading = el('div', 'wt-client-heading');
+      heading.append(el('strong', 'wt-client-name', prettyName(row.clientId, '其他未知客户端')), el('span', 'wt-client-share', formatPercent(row.tokenShare)));
+      item.append(heading, el('span', 'wt-client-value', `${formatNumber(row.tokens)} Tokens · ${formatNumber(row.credits)} Credits · ${formatNumber(row.threads)} Threads · ${formatNumber(row.turns)} Turns`));
       item.append(createProgress(totalTokens ? row.tokenShare : null, `${row.clientId} Token 占比`));
       wrapper.append(item);
     }
@@ -947,6 +1194,10 @@
       ['脚本版本', VERSION], ['当前路径', location.pathname], ['Usage HTTP 状态', runtime.state.diagnostics.usageStatus || '未请求'],
       ['Analytics HTTP 状态', runtime.state.diagnostics.analyticsStatus || '未请求'], ['请求模式', runtime.state.diagnostics.usageMode],
       ['获取时间', formatDate(runtime.state.fetchedAt)], ['原始 plan_type', runtime.state.data && runtime.state.data.plan.rawType],
+      ['当前选中范围', runtime.prefs.range], ['自定义开始日期', runtime.prefs.customStart || '未提供'], ['自定义结束日期', runtime.prefs.customEnd || '未提供'],
+      ['Analytics coverage', runtime.state.analytics.coverage.start ? `${runtime.state.analytics.coverage.start}..${runtime.state.analytics.coverage.end}` : '未覆盖'],
+      ['最后一次 Analytics 请求范围', runtime.state.analytics.lastRequest ? `${runtime.state.analytics.lastRequest.start}..${runtime.state.analytics.lastRequest.end}` : '未请求'],
+      ['命中内存 coverage', runtime.state.analytics.cacheHit ? '是' : '否'], ['当前范围日期桶数', runtime.state.analytics.selectedBucketCount],
       ['成功解析窗口数量', runtime.state.diagnostics.windowCount], ['主额度窗口数量', runtime.state.diagnostics.primaryWindowCount], ['额外额度窗口数量', runtime.state.diagnostics.additionalWindowCount], ['每日数据行数', runtime.state.diagnostics.dailyRows],
       ['客户端类型', runtime.state.diagnostics.clientTypes.join(', ') || '未提供'], ['未识别顶层字段', runtime.state.diagnostics.unknownFields.join(', ') || '无'], ['错误代码', runtime.state.diagnostics.errors.join(', ') || '无']
     ];
@@ -967,6 +1218,10 @@
       `脚本版本: ${VERSION}`, `当前路径: ${location.pathname}`, `Usage HTTP 状态: ${runtime.state.diagnostics.usageStatus || '未请求'}`,
       `Analytics HTTP 状态: ${runtime.state.diagnostics.analyticsStatus || '未请求'}`, `请求模式: ${runtime.state.diagnostics.usageMode}`,
       `获取时间: ${formatDate(runtime.state.fetchedAt)}`, `原始 plan_type: ${runtime.state.data ? runtime.state.data.plan.rawType || '未提供' : '未提供'}`,
+      `当前选中范围: ${runtime.prefs.range}`, `自定义开始日期: ${runtime.prefs.customStart || '未提供'}`, `自定义结束日期: ${runtime.prefs.customEnd || '未提供'}`,
+      `Analytics coverage: ${runtime.state.analytics.coverage.start ? `${runtime.state.analytics.coverage.start}..${runtime.state.analytics.coverage.end}` : '未覆盖'}`,
+      `最后一次 Analytics 请求范围: ${runtime.state.analytics.lastRequest ? `${runtime.state.analytics.lastRequest.start}..${runtime.state.analytics.lastRequest.end}` : '未请求'}`,
+      `命中内存 coverage: ${runtime.state.analytics.cacheHit ? '是' : '否'}`, `当前范围日期桶数: ${runtime.state.analytics.selectedBucketCount}`,
       `成功解析窗口数量: ${runtime.state.diagnostics.windowCount}`, `主额度窗口数量: ${runtime.state.diagnostics.primaryWindowCount}`, `额外额度窗口数量: ${runtime.state.diagnostics.additionalWindowCount}`, `每日数据行数: ${runtime.state.diagnostics.dailyRows}`,
       `客户端类型: ${runtime.state.diagnostics.clientTypes.join(', ') || '未提供'}`, `未识别顶层字段: ${runtime.state.diagnostics.unknownFields.join(', ') || '无'}`, `错误代码: ${runtime.state.diagnostics.errors.join(', ') || '无'}`
     ];
@@ -985,14 +1240,24 @@
     return svg;
   }
 
+  function refreshIcon() {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    setAttributes(svg, { viewBox: '0 0 24 24', 'aria-hidden': 'true', focusable: 'false' });
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    setAttributes(path, { d: 'M20 11a8 8 0 0 0-14.7-4L4 9m0-4v4h4M4 13a8 8 0 0 0 14.7 4L20 15m0 4v-4h-4', fill: 'none', stroke: 'currentColor', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'stroke-width': '1.7' });
+    svg.append(path);
+    return svg;
+  }
+
   function statusKind() {
     if (runtime.state.error || runtime.state.data?.windows.some((item) => item.limitReached === true)) return 'danger';
-    if (runtime.state.stale || runtime.state.analyticsError || runtime.state.loading || runtime.state.data?.windows.some((item) => item.allowed === null || item.resetAt === null)) return 'warning';
+    if (runtime.state.stale || runtime.state.analyticsError || runtime.state.loading || runtime.state.analytics.loading || runtime.state.data?.windows.some((item) => item.allowed === null || item.resetAt === null)) return 'warning';
     return 'ok';
   }
 
   function renderCollapsedLauncher() {
-    const launcher = setAttributes(el('button', 'wt-launcher wt-drag-handle'), { type: 'button', 'aria-label': '打开账户用量面板', title: '账户用量' });
+    const statusText = runtime.state.error || runtime.state.data?.windows.some((item) => item.limitReached === true) ? '已达到额度限制或发生错误' : runtime.state.stale || runtime.state.analyticsError || runtime.state.loading || runtime.state.analytics.loading ? 'Analytics 部分不可用或正在加载' : '数据正常';
+    const launcher = setAttributes(el('button', 'wt-launcher wt-drag-handle'), { type: 'button', 'aria-label': '打开账户用量面板', title: `账户用量 · ${statusText}` });
     launcher.append(usageIcon(), el('span', `wt-status-dot wt-status-dot-${statusKind()}`));
     return launcher;
   }
@@ -1001,33 +1266,42 @@
     const shell = el('div', 'wt-shell');
     const header = el('div', 'wt-header wt-drag-handle');
     const title = el('div', 'wt-title-group');
-    title.append(el('strong', 'wt-title', '账户用量'), el('span', 'wt-title-status', runtime.state.stale ? '数据可能已过期' : runtime.state.loading ? '读取中…' : runtime.state.error ? runtime.state.error : '就绪'));
+    title.append(el('strong', 'wt-title', '用量与额度'), el('span', 'wt-title-status', runtime.state.loading ? '读取中…' : runtime.state.analytics.loading ? 'Analytics 读取中…' : runtime.state.fetchedAt ? formatUpdatedAt(runtime.state.fetchedAt) : '更新时间未提供'));
+    const controls = el('div', 'wt-header-controls');
+    const refreshBusy = runtime.state.loading || runtime.state.analytics.loading;
+    const refreshButton = setAttributes(el('button', `wt-icon-button${refreshBusy ? ' wt-icon-button-loading' : ''}`), { type: 'button', 'aria-label': '刷新账户用量', title: refreshBusy ? '正在刷新账户用量' : '刷新账户用量', 'aria-busy': refreshBusy, disabled: refreshBusy ? 'true' : null });
+    refreshButton.append(refreshIcon());
+    refreshButton.dataset.action = 'refresh';
     const toggle = setAttributes(el('button', 'wt-icon-button'), { type: 'button', 'aria-label': '收起账户用量面板', title: '收起账户用量面板', 'aria-expanded': 'true' });
-    toggle.append(usageIcon());
+    toggle.append(el('span', 'wt-close-icon', '×'));
     toggle.dataset.action = 'toggle';
-    header.append(title, toggle);
+    controls.append(refreshButton, toggle);
+    header.append(title, controls);
     shell.append(header);
     const body = el('div', 'wt-body');
     if (runtime.state.loading && !runtime.state.data) body.append(el('div', 'wt-loading', '正在读取账户与额度…'));
-    if (runtime.state.error && !runtime.state.data) body.append(el('div', 'wt-notice wt-notice-danger', runtime.state.error));
+    if (runtime.state.error) body.append(el('div', `wt-notice ${runtime.state.data ? 'wt-notice-warning' : 'wt-notice-danger'}`, `${runtime.state.data ? '刷新未完成，继续显示上次成功数据：' : ''}${runtime.state.error}`));
     if (runtime.state.data) {
       const credits = renderCredits(runtime.state.data);
-      body.append(renderAccount(runtime.state.data));
-      if (credits) body.append(credits);
+      body.append(renderAccountSummary(runtime.state.data));
       const windows = section('额度窗口');
       if (runtime.state.data.windows.length) runtime.state.data.windows.forEach((item) => windows.append(renderWindow(item)));
       else windows.append(el('p', 'wt-empty', '接口未提供有效额度窗口'));
-      body.append(windows, renderAnalytics(runtime.state.data));
+      body.append(windows);
+      if (credits) body.append(credits);
+      body.append(renderAnalytics(runtime.state.data));
     }
-    const actions = section('操作');
+    const actions = el('section', 'wt-footer-settings');
+    const settings = el('details', 'wt-settings');
+    settings.append(el('summary', '设置与链接'));
     const refresh = el('div', 'wt-action-row');
-    const refreshButton = el('button', 'wt-button', '手动刷新'); refreshButton.type = 'button'; refreshButton.dataset.action = 'refresh';
     const refreshSelect = setAttributes(el('select', 'wt-select'), { 'aria-label': '自动刷新间隔' });
     for (const value of REFRESH_OPTIONS) { const option = setAttributes(el('option', '', `自动刷新：${formatRefresh(value)}`), { value }); option.selected = runtime.prefs.refresh === value; refreshSelect.append(option); }
     refreshSelect.addEventListener('change', () => { runtime.prefs.refresh = Number(refreshSelect.value); writePreference(PREF_KEYS.refresh, runtime.prefs.refresh); scheduleRefresh(); });
-    refresh.append(refreshButton, refreshSelect); actions.append(refresh);
-    actions.append(linkButton(ANALYTICS_URL, '打开官方 Analytics'));
-    const usageHref = findOfficialUsageHref(); if (usageHref) actions.append(linkButton(usageHref, '打开官方 Usage'));
+    refresh.append(el('span', 'wt-settings-label', '自动刷新'), refreshSelect); settings.append(refresh);
+    settings.append(linkButton(ANALYTICS_URL, '打开官方 Analytics'));
+    const usageHref = findOfficialUsageHref(); if (usageHref) settings.append(linkButton(usageHref, '打开官方 Usage'));
+    actions.append(settings);
     body.append(actions, renderDiagnostics());
     shell.append(body);
     return shell;
@@ -1036,9 +1310,32 @@
   function render() {
     if (!runtime.app || !runtime.host) return;
     runtime.app.replaceChildren();
+    syncTheme();
     runtime.host.setAttribute('data-wt-mode', runtime.prefs.collapsed ? 'collapsed' : 'expanded');
     runtime.app.append(runtime.prefs.collapsed ? renderCollapsedLauncher() : renderExpandedPanel());
     applyPosition();
+  }
+
+  function detectPageTheme() {
+    const roots = [document.documentElement, document.body].filter(Boolean);
+    for (const root of roots) {
+      const explicit = root.getAttribute('data-theme') || root.getAttribute('data-color-scheme') || root.getAttribute('theme');
+      if (/^dark$/i.test(explicit || '')) return 'dark';
+      if (/^light$/i.test(explicit || '')) return 'light';
+    }
+    if (roots.some((root) => root.classList.contains('dark') || root.classList.contains('dark-mode'))) return 'dark';
+    if (roots.some((root) => root.classList.contains('light') || root.classList.contains('light-mode'))) return 'light';
+    const scheme = getComputedStyle(document.documentElement).colorScheme;
+    if (/dark/i.test(scheme) && !/light/i.test(scheme)) return 'dark';
+    if (/light/i.test(scheme) && !/dark/i.test(scheme)) return 'light';
+    const background = getComputedStyle(document.body || document.documentElement).backgroundColor;
+    const match = background.match(/rgba?\((\d+)[, ]+(\d+)[, ]+(\d+)/);
+    if (match && (Number(match[1]) * 299 + Number(match[2]) * 587 + Number(match[3]) * 114) / 1000 < 128) return 'dark';
+    return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+
+  function syncTheme() {
+    if (runtime.host) runtime.host.setAttribute('data-wt-theme', detectPageTheme());
   }
 
   function viewportPosition(position) {
@@ -1141,24 +1438,27 @@
   function createStyle() {
     const style = document.createElement('style');
     style.textContent = `
-      :host { --wt-bg: #ffffff; --wt-panel: #f7f7f8; --wt-text: #202123; --wt-muted: #6b7280; --wt-border: #d9d9e0; --wt-accent: #10a37f; --wt-danger: #c2410c; --wt-warning: #b45309; --wt-shadow: 0 16px 50px rgba(0,0,0,.22); color: var(--wt-text); display: block; font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; position: fixed; width: min(400px, calc(100vw - 24px)); z-index: 100000; }
-      :host([data-wt-mode="collapsed"]) { height: 48px; width: 48px; }
-      :host([data-wt-mode="expanded"]) { max-width: calc(100vw - 24px); }
-      @media (prefers-color-scheme: dark) { :host { --wt-bg: #202123; --wt-panel: #2b2c2f; --wt-text: #f7f7f8; --wt-muted: #b5b5bd; --wt-border: #4a4b52; --wt-shadow: 0 16px 50px rgba(0,0,0,.55); } }
-      .wt-shell { background: var(--wt-bg); border: 1px solid var(--wt-border); border-radius: 16px; box-shadow: var(--wt-shadow); max-width: 100%; overflow: hidden; }
-      .wt-header { align-items: center; background: var(--wt-panel); cursor: grab; display: flex; gap: 10px; justify-content: space-between; padding: 11px 12px; user-select: none; }
-      .wt-header:active { cursor: grabbing; } .wt-title-group { min-width: 0; } .wt-title { display: block; font-size: 14px; } .wt-title-status { color: var(--wt-muted); display: block; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      button, select, a { font: inherit; } button, a, select { -webkit-tap-highlight-color: transparent; } button:focus-visible, a:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--wt-accent); outline-offset: 2px; }
-      .wt-icon-button, .wt-button, .wt-link, .wt-select { border: 1px solid var(--wt-border); border-radius: 8px; cursor: pointer; padding: 6px 9px; text-decoration: none; } .wt-icon-button { align-items: center; background: transparent; color: var(--wt-text); display: inline-flex; justify-content: center; } .wt-icon-button svg { height: 18px; width: 18px; } .wt-button { background: var(--wt-accent); border-color: var(--wt-accent); color: #fff; } .wt-button-secondary, .wt-select { background: var(--wt-panel); color: var(--wt-text); } .wt-link { background: transparent; color: var(--wt-accent); display: inline-block; margin: 4px 0; }
-      .wt-launcher { align-items: center; background: var(--wt-bg); border: 1px solid var(--wt-border); border-radius: 14px; box-shadow: 0 5px 18px rgba(0,0,0,.16); color: var(--wt-accent); cursor: grab; display: inline-flex; height: 48px; justify-content: center; padding: 0; position: relative; touch-action: none; user-select: none; width: 48px; } .wt-launcher:active { cursor: grabbing; } .wt-launcher svg { height: 24px; width: 24px; } .wt-status-dot { border: 2px solid var(--wt-bg); border-radius: 50%; bottom: 4px; height: 8px; position: absolute; right: 4px; width: 8px; } .wt-status-dot-ok { background: var(--wt-accent); } .wt-status-dot-warning { background: var(--wt-warning); } .wt-status-dot-danger { background: var(--wt-danger); }
-      .wt-body { max-height: 70vh; overflow: auto; padding: 0 12px 12px; } .wt-section { border-top: 1px solid var(--wt-border); padding: 12px 0 0; } .wt-section-title, .wt-subtitle { font-size: 13px; margin: 0 0 9px; } .wt-subtitle { color: var(--wt-muted); font-size: 12px; }
-      .wt-field-grid { display: grid; gap: 7px 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); } .wt-field { display: flex; flex-direction: column; min-width: 0; } .wt-field-label { color: var(--wt-muted); font-size: 11px; } .wt-field-value { overflow-wrap: anywhere; }
-      .wt-badge { background: var(--wt-panel); border-radius: 999px; color: var(--wt-muted); display: inline-block; font-size: 10px; padding: 2px 7px; white-space: nowrap; } .wt-badge-ok { color: var(--wt-accent); } .wt-badge-danger { color: var(--wt-danger); }
-      .wt-window { background: var(--wt-panel); border: 1px solid var(--wt-border); border-radius: 10px; margin: 8px 0; padding: 9px; } .wt-window-heading, .wt-subsection-heading, .wt-action-row { align-items: center; display: flex; gap: 8px; justify-content: space-between; } .wt-window-meta, .wt-empty, .wt-notice, .wt-loading { color: var(--wt-muted); font-size: 12px; margin: 5px 0; } .wt-progress-wrap { margin: 8px 0; } .wt-progress { background: var(--wt-border); border-radius: 999px; height: 6px; overflow: hidden; position: relative; } .wt-progress::after { background: var(--wt-accent); border-radius: inherit; content: ''; display: block; height: 100%; width: var(--wt-progress, 0%); } .wt-window-percent-unknown { color: var(--wt-warning); }
-      .wt-notice { border: 1px solid var(--wt-border); border-radius: 8px; padding: 8px; } .wt-notice-warning { color: #b45309; } .wt-notice-danger { color: var(--wt-danger); } .wt-subsection { border-top: 1px solid var(--wt-border); margin-top: 12px; padding-top: 10px; } .wt-client-row { border-bottom: 1px solid var(--wt-border); padding: 7px 0; } .wt-client-name, .wt-client-value { display: block; } .wt-client-value { color: var(--wt-muted); font-size: 11px; }
-      .wt-chart { align-items: end; display: flex; gap: 3px; height: 130px; overflow-x: auto; padding-top: 8px; } .wt-chart-column { align-items: center; display: flex; flex: 1 0 14px; flex-direction: column; height: 100%; justify-content: end; min-width: 14px; } .wt-chart-bar { background: var(--wt-accent); border-radius: 3px 3px 0 0; min-height: 3px; width: 100%; } .wt-chart-label { color: var(--wt-muted); font-size: 9px; margin-top: 3px; transform: rotate(-45deg); transform-origin: top center; white-space: nowrap; }
-      .wt-action-row { justify-content: flex-start; margin-bottom: 5px; } .wt-diagnostics { border-top: 1px solid var(--wt-border); margin-top: 12px; padding-top: 10px; } .wt-diagnostics summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; } .wt-diagnostics .wt-field { margin: 6px 0; } .wt-loading { min-height: 120px; padding-top: 18px; } .wt-chart-select { margin-left: auto; } @media (max-width: 480px) { :host([data-wt-mode="expanded"]) { width: calc(100vw - 24px); } .wt-body { max-height: 68vh; } }
-      @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
+      :host { --wt-color-bg: #ffffff; --wt-color-surface: #f7f7f8; --wt-color-surface-secondary: #f0f0f1; --wt-color-text: #202123; --wt-color-text-secondary: #5f6368; --wt-color-text-tertiary: #8b8d91; --wt-color-border: #d9d9df; --wt-color-border-subtle: #e8e8eb; --wt-color-primary: #202123; --wt-color-primary-hover: #35363a; --wt-color-primary-text: #ffffff; --wt-color-focus: #2563eb; --wt-color-success: #159447; --wt-color-warning: #b86a08; --wt-color-danger: #c43d32; --wt-color-chart: #3b82f6; --wt-shadow: 0 14px 40px rgba(0,0,0,.16); color: var(--wt-color-text); display: block; font: 13px/1.45 ui-sans-serif, -apple-system, system-ui, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; position: fixed; width: min(400px, calc(100vw - 24px)); z-index: 100000; }
+      :host([data-wt-theme="dark"]) { --wt-color-bg: #202123; --wt-color-surface: #2a2b2f; --wt-color-surface-secondary: #34353a; --wt-color-text: #f7f7f8; --wt-color-text-secondary: #b5b5bd; --wt-color-text-tertiary: #8f9198; --wt-color-border: #4a4b52; --wt-color-border-subtle: #38393e; --wt-color-primary: #f7f7f8; --wt-color-primary-hover: #ffffff; --wt-color-primary-text: #202123; --wt-color-focus: #70a7ff; --wt-color-success: #48c774; --wt-color-warning: #f1ad42; --wt-color-danger: #ff7b72; --wt-color-chart: #75a7ff; --wt-shadow: 0 18px 48px rgba(0,0,0,.52); }
+      :host([data-wt-mode="collapsed"]) { height: 46px; width: 46px; } :host([data-wt-mode="expanded"]) { max-width: calc(100vw - 24px); }
+      .wt-shell { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 16px; box-shadow: var(--wt-shadow); max-width: 100%; overflow: hidden; }
+      .wt-header { align-items: center; background: var(--wt-color-bg); border-bottom: 1px solid var(--wt-color-border-subtle); cursor: grab; display: flex; gap: 12px; justify-content: space-between; padding: 14px 16px 12px; user-select: none; } .wt-header:active { cursor: grabbing; } .wt-title-group { min-width: 0; } .wt-title { display: block; font-size: 15px; font-weight: 600; letter-spacing: -.01em; } .wt-title-status { color: var(--wt-color-text-tertiary); display: block; font-size: 11px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .wt-header-controls { align-items: center; display: flex; gap: 4px; }
+      button, select, input, a { font: inherit; } button, a, select, input { -webkit-tap-highlight-color: transparent; } button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--wt-color-focus); outline-offset: 2px; }
+      .wt-icon-button, .wt-button, .wt-link, .wt-select { border: 1px solid var(--wt-color-border); border-radius: 8px; cursor: pointer; min-height: 40px; padding: 6px 10px; text-decoration: none; } .wt-icon-button { align-items: center; background: transparent; color: var(--wt-color-text-secondary); display: inline-flex; justify-content: center; min-height: 40px; min-width: 40px; padding: 8px; } .wt-icon-button:hover { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-icon-button svg { height: 18px; width: 18px; } .wt-icon-button-loading svg { animation: wt-spin .8s linear infinite; } .wt-close-icon { font-size: 22px; font-weight: 300; line-height: 1; } .wt-button { background: var(--wt-color-primary); border-color: var(--wt-color-primary); color: var(--wt-color-primary-text); } .wt-button:hover { background: var(--wt-color-primary-hover); } .wt-button-secondary, .wt-select { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-button-quiet { background: transparent; border-color: transparent; color: var(--wt-color-text-secondary); } .wt-link { background: transparent; border-color: transparent; color: var(--wt-color-text-secondary); display: inline-block; padding-left: 0; padding-right: 0; } .wt-link:hover { color: var(--wt-color-text); text-decoration: underline; }
+      .wt-launcher { align-items: center; background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 13px; box-shadow: 0 5px 18px rgba(0,0,0,.14); color: var(--wt-color-text); cursor: grab; display: inline-flex; height: 46px; justify-content: center; padding: 0; position: relative; touch-action: none; user-select: none; width: 46px; } .wt-launcher:hover { background: var(--wt-color-surface); } .wt-launcher:active { cursor: grabbing; } .wt-launcher svg { height: 23px; width: 23px; } .wt-status-dot { border: 2px solid var(--wt-color-bg); border-radius: 50%; bottom: 4px; height: 8px; position: absolute; right: 4px; width: 8px; } .wt-status-dot-ok { background: var(--wt-color-success); } .wt-status-dot-warning { background: var(--wt-color-warning); } .wt-status-dot-danger { background: var(--wt-color-danger); }
+      .wt-body { max-height: 70vh; overflow: auto; padding: 0 16px 16px; } .wt-section { border-top: 1px solid var(--wt-color-border-subtle); padding: 16px 0 0; } .wt-section-title, .wt-subtitle { font-size: 13px; font-weight: 600; margin: 0 0 10px; } .wt-subtitle { color: var(--wt-color-text-secondary); font-size: 12px; }
+      .wt-account-summary { align-items: center; display: grid; gap: 4px 10px; grid-template-columns: minmax(0, 1fr) auto; padding: 16px 0 14px; } .wt-identity-block { align-items: center; display: flex; gap: 10px; min-width: 0; } .wt-avatar { align-items: center; background: var(--wt-color-surface-secondary); border-radius: 50%; color: var(--wt-color-text-secondary); display: inline-flex; flex: 0 0 34px; font-size: 15px; font-weight: 600; height: 34px; justify-content: center; width: 34px; } .wt-identity-copy { display: flex; flex-direction: column; min-width: 0; } .wt-account-name, .wt-account-email { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .wt-account-name { font-size: 13px; font-weight: 600; } .wt-account-email { color: var(--wt-color-text-secondary); font-size: 11px; margin-top: 2px; } .wt-account-side { align-items: flex-end; display: flex; flex-direction: column; gap: 5px; } .wt-account-meta { color: var(--wt-color-text-tertiary); font-size: 11px; grid-column: 1 / -1; padding-left: 44px; } .wt-account-status { align-items: center; color: var(--wt-color-text-secondary); display: inline-flex; font-size: 11px; gap: 5px; } .wt-account-status-ok { color: var(--wt-color-success); } .wt-account-status-warning { color: var(--wt-color-warning); } .wt-account-status-danger { color: var(--wt-color-danger); } .wt-status-dot-inline { background: currentColor; border-radius: 50%; height: 7px; width: 7px; }
+      .wt-field-grid { display: grid; gap: 8px 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); } .wt-field { display: flex; flex-direction: column; min-width: 0; } .wt-field-label { color: var(--wt-color-text-secondary); font-size: 11px; } .wt-field-value { overflow-wrap: anywhere; }
+      .wt-badge { background: var(--wt-color-surface-secondary); border-radius: 9999px; color: var(--wt-color-text-secondary); display: inline-block; font-size: 11px; font-weight: 500; padding: 4px 8px; white-space: nowrap; } .wt-badge-plan { background: var(--wt-color-surface-secondary); color: var(--wt-color-text); } .wt-badge-ok { color: var(--wt-color-success); } .wt-badge-warning { color: var(--wt-color-warning); } .wt-badge-danger { color: var(--wt-color-danger); }
+      .wt-window { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border-subtle); border-radius: 11px; margin: 8px 0; padding: 12px; } .wt-window-heading, .wt-subsection-heading, .wt-action-row, .wt-client-heading { align-items: center; display: flex; gap: 8px; justify-content: space-between; } .wt-window-meta, .wt-empty, .wt-notice, .wt-loading, .wt-range-caption { color: var(--wt-color-text-secondary); font-size: 12px; margin: 6px 0; } .wt-progress-wrap { margin: 9px 0; } .wt-progress { background: var(--wt-color-surface-secondary); border-radius: 9999px; height: 6px; overflow: hidden; position: relative; } .wt-progress::after { background: var(--wt-color-chart); border-radius: inherit; content: ''; display: block; height: 100%; width: var(--wt-progress, 0%); } .wt-window-percent-unknown { color: var(--wt-color-warning); }
+      .wt-notice { border: 1px solid var(--wt-color-border-subtle); border-radius: 10px; padding: 10px; } .wt-notice-warning { color: var(--wt-color-warning); } .wt-notice-danger { color: var(--wt-color-danger); } .wt-notice-info { color: var(--wt-color-text-secondary); } .wt-subsection { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 16px; padding-top: 12px; } .wt-client-row { border-bottom: 1px solid var(--wt-color-border-subtle); padding: 9px 0; } .wt-client-name, .wt-client-value { display: block; } .wt-client-share { color: var(--wt-color-text-secondary); font-size: 11px; } .wt-client-value { color: var(--wt-color-text-secondary); font-size: 11px; margin-top: 3px; }
+      .wt-metric-grid { border: 1px solid var(--wt-color-border-subtle); border-radius: 11px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: hidden; } .wt-metric { border-bottom: 1px solid var(--wt-color-border-subtle); display: flex; flex-direction: column; min-width: 0; padding: 11px; } .wt-metric:nth-child(odd) { border-right: 1px solid var(--wt-color-border-subtle); } .wt-metric:nth-last-child(-n+2) { border-bottom: 0; } .wt-metric-label { color: var(--wt-color-text-secondary); font-size: 11px; } .wt-metric-value { font-size: 17px; font-weight: 600; margin-top: 3px; } .wt-secondary-metrics { border-top: 1px solid var(--wt-color-border-subtle); grid-column: 1 / -1; padding: 9px 11px; } .wt-secondary-metrics summary, .wt-settings summary, .wt-diagnostics summary { color: var(--wt-color-text-secondary); cursor: pointer; font-size: 12px; font-weight: 500; }
+      .wt-range-selector { display: flex; gap: 3px; margin-bottom: 10px; max-width: 100%; overflow-x: auto; padding: 2px; scrollbar-width: thin; } .wt-range-button { background: transparent; border: 1px solid transparent; border-radius: 8px; color: var(--wt-color-text-secondary); cursor: pointer; flex: 0 0 auto; min-height: 36px; padding: 6px 10px; white-space: nowrap; } .wt-range-button:hover { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-range-button-active { background: var(--wt-color-surface-secondary); border-color: var(--wt-color-border); color: var(--wt-color-text); font-weight: 600; }
+      .wt-custom-range { background: var(--wt-color-surface); border-radius: 10px; margin-bottom: 10px; padding: 10px; } .wt-date-fields { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); } .wt-date-label { color: var(--wt-color-text-secondary); display: flex; flex-direction: column; font-size: 11px; gap: 4px; } .wt-date-input { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 8px; color: var(--wt-color-text); min-height: 38px; min-width: 0; padding: 7px; } .wt-date-hint { color: var(--wt-color-text-tertiary); font-size: 11px; margin: 7px 0 0; } .wt-date-error { color: var(--wt-color-danger); font-size: 11px; min-height: 16px; margin: 5px 0 0; } .wt-custom-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+      .wt-chart { align-items: end; border-bottom: 1px solid var(--wt-color-border); display: flex; gap: 4px; height: 132px; overflow-x: auto; padding: 8px 2px 0; } .wt-chart-column { align-items: center; display: flex; flex: 1 0 16px; flex-direction: column; height: 100%; justify-content: end; min-width: 16px; } .wt-chart-bar { background: var(--wt-color-chart); border-radius: 3px 3px 0 0; min-height: 3px; width: 100%; } .wt-chart-label { color: var(--wt-color-text-tertiary); font-size: 9px; margin-top: 4px; white-space: nowrap; }
+      .wt-action-row { justify-content: flex-start; margin-top: 8px; } .wt-settings-label { color: var(--wt-color-text-secondary); font-size: 12px; } .wt-footer-settings { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 16px; padding-top: 12px; } .wt-settings { display: grid; gap: 7px; } .wt-diagnostics { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 12px; padding-top: 10px; } .wt-diagnostics summary { margin-bottom: 8px; } .wt-diagnostics .wt-field { margin: 6px 0; } .wt-loading { min-height: 120px; padding-top: 18px; } .wt-chart-select { margin-left: auto; }
+      @keyframes wt-spin { to { transform: rotate(360deg); } } @media (max-width: 480px) { :host([data-wt-mode="expanded"]) { width: calc(100vw - 24px); } .wt-body { max-height: 68vh; padding-left: 12px; padding-right: 12px; } .wt-header { padding-left: 12px; padding-right: 12px; } } @media (max-width: 340px) { .wt-account-summary { align-items: start; } .wt-account-side { align-items: flex-start; grid-column: 1 / -1; padding-left: 44px; } .wt-date-fields { grid-template-columns: 1fr; } .wt-range-button { padding-left: 8px; padding-right: 8px; } }
+      @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; } }
     `;
     return style;
   }
@@ -1199,9 +1499,10 @@
     runtime.visibilityHandler = () => { if (document.visibilityState === 'visible' && runtime.state.fetchedAt && Date.now() - runtime.state.fetchedAt > 120_000) refresh(); };
     document.addEventListener('visibilitychange', runtime.visibilityHandler);
     window.addEventListener('resize', applyPosition, { passive: true });
-    const themeObserver = new MutationObserver(() => render());
-    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style', 'color-scheme'] });
-    if (document.body) themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class', 'style', 'color-scheme'] });
+    const themeObserver = new MutationObserver(() => syncTheme());
+    const themeAttributes = ['class', 'style', 'color-scheme', 'data-theme', 'data-color-scheme', 'theme'];
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: themeAttributes });
+    if (document.body) themeObserver.observe(document.body, { attributes: true, attributeFilter: themeAttributes });
     runtime.observers.push(themeObserver);
     const attachBodyObserver = () => {
       runtime.bodyObserver?.disconnect();
