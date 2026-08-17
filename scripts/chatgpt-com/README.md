@@ -37,6 +37,8 @@ The launcher is a 44–48px draggable utility button with a generic usage/activi
 
 The visual direction is a local adaptation of public [OpenAI Apps SDK UI](DESIGN.md#official-references) patterns. This is an unofficial userscript, not an OpenAI, ChatGPT, or Codex product. It does not use the OpenAI Logo, Blossom, wordmark, or other OpenAI marks; launcher icons are generic usage/activity symbols. See [`DESIGN.md`](DESIGN.md) for the complete site-level specification.
 
+The launcher and expanded panel share one size-independent viewport anchor. Expanding and collapsing therefore do not change the saved user position; dragging either state updates that anchor. Window-size changes may temporarily clamp the visible surface into the viewport without overwriting the saved position.
+
 ## Plan labels and quota semantics
 
 The display mapping keeps product labels readable without treating a plan label as a quota calculator:

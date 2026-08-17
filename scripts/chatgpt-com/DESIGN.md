@@ -93,9 +93,9 @@ Prefer one consistent gap between siblings over repeated ad-hoc margins. On narr
 
 ## Layout
 
-The launcher is a compact, draggable utility button with a generic usage/activity inline SVG. It is visually centered, has a light border and shadow, and exposes a small status indicator. A small pointer movement must not be mistaken for a click; dragging must not open the panel.
+The launcher is a compact, draggable utility button with a generic usage/activity inline SVG. It is visually centered, has a light border and shadow, and exposes a small status indicator. A small pointer movement must not be mistaken for a click; dragging must not open the panel. Its position is stored as a size-independent viewport anchor (`left`/`right` plus `top`/`bottom` offsets), so the same anchor can position both modes.
 
-The expanded panel is approximately 400px wide with `max-width: calc(100vw - 24px)` and a `max-height` near 70vh. It stays within the viewport after dragging. Its structure is:
+The expanded panel is approximately 400px wide with `max-width: calc(100vw - 24px)` and a `max-height` near 70vh. It stays within the viewport after dragging. Near the right edge it expands to the left, and near the bottom it expands upward, while retaining the same viewport anchor as the launcher. Its structure is:
 
 1. Header: `用量与额度`, update/status text, refresh, official Analytics icon, and collapse control.
 2. Compact account summary: identity and plan badge in one block, with no redundant full-width “signed in” row.
@@ -103,6 +103,13 @@ The expanded panel is approximately 400px wide with `max-width: calc(100vw - 24p
 4. Analytics: selected range, metric summary, client distribution, and a native CSS/SVG daily trend.
 5. Footer: diagnostics and necessary explanatory notices only; automatic refresh is fixed at five minutes and has no settings UI.
 6. Diagnostics: collapsed by default and safe to copy.
+
+## Interaction and position lifecycle
+
+- The stored position is a versioned viewport anchor, not a mutable mode-specific `left`/`top` pair.
+- Mode changes and ordinary renders apply an effective, viewport-clamped anchor but never write that temporary clamp back to the stored anchor. This prevents expanded-panel size changes from causing cumulative launcher drift.
+- Dragging either the launcher or the panel uses temporary coordinates during movement. On pointer release, the actual surface rectangle is converted back into a shared anchor and persisted once; a click without movement keeps the launcher toggle behavior.
+- Legacy `{ left, top }` preferences are clamped and converted to the anchor format after the first laid-out frame. Resize handling reapplies the stored anchor without creating a preference-write loop.
 
 The panel should use a small number of clear sections rather than a stack of visually heavy cards. A two-column metric grid is preferred for compact statistics; it may collapse to one column when the available width requires it.
 

@@ -2,7 +2,7 @@
 // @name         ChatGPT Account Usage Dashboard
 // @name:zh-CN   ChatGPT 账户用量浮窗
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.2.2
+// @version      1.2.3
 // @description  Display the current ChatGPT account plan, Codex limits, credits, and usage analytics in a private floating dashboard.
 // @description:zh-CN 在 ChatGPT 页面显示当前账号套餐、Codex 额度、Credits 与使用统计。
 // @author       KnowSky404
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.2.2';
+  const VERSION = '1.2.3';
   const HOST_ID = 'wt-chatgpt-account-usage-host';
   const SESSION_ENDPOINT = '/api/auth/session';
   const USAGE_ENDPOINT = '/backend-api/wham/usage';
@@ -27,6 +27,15 @@
   const REQUEST_TIMEOUT_MS = 8000;
   const AUTO_REFRESH_INTERVAL_MS = 300_000;
   const LEGACY_REFRESH_PREF_KEY = 'wt-chatgpt-account-usage:refresh-interval';
+  const POSITION_VERSION = 2;
+  const VIEWPORT_MARGIN_PX = 12;
+  const DEFAULT_POSITION_ANCHOR = Object.freeze({
+    version: POSITION_VERSION,
+    horizontal: 'right',
+    vertical: 'bottom',
+    offsetX: 20,
+    offsetY: 96
+  });
   const MAX_CUSTOM_RANGE_DAYS = 366;
   const METRIC_KEYS = Object.freeze(['credits', 'tokens', 'cachedInputTokens', 'uncachedInputTokens', 'outputTokens', 'threads', 'turns']);
   // OpenAI Codex exposes ProLite and Pro plan types; this product surface names them Pro 5X and Pro 20X.
@@ -93,7 +102,8 @@
     ui: {
       panelSession: 0,
       pendingPanelState: null,
-      tooltipTimer: null
+      tooltipTimer: null,
+      positionFrame: null
     }
   };
 
@@ -351,11 +361,34 @@
     }
   }
 
+  function normalizePositionAnchor(value) {
+    if (!isRecord(value) || value.version !== POSITION_VERSION) return null;
+    if (!['left', 'right'].includes(value.horizontal) || !['top', 'bottom'].includes(value.vertical)) return null;
+    const offsetX = numberOrNull(value.offsetX);
+    const offsetY = numberOrNull(value.offsetY);
+    if (offsetX === null || offsetY === null || offsetX < 0 || offsetY < 0) return null;
+    return {
+      version: POSITION_VERSION,
+      horizontal: value.horizontal,
+      vertical: value.vertical,
+      offsetX,
+      offsetY
+    };
+  }
+
+  function normalizeLegacyPosition(value) {
+    if (!isRecord(value)) return null;
+    const left = numberOrNull(value.left);
+    const top = numberOrNull(value.top);
+    return left !== null && top !== null ? { left, top } : null;
+  }
+
   function loadPreferences() {
     removePreference(LEGACY_REFRESH_PREF_KEY);
-    const position = readPreference(PREF_KEYS.position, DEFAULT_PREFS.position);
+    const storedPosition = readPreference(PREF_KEYS.position, DEFAULT_PREFS.position);
     return {
-      position: isRecord(position) && numberOrNull(position.left) !== null && numberOrNull(position.top) !== null ? position : null,
+      position: normalizePositionAnchor(storedPosition),
+      legacyPosition: normalizeLegacyPosition(storedPosition),
       collapsed: readPreference(PREF_KEYS.collapsed, DEFAULT_PREFS.collapsed) !== false,
       range: RANGE_OPTIONS.includes(readPreference(PREF_KEYS.range, DEFAULT_PREFS.range)) ? readPreference(PREF_KEYS.range, DEFAULT_PREFS.range) : DEFAULT_PREFS.range,
       email: readPreference(PREF_KEYS.email, DEFAULT_PREFS.email) !== false,
@@ -1437,6 +1470,7 @@
     if (!runtime.app || !runtime.host) return;
     clearTimeout(runtime.ui.tooltipTimer);
     runtime.ui.tooltipTimer = null;
+    cancelPositionFrame();
     const wasExpanded = runtime.host.getAttribute('data-wt-mode') === 'expanded';
     const willBeExpanded = !runtime.prefs.collapsed;
     const capturedState = wasExpanded && willBeExpanded ? captureExpandedPanelState() : null;
@@ -1454,6 +1488,7 @@
     runtime.host.setAttribute('data-wt-mode', runtime.prefs.collapsed ? 'collapsed' : 'expanded');
     runtime.app.append(runtime.prefs.collapsed ? renderCollapsedLauncher() : renderExpandedPanel());
     applyPosition();
+    schedulePositionApplication();
     if (preservedState) {
       runtime.ui.pendingPanelState = preservedState;
       requestAnimationFrame(() => {
@@ -1486,26 +1521,97 @@
     if (runtime.host) runtime.host.setAttribute('data-wt-theme', detectPageTheme());
   }
 
-  function viewportPosition(position) {
-    const width = runtime.host ? runtime.host.getBoundingClientRect().width || runtime.host.offsetWidth : 400;
-    const height = runtime.host ? runtime.host.getBoundingClientRect().height || runtime.host.offsetHeight : 200;
-    const maxLeft = Math.max(12, window.innerWidth - width - 12);
-    const maxTop = Math.max(12, window.innerHeight - height - 12);
-    return { left: Math.max(12, Math.min(maxLeft, numberOrNull(position.left) ?? 12)), top: Math.max(12, Math.min(maxTop, numberOrNull(position.top) ?? 12)) };
+  function cancelPositionFrame() {
+    if (runtime.ui.positionFrame === null) return;
+    cancelAnimationFrame(runtime.ui.positionFrame);
+    runtime.ui.positionFrame = null;
+  }
+
+  function clampNumber(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function currentHostSize() {
+    const rect = runtime.host?.getBoundingClientRect();
+    return {
+      width: rect?.width || runtime.host?.offsetWidth || 400,
+      height: rect?.height || runtime.host?.offsetHeight || 200
+    };
+  }
+
+  function anchorFromRect(rect) {
+    const horizontal = rect.left + rect.width / 2 <= window.innerWidth / 2 ? 'left' : 'right';
+    const vertical = rect.top + rect.height / 2 <= window.innerHeight / 2 ? 'top' : 'bottom';
+    return {
+      version: POSITION_VERSION,
+      horizontal,
+      vertical,
+      offsetX: Math.max(0, horizontal === 'left' ? rect.left : window.innerWidth - rect.right),
+      offsetY: Math.max(0, vertical === 'top' ? rect.top : window.innerHeight - rect.bottom)
+    };
+  }
+
+  function clampAnchorForViewport(anchor) {
+    const { width, height } = currentHostSize();
+    const rawLeft = anchor.horizontal === 'left' ? anchor.offsetX : window.innerWidth - width - anchor.offsetX;
+    const rawTop = anchor.vertical === 'top' ? anchor.offsetY : window.innerHeight - height - anchor.offsetY;
+    const maxLeft = Math.max(VIEWPORT_MARGIN_PX, window.innerWidth - width - VIEWPORT_MARGIN_PX);
+    const maxTop = Math.max(VIEWPORT_MARGIN_PX, window.innerHeight - height - VIEWPORT_MARGIN_PX);
+    const left = clampNumber(rawLeft, VIEWPORT_MARGIN_PX, maxLeft);
+    const top = clampNumber(rawTop, VIEWPORT_MARGIN_PX, maxTop);
+    return {
+      ...anchor,
+      offsetX: anchor.horizontal === 'left' ? left : Math.max(0, window.innerWidth - width - left),
+      offsetY: anchor.vertical === 'top' ? top : Math.max(0, window.innerHeight - height - top)
+    };
+  }
+
+  function applyPositionAnchor(anchor) {
+    if (!runtime.host) return;
+    const effective = clampAnchorForViewport(anchor || DEFAULT_POSITION_ANCHOR);
+    runtime.host.style.left = effective.horizontal === 'left' ? `${effective.offsetX}px` : 'auto';
+    runtime.host.style.right = effective.horizontal === 'right' ? `${effective.offsetX}px` : 'auto';
+    runtime.host.style.top = effective.vertical === 'top' ? `${effective.offsetY}px` : 'auto';
+    runtime.host.style.bottom = effective.vertical === 'bottom' ? `${effective.offsetY}px` : 'auto';
+  }
+
+  function applyTemporaryPosition(left, top) {
+    const { width, height } = currentHostSize();
+    const maxLeft = Math.max(VIEWPORT_MARGIN_PX, window.innerWidth - width - VIEWPORT_MARGIN_PX);
+    const maxTop = Math.max(VIEWPORT_MARGIN_PX, window.innerHeight - height - VIEWPORT_MARGIN_PX);
+    runtime.host.style.left = `${clampNumber(left, VIEWPORT_MARGIN_PX, maxLeft)}px`;
+    runtime.host.style.top = `${clampNumber(top, VIEWPORT_MARGIN_PX, maxTop)}px`;
+    runtime.host.style.right = 'auto';
+    runtime.host.style.bottom = 'auto';
+  }
+
+  function migrateLegacyPosition() {
+    const legacyPosition = runtime.prefs.legacyPosition;
+    if (!runtime.host || !legacyPosition) return;
+    applyTemporaryPosition(legacyPosition.left, legacyPosition.top);
+    const anchor = anchorFromRect(runtime.host.getBoundingClientRect());
+    runtime.prefs.position = anchor;
+    runtime.prefs.legacyPosition = null;
+    writePreference(PREF_KEYS.position, anchor);
   }
 
   function applyPosition() {
     if (!runtime.host) return;
-    if (runtime.prefs.position) {
-      const position = viewportPosition(runtime.prefs.position);
-      runtime.prefs.position = position;
-      runtime.host.style.left = `${position.left}px`;
-      runtime.host.style.top = `${position.top}px`;
-      runtime.host.style.right = 'auto';
-      runtime.host.style.bottom = 'auto';
-    } else {
-      runtime.host.style.left = 'auto'; runtime.host.style.top = 'auto'; runtime.host.style.right = '20px'; runtime.host.style.bottom = '96px';
+    if (runtime.prefs.legacyPosition) {
+      applyTemporaryPosition(runtime.prefs.legacyPosition.left, runtime.prefs.legacyPosition.top);
+      return;
     }
+    applyPositionAnchor(runtime.prefs.position || DEFAULT_POSITION_ANCHOR);
+  }
+
+  function schedulePositionApplication() {
+    cancelPositionFrame();
+    runtime.ui.positionFrame = requestAnimationFrame(() => {
+      runtime.ui.positionFrame = null;
+      if (!runtime.host) return;
+      if (runtime.prefs.legacyPosition) migrateLegacyPosition();
+      applyPosition();
+    });
   }
 
   function startDrag(event, dragSurface = event.currentTarget) {
@@ -1530,20 +1636,24 @@
         moved = true;
         moveEvent.preventDefault();
       }
-      const position = viewportPosition({ left: moveEvent.clientX - offsetX, top: moveEvent.clientY - offsetY });
-      runtime.prefs.position = position;
-      applyPosition();
+      applyTemporaryPosition(moveEvent.clientX - offsetX, moveEvent.clientY - offsetY);
     };
-    const end = () => {
+    const end = (endEvent) => {
       if (ended) return;
       ended = true;
       surface.removeEventListener('pointermove', move);
       surface.removeEventListener('pointerup', end);
       surface.removeEventListener('pointercancel', end);
       surface.releasePointerCapture?.(event.pointerId);
-      if (moved) {
-        writePreference(PREF_KEYS.position, runtime.prefs.position);
+      if (moved && endEvent?.type !== 'pointercancel') {
+        const anchor = anchorFromRect(runtime.host.getBoundingClientRect());
+        runtime.prefs.position = anchor;
+        runtime.prefs.legacyPosition = null;
+        writePreference(PREF_KEYS.position, anchor);
+        applyPositionAnchor(anchor);
         runtime.dragSuppressUntil = Date.now() + 250;
+      } else if (moved) {
+        applyPosition();
       } else if (isLauncher) {
         runtime.prefs.collapsed = false;
         writePreference(PREF_KEYS.collapsed, false);
@@ -1668,6 +1778,7 @@
   function cleanup() {
     clearTimeout(runtime.refreshTimer);
     clearTimeout(runtime.ui.tooltipTimer);
+    cancelPositionFrame();
     runtime.ui.tooltipTimer = null;
     runtime.abortController?.abort();
     runtime.observers.forEach((observer) => observer.disconnect());
