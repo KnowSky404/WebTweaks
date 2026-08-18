@@ -2,7 +2,7 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.0.0
+// @version      1.1.0
 // @description  Threaded cross-page replies, Imgur image uploads, and navigation improvements for V2EX.
 // @description:zh-CN 为 V2EX 提供跨页楼中楼、Imgur 图片上传和返回顶部功能。
 // @author       KnowSky404
@@ -55,9 +55,15 @@
     enhancedEditors: new WeakSet(),
     editorObserver: null,
     editorScanFrame: 0,
+    controlDock: null,
+    conversationToggle: null,
+    conversationPanel: null,
+    panelDismissalAttached: false,
     scrollButton: null,
     scrollFrame: 0,
-    nativeReplyListenerAttached: false
+    nativeReplyListenerAttached: false,
+    navigationAttached: false,
+    navigationSync: false
   };
 
   function logError(error) {
@@ -282,7 +288,40 @@
     return clone.innerHTML;
   }
 
-  function parseReply(element, page, context) {
+  function sanitizeReplyTemplate(element, base = location.href) {
+    const clone = element.cloneNode(true);
+    clone.removeAttribute('id');
+    clone.querySelectorAll('script, style, iframe, form, object, embed, template, base, meta, link, input, select, textarea, button, [data-action], a.reply, .reply a, .thank, .ignore, .moderate, .small.fade').forEach((node) => node.remove());
+    clone.querySelectorAll('[id]').forEach((node) => node.removeAttribute('id'));
+    clone.querySelectorAll('*').forEach((node) => {
+      [...node.attributes].forEach((attribute) => {
+        const name = attribute.name.toLowerCase();
+        const value = attribute.value.trim();
+        if (name.startsWith('on') || name === 'srcset' || name === 'srcdoc' || name === 'style' || name === 'formaction') {
+          node.removeAttribute(attribute.name);
+          return;
+        }
+        if (name === 'href' || name === 'src') {
+          const safe = safeUrl(value, name === 'src' ? 'image' : 'link', base);
+          if (!safe) node.removeAttribute(attribute.name);
+          else node.setAttribute(name, safe);
+        }
+      });
+      if (node.matches('a')) {
+        const href = safeUrl(node.getAttribute('href'), 'link', base);
+        if (!href) node.removeAttribute('href');
+        else if (new URL(href).origin !== location.origin) node.setAttribute('rel', 'noopener noreferrer');
+      }
+      if (node.matches('img')) {
+        const src = safeUrl(node.getAttribute('src'), 'image', base);
+        if (!src) node.remove();
+        else node.setAttribute('loading', 'lazy');
+      }
+    });
+    return clone;
+  }
+
+  function parseReply(element, page, context, index = 0) {
     const content = firstMatch(element, SELECTORS.replyContent);
     if (!content) return null;
     const idMatch = String(element.id || '').match(/^r_(.+)$/);
@@ -294,7 +333,7 @@
     const thankCount = thanksText.match(/\d+/)?.[0];
     const prefix = parseLeadingPrefix(content);
     return {
-      id: idMatch ? idMatch[1] : `${page}-${floor || Math.random().toString(36).slice(2)}`,
+      id: idMatch ? idMatch[1] : `fallback-${page}-${floor || 'unknown'}-${index}`,
       floor,
       page,
       author,
@@ -313,13 +352,14 @@
       relationshipConfidence: 'root',
       unresolvedReason: '',
       children: [],
+      nativeTemplate: sanitizeReplyTemplate(element),
       originalUrl: new URL(`/t/${context.id}?p=${page}#r_${encodeURIComponent(idMatch ? idMatch[1] : '')}`, location.origin).href
     };
   }
 
   function parseReplies(root, page, context) {
     const elements = root instanceof Document ? allMatches(root, SELECTORS.reply) : allMatches(root, SELECTORS.reply);
-    return elements.map((element) => parseReply(element, page, context)).filter(Boolean);
+    return elements.map((element, index) => parseReply(element, page, context, index)).filter(Boolean);
   }
 
   function inferRelationships(replies) {
@@ -426,23 +466,60 @@
     return results;
   }
 
-  function createTopicToolbar(topic) {
-    const toolbar = document.createElement('div');
-    toolbar.className = 'wt-v2ex-thread-toolbar';
-    toolbar.setAttribute('role', 'toolbar');
-    toolbar.innerHTML = `
-      <div class="wt-v2ex-thread-toolbar-title">会话视图</div>
-      <div class="wt-v2ex-thread-toolbar-actions">
-        <button type="button" class="wt-v2ex-thread-action" data-view="threaded" aria-label="切换到楼中楼" aria-pressed="false">楼中楼</button>
-        <button type="button" class="wt-v2ex-thread-action" data-view="original" aria-label="切换到原始顺序" aria-pressed="false">原始顺序</button>
-        <button type="button" class="wt-v2ex-thread-action" data-expand="all" aria-label="展开全部分支">全部展开</button>
-        <button type="button" class="wt-v2ex-thread-action" data-expand="none" aria-label="折叠全部分支">全部折叠</button>
-        <button type="button" class="wt-v2ex-thread-action wt-v2ex-load-pages" hidden aria-label="加载全部分页">加载全部分页</button>
+  function ensureControlDock() {
+    if (runtime.controlDock?.isConnected) return runtime.controlDock;
+    const dock = document.createElement('div');
+    dock.id = 'wt-v2ex-control-dock';
+    dock.className = 'wt-v2ex-control-dock';
+    dock.setAttribute('aria-label', 'V2EX 页面工具');
+    document.body.append(dock);
+    runtime.controlDock = dock;
+    return dock;
+  }
+
+  function setConversationPanelOpen(topic, open) {
+    const panel = topic.panel || runtime.conversationPanel;
+    const toggle = runtime.conversationToggle;
+    if (!panel || !toggle) return;
+    panel.hidden = !open;
+    toggle.setAttribute('aria-expanded', String(open));
+  }
+
+  function createConversationControl(topic) {
+    const dock = ensureControlDock();
+    if (runtime.conversationToggle?.isConnected) {
+      topic.panel = runtime.conversationPanel;
+      updateTopicPanel(topic);
+      return;
+    }
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'wt-v2ex-conversation-toggle';
+    toggle.textContent = '会话';
+    toggle.setAttribute('aria-label', '打开会话视图控制面板');
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.setAttribute('aria-controls', 'wt-v2ex-conversation-panel');
+    const panel = document.createElement('div');
+    panel.id = 'wt-v2ex-conversation-panel';
+    panel.className = 'wt-v2ex-conversation-panel';
+    panel.setAttribute('role', 'region');
+    panel.setAttribute('aria-label', '会话视图');
+    panel.hidden = true;
+    panel.innerHTML = `
+      <div class="wt-v2ex-conversation-panel-title">会话视图</div>
+      <div class="wt-v2ex-conversation-panel-group" role="group" aria-label="视图模式">
+        <button type="button" class="wt-v2ex-panel-action" data-view="threaded" aria-pressed="false">楼中楼</button>
+        <button type="button" class="wt-v2ex-panel-action" data-view="original" aria-pressed="false">原始顺序</button>
       </div>
+      <div class="wt-v2ex-conversation-panel-group" role="group" aria-label="分支操作">
+        <button type="button" class="wt-v2ex-panel-action" data-expand="all">全部展开</button>
+        <button type="button" class="wt-v2ex-panel-action" data-expand="none">全部折叠</button>
+      </div>
+      <button type="button" class="wt-v2ex-panel-action wt-v2ex-load-pages" hidden>加载全部分页</button>
       <div class="wt-v2ex-thread-status" role="status" aria-live="polite">准备构建楼中楼</div>`;
-    toolbar.addEventListener('click', (event) => {
+    panel.addEventListener('click', (event) => {
       const button = event.target.closest('button');
-      if (!button || !toolbar.contains(button)) return;
+      if (!button || !panel.contains(button)) return;
       if (button.dataset.view) {
         runtime.settings.preferredView = button.dataset.view;
         saveSettings();
@@ -459,24 +536,44 @@
         });
       }
     });
-    return toolbar;
+    toggle.addEventListener('click', () => setConversationPanelOpen(topic, panel.hidden));
+    dock.prepend(panel, toggle);
+    runtime.conversationToggle = toggle;
+    runtime.conversationPanel = panel;
+    topic.panel = panel;
+    if (!runtime.panelDismissalAttached) {
+      document.addEventListener('pointerdown', (event) => {
+        if (!runtime.conversationPanel || runtime.conversationPanel.hidden || !runtime.controlDock?.contains(event.target)) {
+          if (runtime.topic) setConversationPanelOpen(runtime.topic, false);
+        }
+      }, true);
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && runtime.topic) setConversationPanelOpen(runtime.topic, false);
+      });
+      runtime.panelDismissalAttached = true;
+    }
+    updateTopicPanel(topic);
   }
 
   function setTopicStatus(topic, message) {
-    const status = topic.toolbar?.querySelector('.wt-v2ex-thread-status');
+    topic.statusMessage = message;
+    const status = topic.panel?.querySelector('.wt-v2ex-thread-status');
     if (status) status.textContent = message;
   }
 
-  function updateTopicToolbar(topic) {
-    topic.toolbar.querySelectorAll('[data-view]').forEach((button) => {
-      const active = button.dataset.view === topic.view;
-      button.setAttribute('aria-pressed', String(active));
+  function updateTopicPanel(topic) {
+    const panel = topic.panel;
+    if (!panel) return;
+    panel.querySelectorAll('[data-view]').forEach((button) => {
+      button.setAttribute('aria-pressed', String(button.dataset.view === topic.view));
     });
-    const loadButton = topic.toolbar.querySelector('.wt-v2ex-load-pages');
+    const loadButton = panel.querySelector('.wt-v2ex-load-pages');
     if (loadButton) {
       loadButton.hidden = !topic.incomplete || topic.loading;
       loadButton.textContent = topic.loading ? '正在加载…' : `加载全部 ${topic.maxPage} 页并构建楼中楼`;
     }
+    const status = panel.querySelector('.wt-v2ex-thread-status');
+    if (status) status.textContent = topic.statusMessage || '准备构建楼中楼';
   }
 
   function relationshipLabel(reply) {
@@ -487,38 +584,27 @@
   }
 
   function createReplyCard(reply, depth) {
-    const article = document.createElement('article');
-    article.className = `wt-v2ex-reply-card wt-v2ex-depth-${Math.min(depth, 6)}`;
-    article.dataset.replyId = reply.id;
-    article.setAttribute('aria-label', `第 ${reply.floor || '未知'} 楼，${reply.author || '未知用户'}`);
-    const avatar = document.createElement('img');
-    avatar.className = 'wt-v2ex-reply-avatar';
-    avatar.alt = reply.author ? `${reply.author} 的头像` : '用户头像';
-    avatar.loading = 'lazy';
-    if (reply.avatarUrl) avatar.src = reply.avatarUrl;
-    else avatar.hidden = true;
-    const body = document.createElement('div');
-    body.className = 'wt-v2ex-reply-body';
+    const cell = reply.nativeTemplate?.cloneNode(true) || document.createElement('div');
+    if (!cell.classList.contains('cell')) cell.classList.add('cell');
+    cell.classList.add('wt-v2ex-threaded-reply', `wt-v2ex-depth-${Math.min(depth, 6)}`);
+    cell.removeAttribute('id');
+    cell.dataset.wtV2exReplyId = reply.id;
+    cell.setAttribute('aria-label', `第 ${reply.floor || '未知'} 楼，${reply.author || '未知用户'}`);
+    const content = firstMatch(cell, SELECTORS.replyContent);
+    const contentCell = content?.closest('td') || cell;
+    const separator = [...contentCell.children].find((element) => element.classList.contains('sep5'));
     const header = document.createElement('div');
     header.className = 'wt-v2ex-reply-header';
-    const identity = document.createElement('span');
-    identity.className = 'wt-v2ex-reply-identity';
-    identity.textContent = reply.author || '未知用户';
-    const floor = document.createElement('span');
-    floor.className = 'wt-v2ex-reply-floor';
-    floor.textContent = `#${reply.floor || '?'}`;
-    header.append(identity, floor);
-    if (reply.page > 1) {
-      const page = document.createElement('span');
-      page.className = 'wt-v2ex-reply-page';
-      page.textContent = `第 ${reply.page} 页`;
-      header.append(page);
+    const headerNodes = [];
+    for (let node = contentCell.firstChild; node && node !== separator && node !== content; node = node.nextSibling) {
+      headerNodes.push(node);
     }
-    const time = document.createElement('time');
-    time.className = 'wt-v2ex-reply-time';
-    time.textContent = reply.timeText;
-    if (reply.timeText) time.dateTime = reply.timeText;
-    header.append(time);
+    if (headerNodes.length) {
+      contentCell.insertBefore(header, headerNodes[0]);
+      headerNodes.forEach((node) => header.append(node));
+    } else {
+      contentCell.insertBefore(header, separator || content || contentCell.firstChild);
+    }
     const relation = relationshipLabel(reply);
     if (relation) {
       const badge = document.createElement('span');
@@ -527,9 +613,6 @@
       if (reply.unresolvedReason) badge.title = reply.unresolvedReason;
       header.append(badge);
     }
-    const content = document.createElement('div');
-    content.className = 'wt-v2ex-reply-content';
-    content.innerHTML = reply.contentHtml;
     const actions = document.createElement('div');
     actions.className = 'wt-v2ex-reply-actions';
     const replyButton = document.createElement('button');
@@ -545,17 +628,17 @@
     original.textContent = '定位原楼';
     original.target = '_self';
     actions.append(replyButton, original);
-    body.append(header, content, actions);
-    article.append(avatar, body);
+    header.append(actions);
     if (reply.children.length) {
       const branchButton = document.createElement('button');
       branchButton.type = 'button';
       branchButton.className = 'wt-v2ex-branch-toggle';
       branchButton.textContent = `折叠 ${reply.children.length} 条回复`;
+      branchButton.dataset.childCount = String(reply.children.length);
       branchButton.setAttribute('aria-expanded', 'true');
       branchButton.setAttribute('aria-label', `展开或折叠第 ${reply.floor || ''} 楼的回复`);
       const children = document.createElement('div');
-      children.className = 'wt-v2ex-thread-children';
+      children.className = `wt-v2ex-thread-children wt-v2ex-child-depth-${Math.min(depth + 1, 6)}`;
       children.dataset.expanded = 'true';
       branchButton.addEventListener('click', () => {
         const expanded = children.dataset.expanded === 'true';
@@ -564,22 +647,27 @@
         branchButton.setAttribute('aria-expanded', String(!expanded));
         branchButton.textContent = `${expanded ? '展开' : '折叠'} ${reply.children.length} 条回复`;
       });
-      body.append(branchButton);
-      return { article, children };
+      cell.append(branchButton, children);
+      return { cell, children };
     }
-    return { article, children: null };
+    return { cell, children: null };
   }
 
   function renderThreadedView(topic) {
     topic.threadedView.replaceChildren();
     const fragment = document.createDocumentFragment();
     const stack = [...topic.roots].reverse().map((reply) => ({ reply, target: fragment, depth: 0 }));
+    const renderedReplyIds = new Set();
     while (stack.length) {
       const { reply, target, depth } = stack.pop();
+      if (renderedReplyIds.has(reply.id)) {
+        console.warn(`${LOG_PREFIX} skipped duplicate threaded reply`, reply.id);
+        continue;
+      }
+      renderedReplyIds.add(reply.id);
       const rendered = createReplyCard(reply, depth);
-      target.append(rendered.article);
+      target.append(rendered.cell);
       if (reply.children.length && rendered.children) {
-        rendered.article.querySelector('.wt-v2ex-reply-body').append(rendered.children);
         for (let index = reply.children.length - 1; index >= 0; index -= 1) {
           stack.push({ reply: reply.children[index], target: rendered.children, depth: depth + 1 });
         }
@@ -594,8 +682,14 @@
     }
     topic.view = view;
     topic.threadedView.hidden = view !== 'threaded';
-    topic.nativeReplies.forEach((reply) => reply.classList.toggle('wt-v2ex-native-hidden', view === 'threaded'));
-    updateTopicToolbar(topic);
+    topic.threadedView.setAttribute('aria-hidden', String(view !== 'threaded'));
+    topic.nativeReplies.forEach((reply) => {
+      const hidden = view === 'threaded';
+      reply.classList.toggle('wt-v2ex-native-hidden', hidden);
+      if (hidden) reply.setAttribute('aria-hidden', 'true');
+      else reply.removeAttribute('aria-hidden');
+    });
+    updateTopicPanel(topic);
   }
 
   function setAllBranches(topic, expanded) {
@@ -605,7 +699,7 @@
     });
     topic.threadedView.querySelectorAll('.wt-v2ex-branch-toggle').forEach((button) => {
       button.setAttribute('aria-expanded', String(expanded));
-      const count = button.textContent.match(/\d+/)?.[0] || '';
+      const count = button.dataset.childCount || button.textContent.match(/\d+/)?.[0] || '';
       button.textContent = `${expanded ? '折叠' : '展开'} ${count} 条回复`;
     });
   }
@@ -613,7 +707,7 @@
   async function loadAllTopicPages(topic) {
     if (topic.loading || !topic.incomplete) return;
     topic.loading = true;
-    updateTopicToolbar(topic);
+    updateTopicPanel(topic);
     setTopicStatus(topic, `正在加载 0 / ${topic.maxPage} 页`);
     const pages = topic.pages.filter((page) => !topic.loadedPages.has(page));
     const results = await loadPages(topic, pages, (completed, total) => setTopicStatus(topic, `正在加载 ${completed} / ${total} 页`));
@@ -645,7 +739,7 @@
     if (failures) setTopicStatus(topic, `部分分页加载失败，已显示 ${topic.models.length} 条回复；原始顺序仍可用`);
     else if (topic.duplicateIds) setTopicStatus(topic, `已加载 ${topic.models.length} 条回复（忽略 ${topic.duplicateIds} 个重复 ID）`);
     else setTopicStatus(topic, `已加载 ${topic.models.length} 条回复，关系为启发式重建`);
-    updateTopicToolbar(topic);
+    updateTopicPanel(topic);
     if (failures || topic.failed) applyTopicView(topic, 'original');
     else if (runtime.settings.preferredView === 'threaded') applyTopicView(topic, 'threaded');
   }
@@ -660,14 +754,15 @@
     const threadedView = document.createElement('section');
     threadedView.className = 'wt-v2ex-threaded-view';
     threadedView.setAttribute('aria-label', '楼中楼视图');
+    const discoveredPages = discoverPages(context);
     const topic = {
       context,
       key: context.key,
       nativeReplies,
-      toolbar: null,
+      panel: null,
       threadedView,
-      pages: discoverPages(context).pages,
-      maxPage: discoverPages(context).maxPage,
+      pages: discoveredPages.pages,
+      maxPage: discoveredPages.maxPage,
       loadedPages: new Set([context.page]),
       replies: parseReplies(document, context.page, context),
       models: [],
@@ -676,11 +771,10 @@
       loading: false,
       incomplete: false,
       failed: false,
-      duplicateIds: 0
+      duplicateIds: 0,
+      statusMessage: '准备构建楼中楼'
     };
-    // The toolbar event closures need the completed topic object.
-    topic.toolbar = createTopicToolbar(topic);
-    firstReply.before(topic.toolbar, threadedView);
+    firstReply.before(threadedView);
     runtime.topic = topic;
     topic.models = inferRelationships(topic.replies);
     topic.roots = topic.models.filter((reply) => !reply.parentId);
@@ -688,10 +782,10 @@
     if (topic.maxPage > 10) {
       topic.incomplete = true;
       setTopicStatus(topic, `当前显示第 ${context.page} 页；完整关系需要加载全部 ${topic.maxPage} 页`);
-      updateTopicToolbar(topic);
+      updateTopicPanel(topic);
     } else if (topic.pages.length > 1) {
       topic.incomplete = true;
-      updateTopicToolbar(topic);
+      updateTopicPanel(topic);
       setTopicStatus(topic, `正在加载 0 / ${topic.pages.length - 1} 页`);
       void loadAllTopicPages(topic).catch((error) => {
         topic.loading = false;
@@ -708,6 +802,56 @@
       const button = event.target.closest('.wt-v2ex-reply-action');
       if (button) insertReplyPrefix(findEditor(), button.dataset.replyUser, Number(button.dataset.replyFloor));
     });
+  }
+
+  function removeConversationControl() {
+    runtime.conversationPanel?.remove();
+    runtime.conversationToggle?.remove();
+    runtime.conversationPanel = null;
+    runtime.conversationToggle = null;
+  }
+
+  async function synchronizeTopicPage() {
+    if (runtime.navigationSync) return;
+    const context = topicContext();
+    if (runtime.topic?.key === context?.key) return;
+    runtime.navigationSync = true;
+    try {
+      if (runtime.topic) {
+        applyTopicView(runtime.topic, 'original');
+        runtime.topic.threadedView.remove();
+        runtime.topic = null;
+      }
+      removeConversationControl();
+      if (context) {
+        await initializeTopic();
+        if (runtime.topic) createConversationControl(runtime.topic);
+      }
+    } finally {
+      runtime.navigationSync = false;
+    }
+  }
+
+  function scheduleTopicSynchronization() {
+    window.setTimeout(() => {
+      void synchronizeTopicPage().catch(logError);
+    }, 0);
+  }
+
+  function observeNavigation() {
+    if (runtime.navigationAttached) return;
+    runtime.navigationAttached = true;
+    ['pushState', 'replaceState'].forEach((method) => {
+      const original = window.history[method];
+      if (typeof original !== 'function') return;
+      window.history[method] = function patchedHistoryMethod(...args) {
+        const result = original.apply(this, args);
+        window.dispatchEvent(new Event('wt-v2ex-navigation'));
+        return result;
+      };
+    });
+    window.addEventListener('popstate', scheduleTopicSynchronization);
+    window.addEventListener('wt-v2ex-navigation', scheduleTopicSynchronization);
   }
 
   function findEditor() {
@@ -1009,6 +1153,7 @@
 
   function initializeScrollToTop() {
     if (runtime.scrollButton) return;
+    const dock = ensureControlDock();
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'wt-v2ex-scroll-top';
@@ -1019,7 +1164,7 @@
       const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
       window.scrollTo({ top: 0, behavior: reducedMotion ? 'auto' : 'smooth' });
     });
-    document.body.append(button);
+    dock.append(button);
     runtime.scrollButton = button;
     window.addEventListener('scroll', () => {
       if (runtime.scrollFrame) return;
@@ -1033,33 +1178,40 @@
 
   function addStyles() {
     const css = `
-      .wt-v2ex-thread-toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0; padding:10px 12px; border:1px solid rgba(127,127,127,.24); border-radius:6px; background:var(--v2ex-background-color,#fff); color:var(--v2ex-text-color,#333); }
-      .wt-v2ex-thread-toolbar-title { font-weight:600; margin-right:auto; }
-      .wt-v2ex-thread-toolbar-actions { display:flex; flex-wrap:wrap; gap:6px; }
-      .wt-v2ex-thread-action, .wt-v2ex-reply-action, .wt-v2ex-original-link, .wt-v2ex-upload-button, .wt-v2ex-configure-imgur, .wt-v2ex-branch-toggle { border:1px solid rgba(127,127,127,.35); border-radius:4px; padding:5px 9px; background:transparent; color:inherit; cursor:pointer; font:inherit; text-decoration:none; }
-      .wt-v2ex-thread-action:hover, .wt-v2ex-reply-action:hover, .wt-v2ex-original-link:hover, .wt-v2ex-upload-button:hover, .wt-v2ex-configure-imgur:hover, .wt-v2ex-branch-toggle:hover { background:rgba(127,127,127,.12); }
-      .wt-v2ex-thread-action:focus-visible, .wt-v2ex-reply-action:focus-visible, .wt-v2ex-original-link:focus-visible, .wt-v2ex-upload-button:focus-visible, .wt-v2ex-configure-imgur:focus-visible, .wt-v2ex-branch-toggle:focus-visible, .wt-v2ex-scroll-top:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
-      .wt-v2ex-thread-action[aria-pressed="true"] { background:rgba(22,119,255,.14); border-color:#1677ff; }
-      .wt-v2ex-thread-status { flex-basis:100%; color:#666; font-size:12px; }
+      .wt-v2ex-control-dock { position:fixed; z-index:1000; right:max(16px, env(safe-area-inset-right)); bottom:max(16px, env(safe-area-inset-bottom)); display:flex; flex-direction:column; align-items:flex-end; gap:8px; }
+      .wt-v2ex-conversation-toggle, .wt-v2ex-scroll-top { border:1px solid rgba(127,127,127,.4); background:var(--v2ex-background-color,#fff); color:inherit; box-shadow:0 3px 12px rgba(0,0,0,.16); cursor:pointer; }
+      .wt-v2ex-conversation-toggle { min-width:42px; min-height:34px; border-radius:17px; padding:5px 10px; }
+      .wt-v2ex-scroll-top { width:42px; height:42px; border-radius:50%; font-size:20px; line-height:1; }
+      .wt-v2ex-conversation-panel { position:absolute; right:0; bottom:calc(100% + 8px); width:min(320px, calc(100vw - 24px)); max-height:min(70vh, 560px); overflow:auto; display:grid; gap:9px; padding:12px; border:1px solid rgba(127,127,127,.28); border-radius:7px; background:var(--v2ex-background-color,#fff); color:var(--v2ex-text-color,#333); box-shadow:0 5px 20px rgba(0,0,0,.2); }
+      .wt-v2ex-conversation-panel-title { font-weight:600; }
+      .wt-v2ex-conversation-panel-group { display:flex; flex-wrap:wrap; gap:6px; }
+      .wt-v2ex-panel-action { border:1px solid rgba(127,127,127,.35); border-radius:4px; padding:5px 8px; background:transparent; color:inherit; cursor:pointer; font:inherit; }
+      .wt-v2ex-panel-action:hover, .wt-v2ex-panel-action[aria-pressed="true"] { background:rgba(127,127,127,.12); }
+      .wt-v2ex-upload-button, .wt-v2ex-configure-imgur { border:1px solid rgba(127,127,127,.35); border-radius:4px; padding:5px 9px; background:transparent; color:inherit; cursor:pointer; font:inherit; }
+      .wt-v2ex-upload-button:hover, .wt-v2ex-configure-imgur:hover { background:rgba(127,127,127,.12); }
+      .wt-v2ex-thread-status { color:#666; font-size:12px; }
       .wt-v2ex-threaded-view { margin:10px 0; }
-      .wt-v2ex-native-hidden { display:none; }
-      .wt-v2ex-reply-card { display:flex; gap:10px; margin:8px 0; padding:10px; border:1px solid rgba(127,127,127,.22); border-radius:6px; background:var(--v2ex-background-color,#fff); color:var(--v2ex-text-color,#333); }
-      .wt-v2ex-reply-avatar { flex:0 0 40px; width:40px; height:40px; border-radius:4px; object-fit:cover; background:rgba(127,127,127,.12); }
-      .wt-v2ex-reply-body { min-width:0; flex:1; }
-      .wt-v2ex-reply-header { display:flex; flex-wrap:wrap; align-items:center; gap:7px; margin-bottom:7px; font-size:12px; }
-      .wt-v2ex-reply-identity { font-weight:600; }
-      .wt-v2ex-reply-floor, .wt-v2ex-reply-page, .wt-v2ex-reply-time { color:#777; }
-      .wt-v2ex-relation { padding:2px 5px; border-radius:3px; font-size:11px; border:1px solid rgba(127,127,127,.3); }
+      #Main .cell[id^="r_"].wt-v2ex-native-hidden, #Wrapper .cell[id^="r_"].wt-v2ex-native-hidden { display:none !important; }
+      .wt-v2ex-threaded-reply { position:relative; }
+      .wt-v2ex-threaded-reply .wt-v2ex-reply-header { display:flex; flex-wrap:wrap; align-items:baseline; gap:0 7px; margin-bottom:5px; }
+      .wt-v2ex-threaded-reply .wt-v2ex-reply-header > .fr { float:none; margin-left:0; }
+      .wt-v2ex-threaded-reply .wt-v2ex-reply-actions { display:flex; flex-wrap:wrap; gap:7px; margin-left:auto; }
+      .wt-v2ex-threaded-reply .wt-v2ex-reply-action, .wt-v2ex-threaded-reply .wt-v2ex-original-link { border:0; padding:0; background:transparent; color:inherit; cursor:pointer; font:inherit; text-decoration:none; }
+      .wt-v2ex-threaded-reply .wt-v2ex-reply-action:hover, .wt-v2ex-threaded-reply .wt-v2ex-original-link:hover { text-decoration:underline; }
+      .wt-v2ex-relation { padding:1px 4px; border:1px solid rgba(127,127,127,.3); border-radius:3px; font-size:11px; }
       .wt-v2ex-relation-exact { color:#176b3a; }
       .wt-v2ex-relation-inferred { color:#805b00; }
       .wt-v2ex-relation-unresolved { color:#9b2c2c; }
-      .wt-v2ex-reply-content { overflow-wrap:anywhere; line-height:1.55; }
-      .wt-v2ex-reply-content img { max-width:100%; height:auto; }
-      .wt-v2ex-reply-content pre { overflow:auto; }
-      .wt-v2ex-reply-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
-      .wt-v2ex-thread-children { margin-top:8px; padding-left:10px; border-left:2px solid rgba(22,119,255,.28); }
-      .wt-v2ex-depth-6 { border-left:3px solid rgba(127,127,127,.4); }
-      .wt-v2ex-branch-toggle { margin-top:8px; font-size:12px; }
+      .wt-v2ex-thread-children { margin-top:6px; padding-left:10px; border-left:2px solid rgba(22,119,255,.28); }
+      .wt-v2ex-child-depth-1 { margin-left:4px; }
+      .wt-v2ex-child-depth-2 { margin-left:8px; }
+      .wt-v2ex-child-depth-3 { margin-left:12px; }
+      .wt-v2ex-child-depth-4 { margin-left:16px; }
+      .wt-v2ex-child-depth-5 { margin-left:20px; }
+      .wt-v2ex-child-depth-6 { margin-left:24px; }
+      .wt-v2ex-child-depth-6 .wt-v2ex-child-depth-6 { margin-left:0; padding-left:0; border-left:0; }
+      .wt-v2ex-branch-toggle { margin-top:6px; border:0; padding:0; background:transparent; color:inherit; cursor:pointer; font:inherit; font-size:12px; }
+      .wt-v2ex-panel-action:focus-visible, .wt-v2ex-reply-action:focus-visible, .wt-v2ex-original-link:focus-visible, .wt-v2ex-upload-button:focus-visible, .wt-v2ex-configure-imgur:focus-visible, .wt-v2ex-branch-toggle:focus-visible, .wt-v2ex-conversation-toggle:focus-visible, .wt-v2ex-scroll-top:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
       .wt-v2ex-editor-tools { display:flex; flex-wrap:wrap; align-items:center; gap:7px; margin:6px 0 10px; padding:5px 0; color:inherit; font-size:12px; }
       .wt-v2ex-file-input { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%); }
       .wt-v2ex-upload-status { color:#666; }
@@ -1067,10 +1219,9 @@
       .wt-v2ex-upload-status-success { color:#176b3a; }
       .wt-v2ex-privacy-note { flex-basis:100%; color:#805b00; }
       .wt-v2ex-editor-dragging { outline:2px dashed #1677ff; outline-offset:3px; }
-      .wt-v2ex-scroll-top { position:fixed; z-index:1000; right:max(16px, env(safe-area-inset-right)); bottom:max(16px, env(safe-area-inset-bottom)); width:42px; height:42px; border:1px solid rgba(127,127,127,.4); border-radius:50%; background:var(--v2ex-background-color,#fff); color:inherit; box-shadow:0 3px 12px rgba(0,0,0,.16); cursor:pointer; font-size:20px; line-height:1; }
-      @media (max-width:600px) { .wt-v2ex-scroll-top { right:max(10px, env(safe-area-inset-right)); bottom:max(10px, env(safe-area-inset-bottom)); } .wt-v2ex-reply-card { padding:8px; } .wt-v2ex-reply-avatar { flex-basis:32px; width:32px; height:32px; } }
-      @media (prefers-color-scheme:dark) { .wt-v2ex-thread-toolbar, .wt-v2ex-reply-card, .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); } .wt-v2ex-thread-status, .wt-v2ex-reply-floor, .wt-v2ex-reply-page, .wt-v2ex-reply-time, .wt-v2ex-upload-status { color:#aaa; } }
-      html.night .wt-v2ex-thread-toolbar, html.night .wt-v2ex-reply-card, html.night .wt-v2ex-scroll-top, body.night .wt-v2ex-thread-toolbar, body.night .wt-v2ex-reply-card, body.night .wt-v2ex-scroll-top, [data-theme="dark"] .wt-v2ex-thread-toolbar, [data-theme="dark"] .wt-v2ex-reply-card, [data-theme="dark"] .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); }
+      @media (max-width:600px) { .wt-v2ex-control-dock { right:max(10px, env(safe-area-inset-right)); bottom:max(10px, env(safe-area-inset-bottom)); } .wt-v2ex-conversation-panel { max-height:60vh; } .wt-v2ex-threaded-reply .wt-v2ex-reply-actions { margin-left:0; flex-basis:100%; } }
+      @media (prefers-color-scheme:dark) { .wt-v2ex-conversation-panel, .wt-v2ex-conversation-toggle, .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); } .wt-v2ex-thread-status, .wt-v2ex-upload-status { color:#aaa; } }
+      html.night .wt-v2ex-conversation-panel, html.night .wt-v2ex-conversation-toggle, html.night .wt-v2ex-scroll-top, body.night .wt-v2ex-conversation-panel, body.night .wt-v2ex-conversation-toggle, body.night .wt-v2ex-scroll-top, [data-theme="dark"] .wt-v2ex-conversation-panel, [data-theme="dark"] .wt-v2ex-conversation-toggle, [data-theme="dark"] .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); }
       @media (prefers-reduced-motion:reduce) { .wt-v2ex-scroll-top { scroll-behavior:auto; } }
     `;
     if (typeof GM_addStyle === 'function') GM_addStyle(css);
@@ -1083,7 +1234,18 @@
     addStyles();
     registerMenuCommands();
     attachNativeReplyEnhancer();
-    try { await initializeTopic(); } catch (error) { if (runtime.topic) { runtime.topic.failed = true; applyTopicView(runtime.topic, 'original'); } logError(error); }
+    observeNavigation();
+    try {
+      await initializeTopic();
+      if (runtime.topic) createConversationControl(runtime.topic);
+    } catch (error) {
+      if (runtime.topic) {
+        runtime.topic.failed = true;
+        applyTopicView(runtime.topic, 'original');
+        createConversationControl(runtime.topic);
+      }
+      logError(error);
+    }
     try { observeEditors(); } catch (error) { logError(error); }
     try { if (runtime.settings.scrollTopEnabled) initializeScrollToTop(); } catch (error) { logError(error); }
   }

@@ -21,9 +21,11 @@ The script parses the rendered reply HTML, discovers actual V2EX pagination link
 
 V2EX does not expose a reliable public parent-reply identifier. Inferred relationships are therefore a heuristic, not a guarantee. Replies are never discarded when inference fails. The visual indentation is capped while the logical tree remains intact, and rendering uses an iterative stack so unusually deep content does not require recursive JavaScript calls.
 
-For topics of up to 10 pages, the script loads the remaining pages automatically with at most three concurrent requests. A request has a timeout and may be retried once for a transient/network or 5xx failure. Progress is shown in the toolbar, and partial failures leave the native list available. Topics over 10 pages are not fetched in full automatically; use `加载全部 N 页并构建楼中楼` when desired. `定位原楼` opens the current V2EX origin with the source page and native reply anchor.
+For topics of up to 10 pages, the script loads the remaining pages automatically with at most three concurrent requests. A request has a timeout and may be retried once for a transient/network or 5xx failure. Progress is shown in the lower-right floating conversation panel, and partial failures leave the native list available. Topics over 10 pages are not fetched in full automatically; use `加载全部 N 页并构建楼中楼` when desired. `定位原楼` opens the current V2EX origin with the source page and native reply anchor.
 
-The `楼中楼` and `原始顺序` buttons only switch visibility. They do not move or delete V2EX's original reply elements. The preferred view is stored as a small versioned setting. All custom controls are keyboard operable and expose labels, pressed state, or expanded state as appropriate.
+The compact `会话` control sits in a fixed lower-right dock above the `↑` scroll-to-top button. It opens a non-modal panel with `楼中楼`, `原始顺序`, branch controls, full loading, and live status. The panel is closed by default, Escape, another click on `会话`, or an outside pointer click. The two view buttons only switch visibility; they do not move or delete V2EX's original reply elements.
+
+Threaded replies reuse sanitized clones of V2EX's native `.cell` reply structure and `.reply_content`, so native typography, content elements, theme surfaces, and user CSS remain applicable. Hierarchy adds only scoped indentation and a guide line. A reply with an exact or inferred parent is rendered inside that branch and is never emitted again as a top-level reply. The preferred view is stored as a small versioned setting. All custom controls are keyboard operable and expose labels, pressed state, or expanded state as appropriate.
 
 ### Reply prefixes
 
@@ -41,7 +43,7 @@ If no Client ID is configured, the script shows an inline message and makes no u
 
 ### Scroll to top
 
-One compact fixed button appears near the lower-right safe area after approximately 600 pixels of scrolling. It uses a passive, `requestAnimationFrame`-throttled scroll listener, supports keyboard activation, adapts on narrow screens, and uses instant scrolling when `prefers-reduced-motion: reduce` applies. Repeated initialization does not create another button.
+The shared lower-right dock contains the `会话` control on topic pages and the compact `↑` button below it. The scroll button appears after approximately 600 pixels of scrolling, uses a passive `requestAnimationFrame`-throttled scroll listener, supports keyboard activation, adapts on narrow screens, and uses instant scrolling when `prefers-reduced-motion: reduce` applies. On non-topic pages only the scroll button is present. Repeated initialization does not create another dock or button, and disabling scroll-to-top does not remove the conversation control.
 
 ## Settings and permissions
 
@@ -69,4 +71,4 @@ The menu also provides commands to clear the Client ID and switch the defaults. 
 
 点击“上传图片”或直接把图片粘贴/拖到主题回复编辑器即可上传。首次使用前通过脚本菜单设置自己的 Imgur Client ID；只填 Client ID，不要填 Client Secret。每张图片上限 10 MiB，图片会发送给 Imgur，匿名上传不等于私密存储。上传失败不会清空编辑器，普通文字粘贴保持原生行为。
 
-“返回顶部”按钮默认在滚动约 600 像素后出现。脚本菜单可分别关闭图片上传或返回顶部，也可切换默认的楼中楼/原始顺序。
+主题页右下角的“会话”按钮打开楼中楼控制面板；面板中的“楼中楼”和“原始顺序”只切换显示，原始回复始终保留用于回退。线程回复复用 V2EX 原生回复结构和样式，子回复只显示在父楼层分支中，不会再次出现在顶层。右下角面板下方的“↑”按钮默认在滚动约 600 像素后出现；非主题页只显示该返回顶部按钮。脚本菜单可分别关闭图片上传或返回顶部，也可切换默认的楼中楼/原始顺序。
