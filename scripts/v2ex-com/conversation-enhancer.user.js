@@ -2,7 +2,7 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.1.0
+// @version      1.2.0
 // @description  Threaded cross-page replies, Imgur image uploads, and navigation improvements for V2EX.
 // @description:zh-CN 为 V2EX 提供跨页楼中楼、Imgur 图片上传和返回顶部功能。
 // @author       KnowSky404
@@ -43,6 +43,7 @@
     replyFloor: ['.no'],
     replyTime: ['.ago'],
     replyThanks: ['.small.fade img[alt="❤️"]'],
+    nativeReplyFloor: ['.fr .no', '.no'],
     pagination: ['.ps_container a[href*="?p="]', '.ps_container a[href*="&p="]'],
     pageInput: ['.ps_container input.page_input'],
     editor: ['#reply_content', '#topic_content', 'textarea[name="content"]'],
@@ -321,7 +322,7 @@
     return clone;
   }
 
-  function parseReply(element, page, context, index = 0) {
+  function parseReply(element, page, index = 0) {
     const content = firstMatch(element, SELECTORS.replyContent);
     if (!content) return null;
     const idMatch = String(element.id || '').match(/^r_(.+)$/);
@@ -352,14 +353,13 @@
       relationshipConfidence: 'root',
       unresolvedReason: '',
       children: [],
-      nativeTemplate: sanitizeReplyTemplate(element),
-      originalUrl: new URL(`/t/${context.id}?p=${page}#r_${encodeURIComponent(idMatch ? idMatch[1] : '')}`, location.origin).href
+      nativeTemplate: sanitizeReplyTemplate(element)
     };
   }
 
-  function parseReplies(root, page, context) {
+  function parseReplies(root, page) {
     const elements = root instanceof Document ? allMatches(root, SELECTORS.reply) : allMatches(root, SELECTORS.reply);
-    return elements.map((element, index) => parseReply(element, page, context, index)).filter(Boolean);
+    return elements.map((element, index) => parseReply(element, page, index)).filter(Boolean);
   }
 
   function inferRelationships(replies) {
@@ -451,7 +451,7 @@
         try {
           const html = await fetchPage(pageUrl(topic.context, page));
           const parsed = new DOMParser().parseFromString(html, 'text/html');
-          const replies = parseReplies(parsed, page, topic.context);
+          const replies = parseReplies(parsed, page);
           if (!replies.length) throw new Error('分页中未找到可解析的回复');
           results[index] = { page, replies };
         } catch (error) {
@@ -483,6 +483,7 @@
     if (!panel || !toggle) return;
     panel.hidden = !open;
     toggle.setAttribute('aria-expanded', String(open));
+    toggle.setAttribute('aria-label', open ? '关闭会话视图控制面板' : '打开会话视图控制面板');
   }
 
   function createConversationControl(topic) {
@@ -511,10 +512,6 @@
         <button type="button" class="wt-v2ex-panel-action" data-view="threaded" aria-pressed="false">楼中楼</button>
         <button type="button" class="wt-v2ex-panel-action" data-view="original" aria-pressed="false">原始顺序</button>
       </div>
-      <div class="wt-v2ex-conversation-panel-group" role="group" aria-label="分支操作">
-        <button type="button" class="wt-v2ex-panel-action" data-expand="all">全部展开</button>
-        <button type="button" class="wt-v2ex-panel-action" data-expand="none">全部折叠</button>
-      </div>
       <button type="button" class="wt-v2ex-panel-action wt-v2ex-load-pages" hidden>加载全部分页</button>
       <div class="wt-v2ex-thread-status" role="status" aria-live="polite">准备构建楼中楼</div>`;
     panel.addEventListener('click', (event) => {
@@ -524,8 +521,6 @@
         runtime.settings.preferredView = button.dataset.view;
         saveSettings();
         applyTopicView(topic, button.dataset.view);
-      } else if (button.dataset.expand) {
-        setAllBranches(topic, button.dataset.expand === 'all');
       } else if (button.classList.contains('wt-v2ex-load-pages')) {
         void loadAllTopicPages(topic).catch((error) => {
           topic.loading = false;
@@ -583,6 +578,35 @@
     return '';
   }
 
+  function removeClonedNativeHeaderControls(header) {
+    const nativeFloor = firstMatch(header, SELECTORS.nativeReplyFloor);
+    if (nativeFloor) nativeFloor.remove();
+
+    allMatches(header, SELECTORS.nativeReplyAction).forEach((action) => {
+      const replyWrapper = action.closest('.reply');
+      action.remove();
+      if (replyWrapper && !replyWrapper.children.length && !replyWrapper.textContent.trim()) replyWrapper.remove();
+    });
+
+    header.querySelectorAll('.reply').forEach((wrapper) => wrapper.remove());
+    [...header.querySelectorAll('.reply, .fr')].reverse().forEach((wrapper) => {
+      if (!wrapper.children.length && !wrapper.textContent.trim()) wrapper.remove();
+    });
+  }
+
+  function createReplyIcon() {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.classList.add('wt-v2ex-reply-icon');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('focusable', 'false');
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', 'M3 3.5A2.5 2.5 0 0 1 5.5 1h5A2.5 2.5 0 0 1 13 3.5v3A2.5 2.5 0 0 1 10.5 9H7.2l-3.5 3v-3.1A2.5 2.5 0 0 1 3 6.5v-3Zm2.5-1A1.5 1.5 0 0 0 4 4v2.5A1.5 1.5 0 0 0 5.5 8h.2v1.8L6.8 8h3.7A1.5 1.5 0 0 0 12 6.5v-3A1.5 1.5 0 0 0 10.5 2h-5Z');
+    path.setAttribute('fill', 'currentColor');
+    svg.append(path);
+    return svg;
+  }
+
   function createReplyCard(reply, depth) {
     const cell = reply.nativeTemplate?.cloneNode(true) || document.createElement('div');
     if (!cell.classList.contains('cell')) cell.classList.add('cell');
@@ -605,6 +629,7 @@
     } else {
       contentCell.insertBefore(header, separator || content || contentCell.firstChild);
     }
+    removeClonedNativeHeaderControls(header);
     const relation = relationshipLabel(reply);
     if (relation) {
       const badge = document.createElement('span');
@@ -615,39 +640,22 @@
     }
     const actions = document.createElement('div');
     actions.className = 'wt-v2ex-reply-actions';
+    const floor = document.createElement('span');
+    floor.className = 'wt-v2ex-reply-floor-action';
+    floor.textContent = reply.floor ? String(reply.floor) : '#?';
     const replyButton = document.createElement('button');
     replyButton.type = 'button';
     replyButton.className = 'wt-v2ex-reply-action';
-    replyButton.textContent = '回复';
+    replyButton.append(createReplyIcon());
     replyButton.setAttribute('aria-label', `回复 ${reply.author || '该用户'} 第 ${reply.floor || ''} 楼`);
     replyButton.dataset.replyUser = reply.author;
     replyButton.dataset.replyFloor = String(reply.floor || '');
-    const original = document.createElement('a');
-    original.className = 'wt-v2ex-original-link';
-    original.href = reply.originalUrl;
-    original.textContent = '定位原楼';
-    original.target = '_self';
-    actions.append(replyButton, original);
+    actions.append(floor, replyButton);
     header.append(actions);
     if (reply.children.length) {
-      const branchButton = document.createElement('button');
-      branchButton.type = 'button';
-      branchButton.className = 'wt-v2ex-branch-toggle';
-      branchButton.textContent = `折叠 ${reply.children.length} 条回复`;
-      branchButton.dataset.childCount = String(reply.children.length);
-      branchButton.setAttribute('aria-expanded', 'true');
-      branchButton.setAttribute('aria-label', `展开或折叠第 ${reply.floor || ''} 楼的回复`);
       const children = document.createElement('div');
       children.className = `wt-v2ex-thread-children wt-v2ex-child-depth-${Math.min(depth + 1, 6)}`;
-      children.dataset.expanded = 'true';
-      branchButton.addEventListener('click', () => {
-        const expanded = children.dataset.expanded === 'true';
-        children.dataset.expanded = String(!expanded);
-        children.hidden = expanded;
-        branchButton.setAttribute('aria-expanded', String(!expanded));
-        branchButton.textContent = `${expanded ? '展开' : '折叠'} ${reply.children.length} 条回复`;
-      });
-      cell.append(branchButton, children);
+      cell.append(children);
       return { cell, children };
     }
     return { cell, children: null };
@@ -690,18 +698,6 @@
       else reply.removeAttribute('aria-hidden');
     });
     updateTopicPanel(topic);
-  }
-
-  function setAllBranches(topic, expanded) {
-    topic.threadedView.querySelectorAll('.wt-v2ex-thread-children').forEach((children) => {
-      children.hidden = !expanded;
-      children.dataset.expanded = String(expanded);
-    });
-    topic.threadedView.querySelectorAll('.wt-v2ex-branch-toggle').forEach((button) => {
-      button.setAttribute('aria-expanded', String(expanded));
-      const count = button.dataset.childCount || button.textContent.match(/\d+/)?.[0] || '';
-      button.textContent = `${expanded ? '折叠' : '展开'} ${count} 条回复`;
-    });
   }
 
   async function loadAllTopicPages(topic) {
@@ -764,7 +760,7 @@
       pages: discoveredPages.pages,
       maxPage: discoveredPages.maxPage,
       loadedPages: new Set([context.page]),
-      replies: parseReplies(document, context.page, context),
+      replies: parseReplies(document, context.page),
       models: [],
       roots: [],
       view: 'original',
@@ -805,6 +801,11 @@
   }
 
   function removeConversationControl() {
+    if (runtime.conversationPanel) runtime.conversationPanel.hidden = true;
+    if (runtime.conversationToggle) {
+      runtime.conversationToggle.setAttribute('aria-expanded', 'false');
+      runtime.conversationToggle.setAttribute('aria-label', '打开会话视图控制面板');
+    }
     runtime.conversationPanel?.remove();
     runtime.conversationToggle?.remove();
     runtime.conversationPanel = null;
@@ -1183,6 +1184,7 @@
       .wt-v2ex-conversation-toggle { min-width:42px; min-height:34px; border-radius:17px; padding:5px 10px; }
       .wt-v2ex-scroll-top { width:42px; height:42px; border-radius:50%; font-size:20px; line-height:1; }
       .wt-v2ex-conversation-panel { position:absolute; right:0; bottom:calc(100% + 8px); width:min(320px, calc(100vw - 24px)); max-height:min(70vh, 560px); overflow:auto; display:grid; gap:9px; padding:12px; border:1px solid rgba(127,127,127,.28); border-radius:7px; background:var(--v2ex-background-color,#fff); color:var(--v2ex-text-color,#333); box-shadow:0 5px 20px rgba(0,0,0,.2); }
+      .wt-v2ex-conversation-panel[hidden] { display:none !important; }
       .wt-v2ex-conversation-panel-title { font-weight:600; }
       .wt-v2ex-conversation-panel-group { display:flex; flex-wrap:wrap; gap:6px; }
       .wt-v2ex-panel-action { border:1px solid rgba(127,127,127,.35); border-radius:4px; padding:5px 8px; background:transparent; color:inherit; cursor:pointer; font:inherit; }
@@ -1195,9 +1197,11 @@
       .wt-v2ex-threaded-reply { position:relative; }
       .wt-v2ex-threaded-reply .wt-v2ex-reply-header { display:flex; flex-wrap:wrap; align-items:baseline; gap:0 7px; margin-bottom:5px; }
       .wt-v2ex-threaded-reply .wt-v2ex-reply-header > .fr { float:none; margin-left:0; }
-      .wt-v2ex-threaded-reply .wt-v2ex-reply-actions { display:flex; flex-wrap:wrap; gap:7px; margin-left:auto; }
-      .wt-v2ex-threaded-reply .wt-v2ex-reply-action, .wt-v2ex-threaded-reply .wt-v2ex-original-link { border:0; padding:0; background:transparent; color:inherit; cursor:pointer; font:inherit; text-decoration:none; }
-      .wt-v2ex-threaded-reply .wt-v2ex-reply-action:hover, .wt-v2ex-threaded-reply .wt-v2ex-original-link:hover { text-decoration:underline; }
+      .wt-v2ex-threaded-reply .wt-v2ex-reply-actions { display:flex; flex-wrap:wrap; align-items:center; gap:5px; margin-left:auto; }
+      .wt-v2ex-threaded-reply .wt-v2ex-reply-floor-action { color:inherit; }
+      .wt-v2ex-threaded-reply .wt-v2ex-reply-action { display:inline-flex; align-items:center; justify-content:center; border:0; padding:1px; background:transparent; color:inherit; cursor:pointer; font:inherit; text-decoration:none; }
+      .wt-v2ex-threaded-reply .wt-v2ex-reply-action:hover { opacity:.72; }
+      .wt-v2ex-threaded-reply .wt-v2ex-reply-icon { display:block; width:14px; height:14px; }
       .wt-v2ex-relation { padding:1px 4px; border:1px solid rgba(127,127,127,.3); border-radius:3px; font-size:11px; }
       .wt-v2ex-relation-exact { color:#176b3a; }
       .wt-v2ex-relation-inferred { color:#805b00; }
@@ -1210,8 +1214,7 @@
       .wt-v2ex-child-depth-5 { margin-left:20px; }
       .wt-v2ex-child-depth-6 { margin-left:24px; }
       .wt-v2ex-child-depth-6 .wt-v2ex-child-depth-6 { margin-left:0; padding-left:0; border-left:0; }
-      .wt-v2ex-branch-toggle { margin-top:6px; border:0; padding:0; background:transparent; color:inherit; cursor:pointer; font:inherit; font-size:12px; }
-      .wt-v2ex-panel-action:focus-visible, .wt-v2ex-reply-action:focus-visible, .wt-v2ex-original-link:focus-visible, .wt-v2ex-upload-button:focus-visible, .wt-v2ex-configure-imgur:focus-visible, .wt-v2ex-branch-toggle:focus-visible, .wt-v2ex-conversation-toggle:focus-visible, .wt-v2ex-scroll-top:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
+      .wt-v2ex-panel-action:focus-visible, .wt-v2ex-reply-action:focus-visible, .wt-v2ex-upload-button:focus-visible, .wt-v2ex-configure-imgur:focus-visible, .wt-v2ex-conversation-toggle:focus-visible, .wt-v2ex-scroll-top:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
       .wt-v2ex-editor-tools { display:flex; flex-wrap:wrap; align-items:center; gap:7px; margin:6px 0 10px; padding:5px 0; color:inherit; font-size:12px; }
       .wt-v2ex-file-input { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%); }
       .wt-v2ex-upload-status { color:#666; }
@@ -1219,7 +1222,7 @@
       .wt-v2ex-upload-status-success { color:#176b3a; }
       .wt-v2ex-privacy-note { flex-basis:100%; color:#805b00; }
       .wt-v2ex-editor-dragging { outline:2px dashed #1677ff; outline-offset:3px; }
-      @media (max-width:600px) { .wt-v2ex-control-dock { right:max(10px, env(safe-area-inset-right)); bottom:max(10px, env(safe-area-inset-bottom)); } .wt-v2ex-conversation-panel { max-height:60vh; } .wt-v2ex-threaded-reply .wt-v2ex-reply-actions { margin-left:0; flex-basis:100%; } }
+      @media (max-width:600px) { .wt-v2ex-control-dock { right:max(10px, env(safe-area-inset-right)); bottom:max(10px, env(safe-area-inset-bottom)); } .wt-v2ex-conversation-panel { max-height:60vh; } .wt-v2ex-threaded-view { width:calc(100vw - 40px); max-width:calc(100vw - 40px); overflow-x:hidden; } .wt-v2ex-threaded-reply { box-sizing:border-box; max-width:100%; min-width:0; overflow:hidden; } .wt-v2ex-threaded-reply table { width:100%; max-width:100%; table-layout:fixed; } .wt-v2ex-threaded-reply .wt-v2ex-reply-header { min-width:0; } .wt-v2ex-threaded-reply .wt-v2ex-reply-actions { margin-left:0; flex-basis:100%; } }
       @media (prefers-color-scheme:dark) { .wt-v2ex-conversation-panel, .wt-v2ex-conversation-toggle, .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); } .wt-v2ex-thread-status, .wt-v2ex-upload-status { color:#aaa; } }
       html.night .wt-v2ex-conversation-panel, html.night .wt-v2ex-conversation-toggle, html.night .wt-v2ex-scroll-top, body.night .wt-v2ex-conversation-panel, body.night .wt-v2ex-conversation-toggle, body.night .wt-v2ex-scroll-top, [data-theme="dark"] .wt-v2ex-conversation-panel, [data-theme="dark"] .wt-v2ex-conversation-toggle, [data-theme="dark"] .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); }
       @media (prefers-reduced-motion:reduce) { .wt-v2ex-scroll-top { scroll-behavior:auto; } }
