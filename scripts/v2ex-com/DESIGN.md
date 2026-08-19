@@ -25,7 +25,7 @@ editor: ['#reply_content', '#topic_content', 'textarea[name="content"]']
 nativeReplyAction: ['a.reply', '.reply a', '[data-action="reply"]']
 ```
 
-Pagination is in `.cell.ps_container`, with `.page_current`, `.page_normal`, `.page_input`, and links containing `?p=`. The public pages did not expose authenticated reply actions or editors; those selectors remain defensive.
+Pagination is in `.cell.ps_container`, with `.page_current`, `.page_normal`, `.page_input`, and links containing `?p=`. The public pages did not expose authenticated reply actions or editors; those selectors remain defensive. For authenticated reply controls, extraction is scoped to the reply header's `.fr` group. The implementation checks a V2EX-owned `img[alt="Reply"]` or reply-asset filename, then the existing action selectors, and finally clickable elements whose original `onclick` or `href` contains `replyOne(...)`. It never searches for reply images page-wide.
 
 ## Shared floating dock and panel lifecycle
 
@@ -55,7 +55,7 @@ contentHtml, contentText, thankCount, mentionedUsers,
 normalizedMentions, explicitReplyFloor,
 hasMultipleStructuralMentions, hasStructuralMention,
 parentId, relationshipConfidence, unresolvedReason, children,
-nativeTemplate
+nativeTemplate, nativeReplyControlsTemplate
 ```
 
 `nativeTemplate` is a sanitized clone of the current-page or fetched native reply element. The live current-page element is never moved or mutated during cloning. Fetched HTML is parsed into a detached `Document`, cloned, and sanitized before import into the live page.
@@ -89,22 +89,22 @@ The threaded renderer clones the sanitized native `.cell` and adds no separate r
 
 `sanitizeReplyTemplate` removes scripts, styles, forms, form controls, embedded documents, duplicate IDs, inline event attributes, unsafe URLs, native action controls, and controls that could trigger thank, ignore, moderation, or submission behavior. Safe links are normalized against their source document; external links receive `rel="noopener noreferrer"`, and images are lazy-loaded. The clone is detached from the original live reply and has no duplicate `id="r_*"`.
 
-The clone-only header cleanup runs after the native header nodes have been wrapped in `wt-v2ex-reply-header`. It removes the first matching native floor with `.fr .no` or the fallback `.no`. It removes native reply actions with the verified `a.reply`, `.reply a`, and `[data-action="reply"]` selectors, then removes remaining `.reply` wrappers and prunes empty `.reply`/`.fr` wrappers. These selectors are applied only inside the cloned header; no generic page-wide `.no`, image, anchor, or `.fr` removal is used.
+The clone-only header cleanup runs after the native header nodes have been wrapped in `wt-v2ex-reply-header`. When a cloned `.fr` group contains the native floor or reply action, the entire group is removed after capture; this also guarantees that thank, ignore, report, moderation, delete, and other unrelated right-side actions cannot remain in the threaded header. A scoped fallback removes the header floor/action candidates when no `.fr` group exists. The original controls have already been captured as a separate `nativeReplyControlsTemplate`, so cleanup cannot discard the controls that will be rendered. These operations are applied only inside the cloned header; no generic page-wide `.no`, image, anchor, or `.fr` removal is used.
 
 Hierarchy styling is limited to the prefixed threaded parent, child indentation, a guide line, a six-level visual cap, relationship markers, focus styles, and narrow-screen wrapping. The logical tree remains deeper than six levels. Child containers are always appended and remain visible; they have no per-branch visibility or expanded/collapsed state.
 
 ## Header actions
 
-`createReplyCard` locates the native reply content cell and wraps the native header nodes before `.sep5` in the scoped `wt-v2ex-reply-header`. The verified header area includes the native floor, member link, badges, and `.ago` timestamp. Clone-only native floor/action cleanup runs before the custom group is appended.
+`createReplyCard` locates the native reply content cell and wraps the native header nodes before `.sep5` in the scoped `wt-v2ex-reply-header`. The verified header area includes the native floor, member link, badges, and `.ago` timestamp. Before cleanup, `parseReply` captures the reply's native `.fr` control group into `nativeReplyControlsTemplate`.
 
-The custom right-side group is `.wt-v2ex-reply-actions` and contains, in exact order:
+The rendered right-side group is `.fr.wt-v2ex-native-reply-controls` and contains, in exact order:
 
-1. `.wt-v2ex-reply-floor-action`, which displays the parsed floor or `#?` when unavailable;
-2. `button.wt-v2ex-reply-action`, a real `type="button"` with an accessible `aria-label` and an inline SVG `.wt-v2ex-reply-icon`.
+1. the sanitized clone of the native reply anchor/image (or a semantic button wrapper only when the source is not keyboard-interactive);
+2. the sanitized native `.no` floor badge, updated to the reply's parsed floor.
 
-`margin-left: auto` keeps the group at the far right while `flex-wrap` and the narrow-screen rule allow it to wrap without overlapping author, timestamp, badges, or relationship indicators. The button has visible keyboard focus and no visible text label. Its delegated handler preserves the existing `@username #floor ` insertion behavior.
+The scoped `.wt-v2ex-native-reply-controls` rule sets `float: none`, `margin-left: auto`, and a high flex order, moving the preserved native group to the far right without changing the arrow image, its dimensions or safe inline presentation, or the `.no` colors, border, radius, font, or background. The header may wrap naturally at narrow widths; the group is not forced onto a second line at normal desktop widths. Inline handlers, duplicate IDs, unsafe URLs, and stateful data attributes are removed from the detached control. The delegated handler adds `data-reply-user`, `data-reply-floor`, and an accessible label, prevents detached-anchor navigation, and preserves the existing `@username #floor ` insertion behavior.
 
-The relationship label `回复 #12` is retained as relationship metadata when the model has an exact parent; it is not the right-side action label. The threaded header has no original-floor navigation action. The native reply-action enhancement remains delegated separately and still lets V2EX's own handler run first.
+If a fetched page lacks its own reliable native group, `loadPages` clones the safely captured current-page `nativeReplyControlsTemplate` and updates the floor and reply data for that reply. No generated speech-bubble icon, plain-text replacement floor, or unrelated native action is introduced. The relationship label `回复 #12` is retained as relationship metadata; it is not the right-side action label. The threaded header has no original-floor navigation action. The native reply-action enhancement remains delegated separately and still lets V2EX's own handler run first.
 
 ## Two view modes
 
@@ -116,7 +116,7 @@ The former per-branch and global branch-state machinery has been removed. The pa
 
 ## Pagination and fallback
 
-Other pages are fetched from `location.origin` with same-origin credentials. At most three requests run concurrently; each has a timeout and one retry for network/abort or 5xx failures. Up to 10 pages load automatically. Larger topics remain partial until the panel's explicit full-load button is activated. Results are merged by reply ID, relationships are recalculated, and the custom tree is rendered once. Any partial failure reports in the panel and switches to the untouched original reply list so the user never receives an invisibly empty topic.
+Other pages are fetched from `location.origin` with same-origin credentials. At most three requests run concurrently; each has a timeout and one retry for network/abort or 5xx failures. Up to 10 pages load automatically. Each reply prefers its own sanitized native control template; when absent, it receives a clone of the current-page native template with its author, floor, data attributes, and accessible label updated. Larger topics remain partial until the panel's explicit full-load button is activated. Results are merged by reply ID, relationships are recalculated, and the custom tree is rendered once. Any partial failure reports in the panel and switches to the untouched original reply list so the user never receives an invisibly empty topic.
 
 ## Editor and Imgur flow
 
@@ -126,4 +126,4 @@ The editor, paste, drag-and-drop, file validation, Imgur request, reply-prefix, 
 
 Initialization is guarded by `document.documentElement.dataset.wtV2exInitialized`. There is one dock, one conversation panel/toggle on topic pages, one threaded container, one editor observer, one delegated native-action listener, and one scroll listener. Repeated initialization cannot create another dock or custom reply view. The Imgur controls remain next to their recognized editors and are never moved into the shared dock. On soft navigation, the old panel and threaded container are cleaned up before the new topic starts with a closed panel.
 
-Authenticated editor and native reply-action behavior could not be browser-tested in the unauthenticated execution environment. The script retains defensive selectors and leaves unmatched native behavior untouched.
+Authenticated editor and native reply-action behavior could not be browser-tested in the unauthenticated execution environment. The public HTML confirmed the reply cell and native `.fr .no` floor structure; the authenticated arrow selector set remains defensive and must be rechecked after a V2EX markup change. The script retains defensive selectors, does not claim a native arrow when no reliable template exists, and leaves unmatched native behavior untouched.

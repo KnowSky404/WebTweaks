@@ -2,7 +2,7 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.2.0
+// @version      1.2.1
 // @description  Threaded cross-page replies, Imgur image uploads, and navigation improvements for V2EX.
 // @description:zh-CN 为 V2EX 提供跨页楼中楼、Imgur 图片上传和返回顶部功能。
 // @author       KnowSky404
@@ -322,7 +322,111 @@
     return clone;
   }
 
-  function parseReply(element, page, index = 0) {
+  function nativeReplyImage(group) {
+    return [...group.querySelectorAll('img')].find((image) => {
+      const alt = (image.getAttribute('alt') || '').trim().toLocaleLowerCase();
+      const rawSrc = image.getAttribute('src') || '';
+      try {
+        const url = new URL(rawSrc, location.href);
+        const filename = url.pathname.split('/').pop() || '';
+        return isV2exAssetUrl(url) && (alt === 'reply' || /^reply(?:[._-]|$)/i.test(filename));
+      } catch (error) {
+        return false;
+      }
+    });
+  }
+
+  function isV2exAssetUrl(raw, base = location.href) {
+    try {
+      const url = raw instanceof URL ? raw : new URL(raw, base);
+      return url.hostname === 'v2ex.com' || url.hostname.endsWith('.v2ex.com');
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function hasNativeReplyHandler(element) {
+    return [...element.attributes].some((attribute) => {
+      if (!attribute.name.toLowerCase().startsWith('on') && attribute.name.toLowerCase() !== 'href') return false;
+      return /(?:replyOne|reply(?:Action|Reply))\s*\(/i.test(attribute.value);
+    });
+  }
+
+  function nativeReplyAction(group) {
+    const image = nativeReplyImage(group);
+    if (image) {
+      const clickable = image.closest('a, button, [role="button"]');
+      if (clickable && group.contains(clickable)) return clickable;
+    }
+    for (const selector of SELECTORS.nativeReplyAction) {
+      const match = group.querySelector(selector);
+      if (match) return match.closest('a, button, [role="button"]') || match;
+    }
+    return [...group.querySelectorAll('a, button, [role="button"]')].find(hasNativeReplyHandler) || null;
+  }
+
+  function nativeReplyGroup(root) {
+    const groups = [...root.querySelectorAll('.fr')];
+    return groups.find((group) => nativeReplyAction(group)) || groups.find((group) => group.querySelector('.no')) || null;
+  }
+
+  function sanitizeNativeControlNode(node, base, restrictImages = false) {
+    const clone = node.cloneNode(true);
+    clone.querySelectorAll('script, style, iframe, object, embed, form, input, select, textarea, template, base, meta, link').forEach((unsafeNode) => unsafeNode.remove());
+    const nodes = [clone, ...clone.querySelectorAll('*')];
+    nodes.forEach((current) => {
+      [...current.attributes].forEach((attribute) => {
+        const name = attribute.name.toLowerCase();
+        const value = attribute.value.trim();
+        if (name.startsWith('on') || name === 'id' || name === 'srcset' || name === 'srcdoc' || name === 'data-action' || name === 'formaction') {
+          current.removeAttribute(attribute.name);
+          return;
+        }
+        if (name === 'href' || name === 'src') {
+          if (!safeUrl(value, name === 'src' ? 'image' : 'link', base) || (restrictImages && name === 'src' && current.matches('img') && !isV2exAssetUrl(value, base))) current.removeAttribute(attribute.name);
+          else current.setAttribute(name, value);
+        }
+      });
+    });
+    return clone;
+  }
+
+  function extractNativeReplyControls(element, base = location.href) {
+    const group = nativeReplyGroup(element);
+    if (!group) return null;
+    const action = nativeReplyAction(group);
+    const floor = group.querySelector('.no');
+    if (!action && !floor) return null;
+    const controls = document.createElement('div');
+    controls.className = 'fr wt-v2ex-native-reply-controls';
+    if (action) {
+      const actionClone = sanitizeNativeControlNode(action, base, true);
+      const hasReplyImage = actionClone.matches('img') || actionClone.querySelector('img');
+      if (hasReplyImage) {
+        const interactive = actionClone.matches('a, button, [role="button"]')
+          ? actionClone
+          : actionClone.querySelector('a, button, [role="button"]');
+        if (interactive) {
+          interactive.classList.add('wt-v2ex-native-reply-action');
+          interactive.dataset.wtV2exNativeReplyAction = 'true';
+          if (interactive.matches('a') && !interactive.getAttribute('href')) interactive.setAttribute('href', '#');
+          if (interactive.matches('[role="button"]') && !interactive.hasAttribute('tabindex')) interactive.setAttribute('tabindex', '0');
+        } else {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'wt-v2ex-native-reply-action';
+          button.dataset.wtV2exNativeReplyAction = 'true';
+          button.append(actionClone);
+          controls.append(button);
+        }
+        if (interactive) controls.append(actionClone);
+      }
+    }
+    if (floor) controls.append(sanitizeNativeControlNode(floor, base));
+    return controls.childElementCount ? controls : null;
+  }
+
+  function parseReply(element, page, index = 0, base = location.href) {
     const content = firstMatch(element, SELECTORS.replyContent);
     if (!content) return null;
     const idMatch = String(element.id || '').match(/^r_(.+)$/);
@@ -339,9 +443,9 @@
       page,
       author,
       normalizedAuthor: normalizeName(author),
-      avatarUrl: safeUrl(firstMatch(element, SELECTORS.replyAvatar)?.getAttribute('src'), 'image'),
+      avatarUrl: safeUrl(firstMatch(element, SELECTORS.replyAvatar)?.getAttribute('src'), 'image', base),
       timeText: firstMatch(element, SELECTORS.replyTime)?.getAttribute('title') || firstMatch(element, SELECTORS.replyTime)?.textContent.trim() || '',
-      contentHtml: sanitizeContent(content),
+      contentHtml: sanitizeContent(content, base),
       contentText: (content.textContent || '').trim(),
       thankCount: thankCount ? Number(thankCount) : null,
       mentionedUsers: prefix.mentionedUsers,
@@ -353,13 +457,14 @@
       relationshipConfidence: 'root',
       unresolvedReason: '',
       children: [],
-      nativeTemplate: sanitizeReplyTemplate(element)
+      nativeTemplate: sanitizeReplyTemplate(element, base),
+      nativeReplyControlsTemplate: extractNativeReplyControls(element, base)
     };
   }
 
-  function parseReplies(root, page) {
+  function parseReplies(root, page, base = location.href) {
     const elements = root instanceof Document ? allMatches(root, SELECTORS.reply) : allMatches(root, SELECTORS.reply);
-    return elements.map((element, index) => parseReply(element, page, index)).filter(Boolean);
+    return elements.map((element, index) => parseReply(element, page, index, base)).filter(Boolean);
   }
 
   function inferRelationships(replies) {
@@ -451,8 +556,13 @@
         try {
           const html = await fetchPage(pageUrl(topic.context, page));
           const parsed = new DOMParser().parseFromString(html, 'text/html');
-          const replies = parseReplies(parsed, page);
+          const replies = parseReplies(parsed, page, pageUrl(topic.context, page));
           if (!replies.length) throw new Error('分页中未找到可解析的回复');
+          replies.forEach((reply) => {
+            if (!reply.nativeReplyControlsTemplate && topic.nativeReplyControlsTemplate) {
+              reply.nativeReplyControlsTemplate = topic.nativeReplyControlsTemplate.cloneNode(true);
+            }
+          });
           results[index] = { page, replies };
         } catch (error) {
           results[index] = { page, error };
@@ -579,32 +689,20 @@
   }
 
   function removeClonedNativeHeaderControls(header) {
-    const nativeFloor = firstMatch(header, SELECTORS.nativeReplyFloor);
-    if (nativeFloor) nativeFloor.remove();
-
-    allMatches(header, SELECTORS.nativeReplyAction).forEach((action) => {
-      const replyWrapper = action.closest('.reply');
-      action.remove();
-      if (replyWrapper && !replyWrapper.children.length && !replyWrapper.textContent.trim()) replyWrapper.remove();
+    const groups = [...header.querySelectorAll('.fr')];
+    let removedControlGroup = false;
+    groups.forEach((group) => {
+      if (nativeReplyAction(group) || group.querySelector('.no')) {
+        group.remove();
+        removedControlGroup = true;
+      }
     });
-
-    header.querySelectorAll('.reply').forEach((wrapper) => wrapper.remove());
+    allMatches(header, SELECTORS.nativeReplyAction).forEach((action) => action.remove());
+    if (removedControlGroup) allMatches(header, SELECTORS.nativeReplyFloor).forEach((floor) => floor.remove());
+    else firstMatch(header, SELECTORS.nativeReplyFloor)?.remove();
     [...header.querySelectorAll('.reply, .fr')].reverse().forEach((wrapper) => {
       if (!wrapper.children.length && !wrapper.textContent.trim()) wrapper.remove();
     });
-  }
-
-  function createReplyIcon() {
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.classList.add('wt-v2ex-reply-icon');
-    svg.setAttribute('viewBox', '0 0 16 16');
-    svg.setAttribute('aria-hidden', 'true');
-    svg.setAttribute('focusable', 'false');
-    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    path.setAttribute('d', 'M3 3.5A2.5 2.5 0 0 1 5.5 1h5A2.5 2.5 0 0 1 13 3.5v3A2.5 2.5 0 0 1 10.5 9H7.2l-3.5 3v-3.1A2.5 2.5 0 0 1 3 6.5v-3Zm2.5-1A1.5 1.5 0 0 0 4 4v2.5A1.5 1.5 0 0 0 5.5 8h.2v1.8L6.8 8h3.7A1.5 1.5 0 0 0 12 6.5v-3A1.5 1.5 0 0 0 10.5 2h-5Z');
-    path.setAttribute('fill', 'currentColor');
-    svg.append(path);
-    return svg;
   }
 
   function createReplyCard(reply, depth) {
@@ -638,20 +736,21 @@
       if (reply.unresolvedReason) badge.title = reply.unresolvedReason;
       header.append(badge);
     }
-    const actions = document.createElement('div');
-    actions.className = 'wt-v2ex-reply-actions';
-    const floor = document.createElement('span');
-    floor.className = 'wt-v2ex-reply-floor-action';
-    floor.textContent = reply.floor ? String(reply.floor) : '#?';
-    const replyButton = document.createElement('button');
-    replyButton.type = 'button';
-    replyButton.className = 'wt-v2ex-reply-action';
-    replyButton.append(createReplyIcon());
-    replyButton.setAttribute('aria-label', `回复 ${reply.author || '该用户'} 第 ${reply.floor || ''} 楼`);
-    replyButton.dataset.replyUser = reply.author;
-    replyButton.dataset.replyFloor = String(reply.floor || '');
-    actions.append(floor, replyButton);
-    header.append(actions);
+    const controls = reply.nativeReplyControlsTemplate?.cloneNode(true);
+    if (controls) {
+      const nativeAction = controls.querySelector('[data-wt-v2ex-native-reply-action="true"]');
+      const nativeFloor = controls.querySelector('.no');
+      if (nativeFloor) {
+        if (reply.floor) nativeFloor.textContent = String(reply.floor);
+        else nativeFloor.remove();
+      }
+      if (nativeAction) {
+        nativeAction.dataset.replyUser = reply.author;
+        nativeAction.dataset.replyFloor = String(reply.floor || '');
+        nativeAction.setAttribute('aria-label', `回复 ${reply.author || '该用户'} 第 ${reply.floor || ''} 楼`);
+      }
+      if (controls.childElementCount) header.append(controls);
+    }
     if (reply.children.length) {
       const children = document.createElement('div');
       children.className = `wt-v2ex-thread-children wt-v2ex-child-depth-${Math.min(depth + 1, 6)}`;
@@ -760,7 +859,8 @@
       pages: discoveredPages.pages,
       maxPage: discoveredPages.maxPage,
       loadedPages: new Set([context.page]),
-      replies: parseReplies(document, context.page),
+      replies: parseReplies(document, context.page, location.href),
+      nativeReplyControlsTemplate: null,
       models: [],
       roots: [],
       view: 'original',
@@ -770,6 +870,7 @@
       duplicateIds: 0,
       statusMessage: '准备构建楼中楼'
     };
+    topic.nativeReplyControlsTemplate = topic.replies.find((reply) => reply.nativeReplyControlsTemplate)?.nativeReplyControlsTemplate || null;
     firstReply.before(threadedView);
     runtime.topic = topic;
     topic.models = inferRelationships(topic.replies);
@@ -794,10 +895,16 @@
       setTopicStatus(topic, `已加载 ${topic.models.length} 条回复，关系为启发式重建`);
       applyTopicView(topic, runtime.settings.preferredView);
     }
-    topic.threadedView.addEventListener('click', (event) => {
-      const button = event.target.closest('.wt-v2ex-reply-action');
-      if (button) insertReplyPrefix(findEditor(), button.dataset.replyUser, Number(button.dataset.replyFloor));
-    });
+    const activateThreadedReply = (event) => {
+      if (!(event.target instanceof Element)) return;
+      const action = event.target.closest('.wt-v2ex-native-reply-action');
+      if (!action || !topic.threadedView.contains(action)) return;
+      if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      insertReplyPrefix(findEditor(), action.dataset.replyUser, Number(action.dataset.replyFloor));
+    };
+    topic.threadedView.addEventListener('click', activateThreadedReply);
+    topic.threadedView.addEventListener('keydown', activateThreadedReply);
   }
 
   function removeConversationControl() {
@@ -1196,12 +1303,9 @@
       #Main .cell[id^="r_"].wt-v2ex-native-hidden, #Wrapper .cell[id^="r_"].wt-v2ex-native-hidden { display:none !important; }
       .wt-v2ex-threaded-reply { position:relative; }
       .wt-v2ex-threaded-reply .wt-v2ex-reply-header { display:flex; flex-wrap:wrap; align-items:baseline; gap:0 7px; margin-bottom:5px; }
-      .wt-v2ex-threaded-reply .wt-v2ex-reply-header > .fr { float:none; margin-left:0; }
-      .wt-v2ex-threaded-reply .wt-v2ex-reply-actions { display:flex; flex-wrap:wrap; align-items:center; gap:5px; margin-left:auto; }
-      .wt-v2ex-threaded-reply .wt-v2ex-reply-floor-action { color:inherit; }
-      .wt-v2ex-threaded-reply .wt-v2ex-reply-action { display:inline-flex; align-items:center; justify-content:center; border:0; padding:1px; background:transparent; color:inherit; cursor:pointer; font:inherit; text-decoration:none; }
-      .wt-v2ex-threaded-reply .wt-v2ex-reply-action:hover { opacity:.72; }
-      .wt-v2ex-threaded-reply .wt-v2ex-reply-icon { display:block; width:14px; height:14px; }
+      .wt-v2ex-threaded-reply .wt-v2ex-native-reply-controls { float:none; order:999; display:inline-flex; flex:0 0 auto; align-items:center; gap:5px; margin-left:auto; white-space:nowrap; }
+      .wt-v2ex-threaded-reply .wt-v2ex-native-reply-action:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
+      .wt-v2ex-threaded-reply .wt-v2ex-native-reply-action:hover { opacity:.72; }
       .wt-v2ex-relation { padding:1px 4px; border:1px solid rgba(127,127,127,.3); border-radius:3px; font-size:11px; }
       .wt-v2ex-relation-exact { color:#176b3a; }
       .wt-v2ex-relation-inferred { color:#805b00; }
@@ -1214,7 +1318,7 @@
       .wt-v2ex-child-depth-5 { margin-left:20px; }
       .wt-v2ex-child-depth-6 { margin-left:24px; }
       .wt-v2ex-child-depth-6 .wt-v2ex-child-depth-6 { margin-left:0; padding-left:0; border-left:0; }
-      .wt-v2ex-panel-action:focus-visible, .wt-v2ex-reply-action:focus-visible, .wt-v2ex-upload-button:focus-visible, .wt-v2ex-configure-imgur:focus-visible, .wt-v2ex-conversation-toggle:focus-visible, .wt-v2ex-scroll-top:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
+      .wt-v2ex-panel-action:focus-visible, .wt-v2ex-upload-button:focus-visible, .wt-v2ex-configure-imgur:focus-visible, .wt-v2ex-conversation-toggle:focus-visible, .wt-v2ex-scroll-top:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
       .wt-v2ex-editor-tools { display:flex; flex-wrap:wrap; align-items:center; gap:7px; margin:6px 0 10px; padding:5px 0; color:inherit; font-size:12px; }
       .wt-v2ex-file-input { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%); }
       .wt-v2ex-upload-status { color:#666; }
@@ -1222,7 +1326,7 @@
       .wt-v2ex-upload-status-success { color:#176b3a; }
       .wt-v2ex-privacy-note { flex-basis:100%; color:#805b00; }
       .wt-v2ex-editor-dragging { outline:2px dashed #1677ff; outline-offset:3px; }
-      @media (max-width:600px) { .wt-v2ex-control-dock { right:max(10px, env(safe-area-inset-right)); bottom:max(10px, env(safe-area-inset-bottom)); } .wt-v2ex-conversation-panel { max-height:60vh; } .wt-v2ex-threaded-view { width:calc(100vw - 40px); max-width:calc(100vw - 40px); overflow-x:hidden; } .wt-v2ex-threaded-reply { box-sizing:border-box; max-width:100%; min-width:0; overflow:hidden; } .wt-v2ex-threaded-reply table { width:100%; max-width:100%; table-layout:fixed; } .wt-v2ex-threaded-reply .wt-v2ex-reply-header { min-width:0; } .wt-v2ex-threaded-reply .wt-v2ex-reply-actions { margin-left:0; flex-basis:100%; } }
+      @media (max-width:600px) { .wt-v2ex-control-dock { right:max(10px, env(safe-area-inset-right)); bottom:max(10px, env(safe-area-inset-bottom)); } .wt-v2ex-conversation-panel { max-height:60vh; } .wt-v2ex-threaded-view { width:calc(100vw - 40px); max-width:calc(100vw - 40px); overflow-x:hidden; } .wt-v2ex-threaded-reply { box-sizing:border-box; max-width:100%; min-width:0; overflow:hidden; } .wt-v2ex-threaded-reply table { width:100%; max-width:100%; table-layout:fixed; } .wt-v2ex-threaded-reply .wt-v2ex-reply-header { min-width:0; } .wt-v2ex-threaded-reply .wt-v2ex-native-reply-controls { max-width:100%; } }
       @media (prefers-color-scheme:dark) { .wt-v2ex-conversation-panel, .wt-v2ex-conversation-toggle, .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); } .wt-v2ex-thread-status, .wt-v2ex-upload-status { color:#aaa; } }
       html.night .wt-v2ex-conversation-panel, html.night .wt-v2ex-conversation-toggle, html.night .wt-v2ex-scroll-top, body.night .wt-v2ex-conversation-panel, body.night .wt-v2ex-conversation-toggle, body.night .wt-v2ex-scroll-top, [data-theme="dark"] .wt-v2ex-conversation-panel, [data-theme="dark"] .wt-v2ex-conversation-toggle, [data-theme="dark"] .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); }
       @media (prefers-reduced-motion:reduce) { .wt-v2ex-scroll-top { scroll-behavior:auto; } }
