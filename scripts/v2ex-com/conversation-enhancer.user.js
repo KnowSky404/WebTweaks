@@ -2,9 +2,9 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.2.1
-// @description  Threaded cross-page replies, Imgur image uploads, and navigation improvements for V2EX.
-// @description:zh-CN 为 V2EX 提供跨页楼中楼、Imgur 图片上传和返回顶部功能。
+// @version      1.3.0
+// @description  Threaded cross-page replies, client-side image previews, Imgur uploads, and navigation improvements for V2EX.
+// @description:zh-CN 为 V2EX 提供跨页楼中楼、浏览器侧图片预览、Imgur 上传和返回顶部功能。
 // @author       KnowSky404
 // @match        https://v2ex.com/*
 // @match        https://*.v2ex.com/*
@@ -26,13 +26,16 @@
   'use strict';
 
   const LOG_PREFIX = '[WebTweaks:V2EX]';
-  const SETTINGS_VERSION = 1;
+  const SETTINGS_VERSION = 2;
   const SETTINGS_KEY = 'wt-v2ex-settings';
   const MAX_PAGE_REQUESTS = 3;
   const PAGE_TIMEOUT_MS = 12_000;
   const UPLOAD_TIMEOUT_MS = 30_000;
   const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
   const SCROLL_THRESHOLD = 600;
+  const IMAGE_CONTENT_SELECTOR = '.topic_content, .reply_content';
+  const IMAGE_EXTENSION_PATTERN = /\.(?:jpe?g|png|gif|webp|avif)$/i;
+  const IMAGE_URL_TOKEN_PATTERN = /https?:\/\/[^\s<>"']+/gi;
 
   // Verified against public V2EX HTML on 2026-08-18. Fallbacks are intentionally narrow.
   const SELECTORS = Object.freeze({
@@ -64,7 +67,15 @@
     scrollFrame: 0,
     nativeReplyListenerAttached: false,
     navigationAttached: false,
-    navigationSync: false
+    navigationSync: false,
+    imageDelegationAttached: false,
+    imageLightbox: null,
+    imageLightboxImage: null,
+    imageLightboxLink: null,
+    imageLightboxClose: null,
+    imageLightboxOpener: null,
+    imageLightboxFocusFrame: 0,
+    imageScrollLock: null
   };
 
   function logError(error) {
@@ -105,7 +116,9 @@
       preferredView: value.preferredView === 'original' ? 'original' : 'threaded',
       imgurClientId: typeof value.imgurClientId === 'string' ? value.imgurClientId.trim() : '',
       scrollTopEnabled: value.scrollTopEnabled !== false,
-      uploaderEnabled: value.uploaderEnabled !== false
+      uploaderEnabled: value.uploaderEnabled !== false,
+      imagePreviewEnabled: value.imagePreviewEnabled !== false,
+      imageLightboxEnabled: value.imageLightboxEnabled !== false
     };
   }
 
@@ -127,6 +140,24 @@
       saveSettings();
       updateAllEditorStatuses(runtime.settings.uploaderEnabled ? '图片上传已开启' : '图片上传已关闭');
       scanEditors();
+    });
+    GM_registerMenuCommand('开启/关闭评论图片自动展开', () => {
+      runtime.settings.imagePreviewEnabled = !runtime.settings.imagePreviewEnabled;
+      saveSettings();
+      if (runtime.settings.imagePreviewEnabled) scanImageContent(document);
+      else {
+        if (runtime.imageLightboxOpener?.classList.contains('wt-v2ex-inline-image')) closeImageLightbox();
+        resetImagePreviews(document);
+      }
+    });
+    GM_registerMenuCommand('开启/关闭图片点击放大', () => {
+      runtime.settings.imageLightboxEnabled = !runtime.settings.imageLightboxEnabled;
+      saveSettings();
+      if (runtime.settings.imageLightboxEnabled) scanImageContent(document);
+      else {
+        closeImageLightbox();
+        resetLightboxTargets(document);
+      }
     });
     GM_registerMenuCommand('开启/关闭返回顶部', () => {
       runtime.settings.scrollTopEnabled = !runtime.settings.scrollTopEnabled;
@@ -254,6 +285,31 @@
     } catch (error) {
       return null;
     }
+  }
+
+  function imagePreviewUrl(raw, base = location.href) {
+    const safe = safeUrl(raw, 'image', base);
+    if (!safe) return null;
+    try {
+      const url = new URL(safe);
+      return IMAGE_EXTENSION_PATTERN.test(url.pathname) ? url.href : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function imageUrlsInText(value, base = location.href) {
+    const urls = [];
+    const seen = new Set();
+    for (const match of String(value || '').matchAll(IMAGE_URL_TOKEN_PATTERN)) {
+      const candidate = match[0].replace(/[)\]},.;!?，。；！？]+$/u, '');
+      const url = imagePreviewUrl(candidate, base);
+      if (url && !seen.has(url)) {
+        seen.add(url);
+        urls.push(url);
+      }
+    }
+    return urls;
   }
 
   function sanitizeContent(element, base = location.href) {
@@ -761,6 +817,10 @@
   }
 
   function renderThreadedView(topic) {
+    const lightboxUrl = runtime.imageLightboxOpener && topic.threadedView.contains(runtime.imageLightboxOpener)
+      ? lightboxUrlForImage(runtime.imageLightboxOpener)
+      : null;
+    if (lightboxUrl) closeImageLightbox(false);
     topic.threadedView.replaceChildren();
     const fragment = document.createDocumentFragment();
     const stack = [...topic.roots].reverse().map((reply) => ({ reply, target: fragment, depth: 0 }));
@@ -781,6 +841,11 @@
       }
     }
     topic.threadedView.append(fragment);
+    scanImageContent(topic.threadedView);
+    if (lightboxUrl) {
+      const replacement = [...topic.threadedView.querySelectorAll('img')].find((image) => lightboxUrlForImage(image) === lightboxUrl);
+      replacement?.focus({ preventScroll: true });
+    }
   }
 
   function applyTopicView(topic, view) {
@@ -922,9 +987,13 @@
   async function synchronizeTopicPage() {
     if (runtime.navigationSync) return;
     const context = topicContext();
-    if (runtime.topic?.key === context?.key) return;
+    if (runtime.topic?.key === context?.key) {
+      scanImageContent(document);
+      return;
+    }
     runtime.navigationSync = true;
     try {
+      closeImageLightbox();
       if (runtime.topic) {
         applyTopicView(runtime.topic, 'original');
         runtime.topic.threadedView.remove();
@@ -935,6 +1004,7 @@
         await initializeTopic();
         if (runtime.topic) createConversationControl(runtime.topic);
       }
+      scanImageContent(document);
     } finally {
       runtime.navigationSync = false;
     }
@@ -976,6 +1046,13 @@
     const action = form?.getAttribute('action') || '';
     const nearbyEditor = editor.closest('#reply-box, #new-topic, #topic-editor, [id*="reply"], [id*="topic"]');
     return id === 'reply_content' || id === 'topic_content' || /\/t\/\d+/.test(action) || /(?:^|\/)new(?:$|[/?#])/.test(action) || Boolean(nearbyEditor);
+  }
+
+  function isReplyEditor(editor) {
+    if (!isSupportedEditor(editor)) return false;
+    if ((editor.id || '').toLowerCase() === 'reply_content') return true;
+    const action = editor.closest('form')?.getAttribute('action') || '';
+    return Boolean(topicContext()) && /\/t\/\d+/.test(action) && (editor.id || '').toLowerCase() !== 'topic_content';
   }
 
   function insertAtSelection(editor, text) {
@@ -1027,15 +1104,6 @@
     if (runtime.nativeReplyListenerAttached) return;
     runtime.nativeReplyListenerAttached = true;
     document.addEventListener('click', enhanceNativeReplyAction, true);
-  }
-
-  function isMarkdownMode(editor) {
-    const form = editor.closest('form');
-    const explicit = form?.querySelector('[data-markdown="true"], [data-mode="markdown"], input[name*="markdown"]:checked, input[id*="markdown"]:checked');
-    if (explicit) return true;
-    const activeButton = [...(form?.querySelectorAll('button, a, label') || [])].find((node) => node.classList.contains('active') && /markdown/i.test(node.textContent));
-    if (activeButton) return true;
-    return editor.id === 'topic_content' && !editor.closest('form')?.querySelector('[data-mode="plain"]');
   }
 
   function updateAllEditorStatuses(message) {
@@ -1150,9 +1218,8 @@
       setUploadStatus(editor, `正在上传 ${index + 1} / ${validFiles.length}`);
       try {
         const link = await requestImgur(file);
-        const insertion = isMarkdownMode(editor) ? `![image](${link})` : link;
         const separator = editor.value && !/[\n\r]$/.test(editor.value) ? '\n' : '';
-        insertAtSelection(editor, `${separator}${insertion}\n`);
+        insertAtSelection(editor, `${separator}${link}\n`);
         inserted += 1;
         setUploadStatus(editor, `上传成功 ${inserted} / ${validFiles.length}`, 'success');
       } catch (error) {
@@ -1170,7 +1237,7 @@
   }
 
   function addEditorUpload(editor) {
-    if (!runtime.settings.uploaderEnabled || runtime.enhancedEditors.has(editor) || !isSupportedEditor(editor)) return;
+    if (!runtime.settings.uploaderEnabled || runtime.enhancedEditors.has(editor) || !isReplyEditor(editor)) return;
     runtime.enhancedEditors.add(editor);
     const tools = document.createElement('div');
     tools.className = 'wt-v2ex-editor-tools';
@@ -1237,7 +1304,7 @@
       tools.hidden = !runtime.settings.uploaderEnabled;
     });
     if (!runtime.settings.uploaderEnabled) return;
-    allMatches(document, SELECTORS.editor).filter(isSupportedEditor).forEach(addEditorUpload);
+    allMatches(document, SELECTORS.editor).filter(isReplyEditor).forEach(addEditorUpload);
   }
 
   function observeEditors() {
@@ -1252,6 +1319,301 @@
     });
     const editorRoot = document.querySelector('#Main, #Wrapper') || document.body;
     runtime.editorObserver.observe(editorRoot, { childList: true, subtree: true });
+  }
+
+  function imageContentContainers(root = document) {
+    const containers = [];
+    const seen = new Set();
+    if (root instanceof Element && root.matches(IMAGE_CONTENT_SELECTOR)) {
+      seen.add(root);
+      containers.push(root);
+    }
+    if (typeof root.querySelectorAll === 'function') {
+      root.querySelectorAll(IMAGE_CONTENT_SELECTOR).forEach((container) => {
+        if (!seen.has(container)) {
+          seen.add(container);
+          containers.push(container);
+        }
+      });
+    }
+    return containers;
+  }
+
+  function createInlineImage(url) {
+    const image = document.createElement('img');
+    image.className = 'wt-v2ex-inline-image';
+    image.src = url;
+    image.alt = '来自 ' + new URL(url).hostname + ' 的图片预览';
+    image.loading = 'lazy';
+    image.decoding = 'async';
+    image.referrerPolicy = 'no-referrer';
+    image.dataset.wtV2exImageUrl = url;
+    return image;
+  }
+
+  function adjacentImageMatches(source, url) {
+    const sibling = source.nextElementSibling;
+    if (!(sibling instanceof HTMLImageElement)) return false;
+    const siblingUrl = safeUrl(sibling.currentSrc || sibling.getAttribute('src'), 'image', sibling.baseURI);
+    return siblingUrl === url;
+  }
+
+  function enhanceLinkedImages(container) {
+    container.querySelectorAll('a[href]').forEach((anchor) => {
+      if (anchor.dataset.wtV2exImageEnhanced === 'true') return;
+      anchor.dataset.wtV2exImageEnhanced = 'true';
+      if (anchor.querySelector('img')) return;
+      const url = imagePreviewUrl(anchor.getAttribute('href'), anchor.baseURI);
+      if (!url || adjacentImageMatches(anchor, url)) return;
+      anchor.insertAdjacentElement('afterend', createInlineImage(url));
+    });
+  }
+
+  function enhanceTextImages(container) {
+    if (container.dataset.wtV2exImageTextEnhanced === 'true') return;
+    container.dataset.wtV2exImageTextEnhanced = 'true';
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (!node.nodeValue || !/https?:\/\//i.test(node.nodeValue)) return NodeFilter.FILTER_REJECT;
+        const parent = node.parentElement;
+        if (!parent || parent.closest('a, code, pre, textarea, script, style, .wt-v2ex-image-lightbox')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const textNodes = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) textNodes.push(node);
+    textNodes.forEach((textNode) => {
+      let insertionPoint = textNode;
+      imageUrlsInText(textNode.nodeValue, textNode.baseURI).forEach((url) => {
+        const image = createInlineImage(url);
+        insertionPoint.parentNode.insertBefore(image, insertionPoint.nextSibling);
+        insertionPoint = image;
+      });
+    });
+  }
+
+  function prepareLightboxTarget(image) {
+    if (!(image instanceof HTMLImageElement) || image.classList.contains('avatar') || image.closest('.wt-v2ex-image-lightbox')) return;
+    if (!lightboxUrlForImage(image)) return;
+    if (image.dataset.wtV2exLightboxReady === 'true') return;
+    image.dataset.wtV2exLightboxReady = 'true';
+    image.classList.add('wt-v2ex-lightbox-target');
+    if (!image.hasAttribute('tabindex') || image.tabIndex < 0) {
+      image.dataset.wtV2exOriginalTabindex = image.hasAttribute('tabindex') ? image.getAttribute('tabindex') : '';
+      image.tabIndex = 0;
+      image.dataset.wtV2exManagedTabindex = 'true';
+    }
+    if (!image.hasAttribute('role')) {
+      image.setAttribute('role', 'button');
+      image.dataset.wtV2exAddedRole = 'true';
+    }
+    if (!image.hasAttribute('aria-label')) {
+      image.setAttribute('aria-label', image.alt ? '打开图片预览：' + image.alt : '打开图片预览');
+      image.dataset.wtV2exAddedAriaLabel = 'true';
+    }
+  }
+
+  function prepareLightboxTargets(container) {
+    container.querySelectorAll('img').forEach(prepareLightboxTarget);
+  }
+
+  function processImageContent(container) {
+    if (runtime.settings.imagePreviewEnabled) {
+      enhanceLinkedImages(container);
+      enhanceTextImages(container);
+    }
+    if (runtime.settings.imageLightboxEnabled) prepareLightboxTargets(container);
+  }
+
+  function scanImageContent(root = document) {
+    if (!runtime.settings.imagePreviewEnabled && !runtime.settings.imageLightboxEnabled) return;
+    imageContentContainers(root).forEach(processImageContent);
+  }
+
+  function resetImagePreviews(root = document) {
+    if (root instanceof Element && root.matches('.wt-v2ex-inline-image')) root.remove();
+    if (typeof root.querySelectorAll !== 'function') return;
+    root.querySelectorAll('.wt-v2ex-inline-image').forEach((image) => image.remove());
+    root.querySelectorAll('[data-wt-v2ex-image-enhanced]').forEach((source) => {
+      delete source.dataset.wtV2exImageEnhanced;
+    });
+    root.querySelectorAll('[data-wt-v2ex-image-text-enhanced]').forEach((container) => {
+      delete container.dataset.wtV2exImageTextEnhanced;
+    });
+  }
+
+  function resetLightboxTarget(image) {
+    if (!(image instanceof HTMLImageElement)) return;
+    image.classList.remove('wt-v2ex-lightbox-target');
+    if (image.dataset.wtV2exManagedTabindex === 'true') {
+      if (image.dataset.wtV2exOriginalTabindex) image.setAttribute('tabindex', image.dataset.wtV2exOriginalTabindex);
+      else image.removeAttribute('tabindex');
+    }
+    if (image.dataset.wtV2exAddedRole === 'true') image.removeAttribute('role');
+    if (image.dataset.wtV2exAddedAriaLabel === 'true') image.removeAttribute('aria-label');
+    delete image.dataset.wtV2exLightboxReady;
+    delete image.dataset.wtV2exManagedTabindex;
+    delete image.dataset.wtV2exOriginalTabindex;
+    delete image.dataset.wtV2exAddedRole;
+    delete image.dataset.wtV2exAddedAriaLabel;
+  }
+
+  function resetLightboxTargets(root = document) {
+    if (root instanceof HTMLImageElement && root.dataset.wtV2exLightboxReady === 'true') resetLightboxTarget(root);
+    if (typeof root.querySelectorAll !== 'function') return;
+    root.querySelectorAll('img[data-wt-v2ex-lightbox-ready="true"]').forEach(resetLightboxTarget);
+  }
+
+  function lightboxUrlForImage(image) {
+    if (!(image instanceof HTMLImageElement)) return null;
+    const linkedImageUrl = imagePreviewUrl(image.closest('a[href]')?.getAttribute('href'), image.baseURI);
+    return linkedImageUrl || safeUrl(image.currentSrc || image.getAttribute('src'), 'image', image.baseURI);
+  }
+
+  function ensureImageLightbox() {
+    if (runtime.imageLightbox?.isConnected) return runtime.imageLightbox;
+    const overlay = document.createElement('div');
+    overlay.className = 'wt-v2ex-image-lightbox';
+    overlay.hidden = true;
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', '图片预览');
+
+    const closeButton = document.createElement('button');
+    closeButton.type = 'button';
+    closeButton.className = 'wt-v2ex-image-lightbox-close';
+    closeButton.setAttribute('aria-label', '关闭图片预览');
+    closeButton.textContent = '×';
+
+    const image = document.createElement('img');
+    image.className = 'wt-v2ex-image-lightbox-image';
+    image.alt = '图片全屏预览';
+    image.decoding = 'async';
+    image.referrerPolicy = 'no-referrer';
+
+    const originalLink = document.createElement('a');
+    originalLink.className = 'wt-v2ex-image-lightbox-link';
+    originalLink.target = '_blank';
+    originalLink.rel = 'noopener noreferrer';
+    originalLink.textContent = '在新标签页打开原图';
+
+    overlay.append(closeButton, image, originalLink);
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) closeImageLightbox();
+    });
+    overlay.addEventListener('keydown', (event) => {
+      if (event.key !== 'Tab') return;
+      const focusable = [closeButton, originalLink].filter((element) => !element.hidden);
+      if (!focusable.length) return;
+      const currentIndex = focusable.indexOf(document.activeElement);
+      const nextIndex = event.shiftKey
+        ? (currentIndex <= 0 ? focusable.length - 1 : currentIndex - 1)
+        : (currentIndex < 0 || currentIndex === focusable.length - 1 ? 0 : currentIndex + 1);
+      event.preventDefault();
+      focusable[nextIndex].focus();
+    });
+    closeButton.addEventListener('click', () => closeImageLightbox());
+    document.body.append(overlay);
+    runtime.imageLightbox = overlay;
+    runtime.imageLightboxImage = image;
+    runtime.imageLightboxLink = originalLink;
+    runtime.imageLightboxClose = closeButton;
+    return overlay;
+  }
+
+  function openImageLightbox(opener) {
+    if (!runtime.settings.imageLightboxEnabled || !(opener instanceof HTMLImageElement)) return false;
+    if (opener.complete && opener.naturalWidth === 0) return false;
+    const url = lightboxUrlForImage(opener);
+    if (!url) return false;
+    const overlay = ensureImageLightbox();
+    runtime.imageLightboxOpener = opener;
+    runtime.imageLightboxImage.src = url;
+    runtime.imageLightboxImage.alt = opener.alt || '图片全屏预览';
+    runtime.imageLightboxLink.href = url;
+    if (!runtime.imageScrollLock) {
+      runtime.imageScrollLock = {
+        documentOverflow: document.documentElement.style.overflow,
+        bodyOverflow: document.body.style.overflow,
+        scrollX: window.scrollX,
+        scrollY: window.scrollY
+      };
+      document.documentElement.style.overflow = 'hidden';
+      document.body.style.overflow = 'hidden';
+    }
+    overlay.hidden = false;
+    if (runtime.imageLightboxFocusFrame) cancelAnimationFrame(runtime.imageLightboxFocusFrame);
+    runtime.imageLightboxFocusFrame = requestAnimationFrame(() => {
+      runtime.imageLightboxFocusFrame = 0;
+      if (!overlay.hidden) runtime.imageLightboxClose?.focus({ preventScroll: true });
+    });
+    return true;
+  }
+
+  function closeImageLightbox(restoreFocus = true) {
+    if (runtime.imageLightboxFocusFrame) {
+      cancelAnimationFrame(runtime.imageLightboxFocusFrame);
+      runtime.imageLightboxFocusFrame = 0;
+    }
+    const overlay = runtime.imageLightbox;
+    if (!overlay || overlay.hidden) return;
+    overlay.hidden = true;
+    runtime.imageLightboxImage?.removeAttribute('src');
+    runtime.imageLightboxLink?.removeAttribute('href');
+    if (runtime.imageScrollLock) {
+      const scrollLock = runtime.imageScrollLock;
+      document.documentElement.style.overflow = scrollLock.documentOverflow;
+      document.body.style.overflow = scrollLock.bodyOverflow;
+      runtime.imageScrollLock = null;
+      window.scrollTo(scrollLock.scrollX, scrollLock.scrollY);
+    }
+    const opener = runtime.imageLightboxOpener;
+    runtime.imageLightboxOpener = null;
+    if (restoreFocus && opener?.isConnected) opener.focus({ preventScroll: true });
+  }
+
+  function contentImageFromEvent(event) {
+    if (!(event.target instanceof HTMLImageElement)) return null;
+    const image = event.target;
+    if (!image.closest(IMAGE_CONTENT_SELECTOR) || image.classList.contains('avatar') || image.closest('.wt-v2ex-image-lightbox')) return null;
+    return image;
+  }
+
+  function activateContentImage(event) {
+    if (!runtime.settings.imageLightboxEnabled || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    if (event.type === 'click' && event.button !== 0) return;
+    if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return;
+    const image = contentImageFromEvent(event);
+    if (!image || !openImageLightbox(image)) return;
+    event.preventDefault();
+  }
+
+  function handleImageKeydown(event) {
+    if (event.key === 'Escape' && runtime.imageLightbox && !runtime.imageLightbox.hidden) {
+      event.preventDefault();
+      closeImageLightbox();
+      return;
+    }
+    activateContentImage(event);
+  }
+
+  function handleImageLoadFailure(event) {
+    if (!(event.target instanceof HTMLImageElement)) return;
+    if (event.target === runtime.imageLightboxImage) {
+      closeImageLightbox();
+      return;
+    }
+    if (event.target.classList.contains('wt-v2ex-inline-image')) event.target.remove();
+  }
+
+  function initializeImageEnhancement() {
+    if (!runtime.imageDelegationAttached) {
+      runtime.imageDelegationAttached = true;
+      document.addEventListener('click', activateContentImage);
+      document.addEventListener('keydown', handleImageKeydown);
+      document.addEventListener('error', handleImageLoadFailure, true);
+    }
+    scanImageContent(document);
   }
 
   function updateScrollButton() {
@@ -1306,6 +1668,14 @@
       .wt-v2ex-threaded-reply .wt-v2ex-native-reply-controls { float:none; order:999; display:inline-flex; flex:0 0 auto; align-items:center; gap:5px; margin-left:auto; white-space:nowrap; }
       .wt-v2ex-threaded-reply .wt-v2ex-native-reply-action:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
       .wt-v2ex-threaded-reply .wt-v2ex-native-reply-action:hover { opacity:.72; }
+      .wt-v2ex-inline-image { display:block; max-width:100%; height:auto; margin:8px 0; cursor:zoom-in; }
+      .wt-v2ex-lightbox-target { cursor:zoom-in; }
+      .wt-v2ex-image-lightbox { position:fixed; z-index:2147483646; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; box-sizing:border-box; padding:24px; overflow:auto; background:rgba(0,0,0,.88); }
+      .wt-v2ex-image-lightbox[hidden] { display:none !important; }
+      .wt-v2ex-image-lightbox-image { display:block; max-width:92vw; max-height:90vh; width:auto; height:auto; object-fit:contain; }
+      .wt-v2ex-image-lightbox-close { position:fixed; top:max(14px, env(safe-area-inset-top)); right:max(16px, env(safe-area-inset-right)); width:42px; height:42px; border:1px solid rgba(255,255,255,.55); border-radius:50%; background:rgba(0,0,0,.58); color:#fff; cursor:pointer; font:32px/1 sans-serif; }
+      .wt-v2ex-image-lightbox-link { color:#fff; text-decoration:underline; }
+      .wt-v2ex-image-lightbox-close:focus-visible, .wt-v2ex-image-lightbox-link:focus-visible, .wt-v2ex-lightbox-target:focus-visible { outline:2px solid #69a8ff; outline-offset:3px; }
       .wt-v2ex-relation { padding:1px 4px; border:1px solid rgba(127,127,127,.3); border-radius:3px; font-size:11px; }
       .wt-v2ex-relation-exact { color:#176b3a; }
       .wt-v2ex-relation-inferred { color:#805b00; }
@@ -1340,6 +1710,7 @@
     document.documentElement.dataset.wtV2exInitialized = 'true';
     addStyles();
     registerMenuCommands();
+    initializeImageEnhancement();
     attachNativeReplyEnhancer();
     observeNavigation();
     try {
