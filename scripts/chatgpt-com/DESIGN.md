@@ -34,37 +34,24 @@ The references inform roles, contrast, density, accessible component behavior, a
 4. **Truthful uncertainty:** missing percentages, limits, dates, or analytics remain visibly unknown instead of becoming invented zeroes.
 5. **Neutral surfaces:** use restrained borders and elevation; do not turn every row into a heavy card.
 6. **Local adaptation:** borrow public design-system patterns and semantic roles, not OpenAI marks, proprietary product chrome, or an official-looking identity.
-7. **Source-aware cost:** distinguish authoritative server cost from API-equivalent estimation, and do not display an amount without the evidence needed to support it.
+7. **Reliable source boundary:** show only metrics with clear semantics from the current endpoints; unavailable cost capability stays unavailable.
 8. **Defensive interaction:** initialization, navigation, theme synchronization, drag behavior, and event binding must be idempotent.
 
 ## Data semantics and integration contracts
 
-The 1.4.0 contract treats `/backend-api/wham/usage/daily-token-usage-breakdown` as a ChatGPT Analytics data source. When the response declares `units: "percent"`, its `credits` values mean percentage/model-usage share. The UI must render them only as `模型消耗占比` and never convert them to USD. Real Codex Credit consumption comes only from `daily-workspace-usage-counts[].totals.credits`.
+The 1.5.0 contract treats `/backend-api/wham/usage/daily-token-usage-breakdown` as a ChatGPT Analytics data source. When the response declares `units: "percent"`, its `credits` values mean percentage/model-usage share. The UI must render them only as `模型使用占比` and never treat them as Credits, Tokens, or USD. Real Codex Credit data, when present, remains separate from model shares.
 
 ### Model usage component
 
-The model-usage component sits inside Usage Statistics and uses a compact list rather than implying a token ledger. Normalize rows by merging the same model and speed, sort the merged rows in descending share order, hide zero-valued rows, and show the resulting percentage. Do not infer or display fake token counts from these shares. Keep the existing server-supplied Credits metric semantically separate from the Analytics response field named `credits`.
+The model-usage component sits inside Usage Statistics and uses a native conic-gradient pie with an accessible legend rather than implying a token ledger. Normalize rows by merging the same model and speed, sort the merged rows in descending share order, hide zero-valued rows, and show the resulting percentage. Do not infer or display fake token counts from these shares. Keep account-level Credits semantically separate from the Analytics response field named `credits`.
 
-### Cost analysis component
+### Cost capability boundary
 
-The cost component must label its source and confidence:
+The internal capability seam remains available for future `thread_usage`, `real_credit`, and `token_estimate` providers. Version 1.5.0 does not render a cost card, cost badge, USD amount, API-equivalent value, or billing summary. The model-breakdown `credits` field is never used as a cost input. Diagnostics report `costCapability: unavailable` until an authoritative current source is intentionally supported.
 
-| Display meaning | Source | Confidence | Display rule |
-| --- | --- | --- | --- |
-| API-equivalent value | `thread_api` | `authoritative` | Use authoritative USD returned by Thread Usage when available. |
-| API-equivalent value | `codex-credit` | `high` | Use positive daily `totals.credits` and multiply by `0.04`. |
-| API-equivalent estimate | `model_token_estimate` | `estimated` | Use only reliable model-level input, cached-input, and output Token attribution. |
-| Value unavailable | `credit-unavailable` or `unavailable` | `unknown` | Show no dollar amount; distinguish missing Credits from zero billing. |
+### Data-source diagnostics
 
-The internal cost result should preserve `valueUsd`, `source`, `confidence`, `coveragePercent`, and safe `notes` fields. The pricing seam is a per-model `MODEL_PRICING` table containing input, cached-input, output prices, and an effective date for `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5`. `estimateApiCost({ model, inputTokens, cachedInputTokens, outputTokens })` uses uncached input cost plus cached input cost plus output cost; it must not use total Tokens times an average price or percentage times USD.
-
-`usageCostProviders` contains `threadUsageProvider`, `creditProvider`, and `tokenPricingProvider`. Resolution order is Thread Usage authoritative USD, daily-workspace Codex Credits, token pricing, then unavailable. `1000 Credits ≈ $40`, and `credits=0` with positive Tokens must remain `Credit数据不可用` rather than `$0`. Every result keeps `valueUsd`, `source`, and `confidence`; the UI says `API 等价价值`, never actual billing.
-
-### Thread Usage capability diagnostic
-
-Place the probe inside the existing collapsed `诊断信息` disclosure. The compact action opens a small dialog with a labeled Thread ID input and `检测`/`关闭` buttons. Prefill only an already available `/c/<thread-id>` page ID; do not implement broad thread discovery, history crawling, or automatic probing. Reject malformed UUIDs before the network layer.
-
-The provider state is kept in memory and exposes `status`, `checkedAt`, `endpointAvailable`, `threadUsageSupported`, `supportsTokenBreakdown`, `supportsUsdEstimate`, `supportsCreditEstimate`, and a safe `lastError` code. A 200 empty `threads` result means that the endpoint is reachable but returned no queryable thread data; it is not a definitive unsupported-account conclusion. 403 means the endpoint exists but the account may lack permission, 404 means unavailable or hidden, and timeout means the check timed out. The UI may show status, HTTP code, capability booleans, and check time, but never the input ID, response body, account ID, cookie, token, or authorization header.
+The collapsed `诊断信息` section reports `Workspace Analytics`, `Model Breakdown`, `Thread Usage`, `Credit`, and `costCapability` as safe availability values. It never probes Thread Usage during normal refresh and never displays a response body, Thread ID, account ID, cookie, token, authorization header, or cost value.
 
 ## Color tokens
 
@@ -130,8 +117,8 @@ The expanded panel is approximately 400px wide with `max-width: calc(100vw - 24p
 1. Header: `用量与额度`, update/status text, refresh, official Analytics icon, and collapse control.
 2. Compact account summary: identity and plan badge in one block, with no redundant full-width “signed in” row.
 3. Quota windows: primary and additional windows, percentages when known, progress, reset time, countdown, and state.
-4. Cycle analysis: the active window, Tokens, Turns, Credits, API-equivalent value, estimated capacity when mathematically supported, and daily date/Tokens/Credits/API value/Turns table.
-5. Analytics: selected range, metric summary, client distribution, model usage distribution, source-aware cost state, and a native CSS/SVG daily trend.
+4. Usage statistics: selected range, Tokens, token subtypes, Turns, Threads, client distribution, model usage percentage, and a native CSS/SVG daily trend.
+5. Cycle analysis: the active window, Tokens, Turns, Threads, daily date/Tokens/Turns/Threads/primary-model table, and daily model usage.
 6. Footer: diagnostics and necessary explanatory notices only; automatic refresh is fixed at five minutes and has no settings UI.
 7. Diagnostics: collapsed by default and safe to copy.
 
@@ -151,17 +138,16 @@ The panel should use a small number of clear sections rather than a stack of vis
 - **Account summary:** display name and masked email together when available; show a plan badge beside that identity; omit missing fields rather than leaving blank rows.
 - **Quota window:** name, primary/additional context, used and remaining values, progressbar, reset information, and textual state.
 - **Badge and indicator:** compact semantic status, never status by color alone.
-- **Metric grid:** Tokens, server-supplied Credits, Threads, and Turns first; token subtypes and date count are secondary detail. The Analytics model-breakdown `credits` field is a percentage/model share and must not be placed in the Credits metric.
-- **Cycle analysis:** derive the current period from `reset_at - limit_window_seconds` without hardcoding five-hour or weekly durations. Show an estimated total only when `usedCredits > 0` and `usedPercent > 0`, using `usedCredits / (usedPercent / 100)`.
-- **Daily breakdown:** use only daily `totals.credits` for Credits and API value; missing or zero Credits display `Credit数据不可用` when Tokens are present.
+- **Metric grid:** Tokens, Turns, and Threads first; cached input, uncached input, output tokens, and date count are secondary detail. The Analytics model-breakdown `credits` field is a percentage/model share and must not be placed in a Credits metric.
+- **Cycle analysis:** derive the current period from `reset_at - limit_window_seconds` without hardcoding five-hour or weekly durations. Show an estimated total only when mathematically supported by reliable cycle percentage data.
+- **Daily breakdown:** show only date, Tokens, Turns, Threads, and the primary model. Missing values remain visibly unknown.
 - **Client distribution:** client name, token share, and a compact secondary metrics line; avoid an unreadable sentence of equal-weight numbers.
-- **Model usage distribution:** model and speed labels with merged, descending percentage shares; hide zero values and never invent token counts. This component should identify the values as Analytics/model usage share, not Token usage.
-- **Cost analysis:** a compact amount/status row with `来源` and confidence. Show `API 等价价值` with `来源: Codex Credits` for the daily Credit provider, and no dollar amount when the source is unavailable.
-- **Thread Usage diagnostic:** a compact status block inside diagnostics with endpoint status, Token breakdown support, server-estimate field support, and check time. An authoritative USD field, when explicitly returned, may feed the in-memory cost priority but is never presented as subscription billing.
+- **Model usage distribution:** model and speed labels with merged, descending percentage shares; hide zero values, render a native conic-gradient pie chart, provide legend tooltips, and never invent token counts. This component identifies the values as Analytics/model usage share, not Token usage.
+- **Data-source diagnostics:** show safe availability values for Workspace Analytics, Model Breakdown, Thread Usage, Credit, and `costCapability`; do not show cost amounts or provider internals.
 - **Daily trend:** native CSS only; each bar is the actual Analytics value for one UTC date bucket, with a custom Tooltip for hover, focus, and touch that preserves source precision and does not estimate missing dates as zero.
 - **Range selector:** compact keyboard-operable control for current cycle, month, 7 days, 30 days, and custom.
 - **Custom date editor:** native date inputs with labels, inclusive end-date language, inline validation, apply/cancel, and an `aria-live` error region.
-- **Footer and diagnostics:** necessary explanatory notices and a safe, collapsed diagnostic disclosure; no settings or official-link footer. Safe diagnostics may include model-breakdown status, model-row count, cost-provider source, cost confidence, and Thread Usage status/capabilities/check time only.
+- **Footer and diagnostics:** necessary explanatory notices and a safe, collapsed diagnostic disclosure; no settings or official-link footer. Safe diagnostics may include source availability, model-breakdown status, model-row count, request status, and window-shape metadata only.
 
 ## Theme behavior
 
@@ -217,8 +203,7 @@ Use only generic activity, usage, gauge, chart, refresh, settings, and collapse 
 - Repeating official links or automatic-refresh settings in a bottom footer.
 - Using a large primary “manual refresh” block that competes with account and quota data.
 - Rendering the Analytics model-breakdown `credits` field as Credits, Token usage, or USD.
-- Showing a dollar amount from model share alone, or presenting an API-equivalent value as actual billing.
-- Showing `$0` when daily Credits are zero or unavailable while Tokens are present.
+- Rendering a cost card, cost badge, USD amount, API-equivalent value, or billing summary without an explicitly supported authoritative source.
 - Copying Tokens, cookies, authorization values, account IDs, or raw responses into diagnostics.
 - Building a custom calendar, adding a chart library, adding a remote dependency, or introducing a broad permission solely for visual polish.
 - Depending only on `prefers-color-scheme`, creating a new host on each theme change, or attaching duplicate listeners during SPA navigation.

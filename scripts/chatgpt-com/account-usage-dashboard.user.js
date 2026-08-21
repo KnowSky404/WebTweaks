@@ -2,9 +2,9 @@
 // @name         ChatGPT Account Usage Dashboard
 // @name:zh-CN   ChatGPT 账户用量浮窗
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.4.0
-// @description  Display the current ChatGPT account plan, Codex limits, credits, and usage analytics in a private floating dashboard.
-// @description:zh-CN 在 ChatGPT 页面显示当前账号套餐、Codex 额度、Credits 与使用统计。
+// @version      1.5.0
+// @description  Display the current ChatGPT account plan, Codex limits, and reliable usage analytics in a private floating dashboard.
+// @description:zh-CN 在 ChatGPT 页面显示当前账号套餐、Codex 额度与可靠的使用统计。
 // @author       KnowSky404
 // @match        https://chatgpt.com/*
 // @grant        none
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.4.0';
+  const VERSION = '1.5.0';
   const HOST_ID = 'wt-chatgpt-account-usage-host';
   const SESSION_ENDPOINT = '/api/auth/session';
   const USAGE_ENDPOINT = '/backend-api/wham/usage';
@@ -104,15 +104,25 @@
   const PREF_KEYS = {
     position: 'wt-chatgpt-account-usage:position',
     collapsed: 'wt-chatgpt-account-usage:collapsed',
+    sections: 'wt-chatgpt-account-usage:sections',
     range: 'wt-chatgpt-account-usage:range',
     email: 'wt-chatgpt-account-usage:show-email',
     metric: 'wt-chatgpt-account-usage:chart-metric',
     customStart: 'wt-chatgpt-account-usage:custom-start',
     customEnd: 'wt-chatgpt-account-usage:custom-end'
   };
+  const SECTION_IDS = Object.freeze(['account', 'quota', 'stats', 'cycle', 'diagnostics']);
+  const DEFAULT_SECTION_COLLAPSED = Object.freeze({
+    account: false,
+    quota: false,
+    stats: false,
+    cycle: false,
+    diagnostics: true
+  });
   const DEFAULT_PREFS = {
     position: null,
     collapsed: true,
+    sectionCollapsed: DEFAULT_SECTION_COLLAPSED,
     range: 'cycle',
     email: true,
     metric: 'tokens',
@@ -205,6 +215,7 @@
     return {
       units: null,
       rows: [],
+      dailyRows: [],
       loading: false,
       error: null,
       stale: false
@@ -277,6 +288,27 @@
   function clampPercent(value) {
     const number = numberOrNull(value);
     return number === null ? null : Math.min(100, Math.max(0, number));
+  }
+
+  function getQuotaProgressColor(percent, theme = runtime.host?.getAttribute('data-wt-theme') || 'light') {
+    const value = clampPercent(percent);
+    if (value === null) return 'transparent';
+    const stops = theme === 'dark'
+      ? [[0, [72, 201, 116]], [30, [112, 167, 255]], [60, [82, 132, 242]], [90, [241, 173, 66]], [100, [255, 123, 114]]]
+      : [[0, [21, 148, 71]], [30, [37, 99, 235]], [60, [29, 78, 216]], [90, [184, 106, 8]], [100, [196, 61, 50]]];
+    let left = stops[0];
+    let right = stops[stops.length - 1];
+    for (let index = 1; index < stops.length; index += 1) {
+      if (value <= stops[index][0]) {
+        right = stops[index];
+        left = stops[index - 1];
+        break;
+      }
+    }
+    const span = right[0] - left[0] || 1;
+    const ratio = (value - left[0]) / span;
+    const channels = left[1].map((channel, index) => Math.round(channel + (right[1][index] - channel) * ratio));
+    return `rgb(${channels.join(', ')})`;
   }
 
   function parseTimestamp(value) {
@@ -466,36 +498,50 @@
     return `${new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(number)}%`;
   }
 
-  function normalizeModelBreakdown(payload) {
-    const root = unwrapData(payload);
-    const unitsValue = firstDefined(root, ['units']);
-    const units = typeof unitsValue === 'string' ? unitsValue.trim().toLowerCase() : null;
-    const dailyRows = Array.isArray(root)
-      ? root
-      : asArray(firstDefined(root, ['data', 'rows', 'daily', 'usage']));
-    if (units !== 'percent') return { units, rows: [], supported: false };
+  function normalizeModelRows(modelRows) {
     const merged = new Map();
-    for (const dailyRow of dailyRows) {
-      if (!isRecord(dailyRow)) continue;
-      const modelRows = asArray(firstDefined(dailyRow, ['models', 'model_usage', 'modelUsage']));
-      for (const modelRow of modelRows.length ? modelRows : [dailyRow]) {
-        if (!isRecord(modelRow)) continue;
-        const model = firstDefined(modelRow, ['model', 'model_name', 'modelName']);
-        const speed = firstDefined(modelRow, ['speed', 'mode', 'inference_speed', 'inferenceSpeed']) || 'unknown';
-        const value = numberOrNull(firstDefined(modelRow, ['credits']));
-        if (typeof model !== 'string' || !model.trim() || value === null || value <= 0 || value > 100) continue;
-        const key = `${model.trim()}\u0000${String(speed).trim()}`;
-        merged.set(key, (merged.get(key) || 0) + value);
-      }
+    for (const modelRow of modelRows) {
+      if (!isRecord(modelRow)) continue;
+      const model = firstDefined(modelRow, ['model', 'model_name', 'modelName']);
+      const speed = firstDefined(modelRow, ['speed', 'mode', 'inference_speed', 'inferenceSpeed']) || 'unknown';
+      const value = numberOrNull(firstDefined(modelRow, ['credits', 'sharePercent']));
+      if (typeof model !== 'string' || !model.trim() || value === null || value <= 0 || value > 100) continue;
+      const key = `${model.trim()}\u0000${String(speed).trim()}`;
+      merged.set(key, (merged.get(key) || 0) + value);
     }
-    const rows = [...merged.entries()]
+    return [...merged.entries()]
       .map(([key, sharePercent]) => {
         const separator = key.indexOf('\u0000');
         return { model: key.slice(0, separator), speed: key.slice(separator + 1), sharePercent: numberOrNull(sharePercent) };
       })
       .filter((row) => row.sharePercent !== null && row.sharePercent > 0)
       .sort((left, right) => right.sharePercent - left.sharePercent || left.model.localeCompare(right.model) || left.speed.localeCompare(right.speed));
-    return { units, rows, supported: true };
+  }
+
+  function normalizeModelBreakdown(payload) {
+    const root = unwrapData(payload);
+    const unitsValue = firstDefined(root, ['units']);
+    const units = typeof unitsValue === 'string' ? unitsValue.trim().toLowerCase() : null;
+    const sourceRows = Array.isArray(root)
+      ? root
+      : asArray(firstDefined(root, ['data', 'rows', 'daily', 'usage']));
+    if (units !== 'percent') return { units, rows: [], dailyRows: [], supported: false };
+    const dailyRows = sourceRows.map((dailyRow) => {
+      if (!isRecord(dailyRow)) return null;
+      const rawDate = firstDefined(dailyRow, ['date', 'day', 'usage_date', 'usageDate']);
+      const date = typeof rawDate === 'string' && /^\d{4}-\d{2}-\d{2}/.test(rawDate)
+        ? rawDate.slice(0, 10)
+        : dateKeyUTC(parseTimestamp(rawDate));
+      const modelRows = asArray(firstDefined(dailyRow, ['models', 'model_usage', 'modelUsage']));
+      const rows = normalizeModelRows(modelRows.length ? modelRows : [dailyRow]);
+      return date && rows.length ? { date, rows } : null;
+    }).filter(Boolean).sort((left, right) => right.date.localeCompare(left.date));
+    const aggregate = normalizeModelRows(dailyRows.flatMap((dailyRow) => dailyRow.rows));
+    const total = aggregate.reduce((sum, row) => sum + row.sharePercent, 0);
+    const rows = total > 0
+      ? aggregate.map((row) => ({ ...row, sharePercent: row.sharePercent / total * 100 }))
+      : [];
+    return { units, rows, dailyRows, supported: true };
   }
 
   function estimateApiCost({ model, inputTokens, cachedInputTokens, outputTokens } = {}) {
@@ -574,6 +620,14 @@
     }
   }
 
+  function normalizeSectionCollapsed(value) {
+    const stored = isRecord(value) ? value : {};
+    return SECTION_IDS.reduce((result, id) => {
+      result[id] = stored[id] === undefined ? DEFAULT_SECTION_COLLAPSED[id] : stored[id] === true;
+      return result;
+    }, {});
+  }
+
   function normalizePositionAnchor(value) {
     if (!isRecord(value) || value.version !== POSITION_VERSION) return null;
     if (!['left', 'right'].includes(value.horizontal) || !['top', 'bottom'].includes(value.vertical)) return null;
@@ -603,6 +657,7 @@
       position: normalizePositionAnchor(storedPosition),
       legacyPosition: normalizeLegacyPosition(storedPosition),
       collapsed: readPreference(PREF_KEYS.collapsed, DEFAULT_PREFS.collapsed) !== false,
+      sectionCollapsed: normalizeSectionCollapsed(readPreference(PREF_KEYS.sections, DEFAULT_PREFS.sectionCollapsed)),
       range: RANGE_OPTIONS.includes(readPreference(PREF_KEYS.range, DEFAULT_PREFS.range)) ? readPreference(PREF_KEYS.range, DEFAULT_PREFS.range) : DEFAULT_PREFS.range,
       email: readPreference(PREF_KEYS.email, DEFAULT_PREFS.email) !== false,
       metric: readPreference(PREF_KEYS.metric, DEFAULT_PREFS.metric) === 'credits' ? 'credits' : 'tokens',
@@ -1069,7 +1124,11 @@
     modelBreakdown.error = null;
     render();
     runtime.modelBreakdownPromise = (async () => {
-      const result = await requestJSON(MODEL_BREAKDOWN_ENDPOINT, { controller: runtime.abortController, headers });
+      const cycle = runtime.state.analytics.ranges.cycle;
+      const start = cycle?.start || todayKeyUTC();
+      const end = cycle?.end ? addDays(cycle.end, -1) : start;
+      const query = new URLSearchParams({ start_date: start, end_date: end >= start ? end : start, group_by: 'day' });
+      const result = await requestJSON(`${MODEL_BREAKDOWN_ENDPOINT}?${query.toString()}`, { controller: runtime.abortController, headers });
       runtime.state.diagnostics.modelBreakdownStatus = result.status;
       if (!result.ok || !result.data) {
         modelBreakdown.error = '模型使用情况暂不可用';
@@ -1086,6 +1145,7 @@
       }
       modelBreakdown.units = normalized.units;
       modelBreakdown.rows = normalized.rows;
+      modelBreakdown.dailyRows = normalized.dailyRows;
       modelBreakdown.stale = false;
       modelBreakdown.error = null;
       runtime.state.diagnostics.modelRows = normalized.rows.length;
@@ -1434,9 +1494,21 @@
     return node;
   }
 
-  function section(title) {
-    const node = el('section', 'wt-section');
-    node.append(el('h3', 'wt-section-title', title));
+  function collapsibleSection(id, title, content, defaultCollapsed = false) {
+    const collapsed = runtime.prefs.sectionCollapsed[id] ?? defaultCollapsed;
+    const sectionId = `wt-section-${id}`;
+    const node = setAttributes(el('section', 'wt-section wt-collapsible'), { 'data-section': id });
+    const toggle = setAttributes(el('button', 'wt-section-toggle'), {
+      type: 'button',
+      'aria-controls': sectionId,
+      'aria-expanded': !collapsed,
+      'data-action': 'toggle-section',
+      'data-section-id': id
+    });
+    toggle.append(el('span', 'wt-section-title', title), el('span', 'wt-section-chevron', '⌄'));
+    const body = setAttributes(el('div', 'wt-section-body'), { id: sectionId, hidden: collapsed ? 'true' : null });
+    if (content) body.append(content);
+    node.append(toggle, body);
     return node;
   }
 
@@ -1464,7 +1536,9 @@
     const percent = clampPercent(value);
     if (percent !== null) {
       bar.style.setProperty('--wt-progress', `${percent}%`);
+      bar.style.setProperty('--wt-progress-color', getQuotaProgressColor(percent));
       bar.setAttribute('aria-valuenow', String(percent));
+      bar.setAttribute('aria-valuetext', `${formatPercent(percent)} 已使用`);
     }
     wrapper.append(bar);
     return wrapper;
@@ -1510,7 +1584,7 @@
   function renderAccountSummary(data) {
     if (data.session.signedIn === false) return el('div', 'wt-notice wt-notice-warning', '当前未登录 ChatGPT，登录后可查看账户用量。');
     if (data.session.signedIn !== true) return el('div', 'wt-notice wt-notice-warning', '登录状态暂无法确认，请稍后刷新。');
-    const node = el('section', 'wt-account-summary');
+    const node = el('div', 'wt-account-summary');
     const identity = el('div', 'wt-identity-block');
     identity.append(el('span', 'wt-avatar', avatarInitial(data.session.displayName)));
     const copy = el('div', 'wt-identity-copy');
@@ -1524,13 +1598,16 @@
     status.append(el('span', 'wt-status-dot-inline'), el('span', '', usageStatus));
     side.append(status);
     node.append(identity, side, el('div', 'wt-account-meta', formatUpdatedAt(data.fetchedAt)));
+    const credits = renderCredits(data);
+    if (credits) node.append(credits);
     return node;
   }
 
   function renderCredits(data) {
     const values = [data.credits.hasCredits, data.credits.unlimited, data.credits.balance, data.credits.resetCreditsAvailable, data.spendControl.reached, data.spendControl.used, data.spendControl.limit, data.spendControl.usedPercent, data.spendControl.remainingPercent, data.spendControl.resetAt];
     if (!values.some(hasValue)) return null;
-    const node = section('Credits 和账户用量状态');
+    const node = el('div', 'wt-subsection wt-account-credits');
+    node.append(el('h4', 'wt-subtitle', '账户状态'));
     const grid = el('div', 'wt-field-grid');
     appendFieldIfValue(grid, 'Credits 余额', data.credits.balance === null ? null : formatNumber(data.credits.balance));
     appendFieldIfValue(grid, '无限 Credits', data.credits.unlimited === null ? null : data.credits.unlimited ? '是' : '否');
@@ -1547,7 +1624,7 @@
 
   function renderStats(stats) {
     const grid = el('div', 'wt-metric-grid');
-    const metrics = [['tokens', 'Tokens'], ['credits', 'Credits'], ['threads', 'Threads'], ['turns', 'Turns']];
+    const metrics = [['tokens', 'Tokens'], ['turns', 'Turns'], ['threads', 'Threads']];
     metrics.forEach(([key, label]) => {
       if (!hasValue(stats[key])) return;
       const card = el('div', 'wt-metric');
@@ -1582,40 +1659,11 @@
     return usedCredits / (usedPercent / 100);
   }
 
-  function costSourceLabel(source) {
-    if (source === 'codex-credit') return 'Codex Credits';
-    if (source === 'thread_api') return 'Thread Usage USD';
-    if (source === 'model_token_estimate') return 'Token 定价估算';
-    return '不可用';
-  }
-
-  function renderCostCard(estimate, title = 'API 等价价值') {
-    const wrapper = el('div', 'wt-subsection wt-cost-estimate');
-    wrapper.append(el('h4', 'wt-subtitle', title));
-    const hasCost = estimate && numberOrNull(estimate.valueUsd) !== null;
-    wrapper.append(statusBadge(`${hasCost ? title : '价值不可用'} · ${costSourceLabel(estimate?.source)}`, hasCost ? 'ok' : 'warning'));
-    const sourceGrid = el('div', 'wt-field-grid wt-cost-meta');
-    sourceGrid.append(field('来源', costSourceLabel(estimate?.source)));
-    sourceGrid.append(field('置信度', estimate?.confidence || 'unknown'));
-    wrapper.append(sourceGrid);
-    if (hasCost) {
-      wrapper.append(el('p', 'wt-cost-value', `${title}：$${estimate.valueUsd.toFixed(2)}`));
-    } else if (estimate?.source === 'credit-unavailable') {
-      wrapper.append(el('p', 'wt-notice wt-notice-warning', 'Credit数据不可用'));
-    } else if (runtime.state.modelBreakdown.rows.length) {
-      wrapper.append(el('p', 'wt-notice wt-notice-warning', '模型消耗占比仅表示百分比，不能换算美元。'));
-    } else {
-      wrapper.append(el('p', 'wt-notice wt-notice-warning', 'API 等价价值暂不可用。'));
-    }
-    wrapper.append(el('p', 'wt-window-meta', 'API 等价价值不代表 ChatGPT 订阅收费金额。'));
-    return wrapper;
-  }
-
   function renderCycleAnalysis(data) {
     const range = runtime.state.analytics.ranges.cycle;
     const cycle = range?.cycle || cycleUsageAnalyzer(data?.windows || []);
     const stats = range?.stats || normalizeMetrics({});
-    const wrapper = section('周期分析');
+    const wrapper = el('div', 'wt-cycle-content');
     if (cycle.window) {
       wrapper.append(el('p', 'wt-range-caption', `当前周期：${cycle.window.label} · ${formatDate(cycle.startAt)} — ${formatDate(cycle.endAt)}`));
     } else {
@@ -1628,20 +1676,21 @@
     const metrics = [
       ['tokens', 'Tokens', stats.tokens === null ? '未提供' : formatCompactNumber(stats.tokens)],
       ['turns', 'Turns', stats.turns === null ? '未提供' : formatNumber(stats.turns)],
-      ['credits', 'Credits', stats.credits === null ? 'Credit数据不可用' : formatNumber(stats.credits)],
-      ['value', 'API 等价价值', runtime.state.costEstimate.valueUsd === null ? '暂不可用' : `$${runtime.state.costEstimate.valueUsd.toFixed(2)}`]
+      ['threads', 'Threads', stats.threads === null ? '未提供' : formatNumber(stats.threads)]
     ];
     metrics.forEach(([, label, value]) => {
       const card = el('div', 'wt-metric');
       card.append(el('span', 'wt-metric-label', label), el('strong', 'wt-metric-value', value));
       grid.append(card);
     });
-    wrapper.append(grid, renderCostCard(runtime.state.costEstimate));
+    wrapper.append(grid);
     const estimatedTotalCredits = range?.estimatedTotalCredits ?? estimatedCycleCredits(cycle, stats);
     const estimate = el('div', 'wt-notice wt-notice-info');
     estimate.append(el('strong', '', '周期额度推算：'), el('span', '', estimatedTotalCredits === null ? '暂无法推算' : `${formatNumber(estimatedTotalCredits)} Credits`));
     if (cycle.usedPercent !== null) estimate.append(el('span', 'wt-window-meta', `（已使用 ${formatPercent(cycle.usedPercent)}）`));
     wrapper.append(estimate, renderDailyBreakdown(range));
+    const dailyModelUsage = renderDailyModelUsage();
+    if (dailyModelUsage) wrapper.append(dailyModelUsage);
     return wrapper;
   }
 
@@ -1656,16 +1705,15 @@
     const table = el('table', 'wt-daily-table');
     const head = el('thead');
     const headerRow = el('tr');
-    ['日期', 'Tokens', 'Credits', 'API价值', 'Turns'].forEach((label) => headerRow.append(el('th', '', label)));
+    ['日期', 'Tokens', 'Turns', 'Threads', '主要模型'].forEach((label) => headerRow.append(el('th', '', label)));
     head.append(headerRow);
     const body = el('tbody');
     rows.slice().reverse().forEach((row) => {
-      const creditCost = usageCostProviders.creditProvider.resolveCost(row.metrics.credits);
       const tr = el('tr');
       const tokenText = row.metrics.tokens === null ? '未提供' : formatCompactNumber(row.metrics.tokens);
-      const creditText = row.metrics.credits === null ? 'Credit数据不可用' : `${formatNumber(row.metrics.credits)} Credits`;
-      const valueText = creditCost.valueUsd === null ? 'Credit数据不可用' : `$${creditCost.valueUsd.toFixed(2)}`;
-      [row.date, tokenText, creditText, valueText, row.metrics.turns === null ? '未提供' : formatNumber(row.metrics.turns)].forEach((value) => tr.append(el('td', '', value)));
+      const model = runtime.state.modelBreakdown.dailyRows.find((item) => item.date === row.date)?.rows[0];
+      const mainModel = model ? `${formatModelName(model.model)} · ${formatModelSpeed(model.speed)}` : '未提供';
+      [row.date, tokenText, row.metrics.turns === null ? '未提供' : formatNumber(row.metrics.turns), row.metrics.threads === null ? '未提供' : formatNumber(row.metrics.threads), mainModel].forEach((value) => tr.append(el('td', '', value)));
       body.append(tr);
     });
     table.append(head, body);
@@ -1676,7 +1724,7 @@
   function renderModelUsage() {
     const modelBreakdown = runtime.state.modelBreakdown;
     const wrapper = el('div', 'wt-subsection wt-model-usage');
-    wrapper.append(el('h4', 'wt-subtitle', '模型消耗占比'));
+    wrapper.append(el('h4', 'wt-subtitle', '模型使用占比'));
     if (modelBreakdown.loading) wrapper.append(el('p', 'wt-notice wt-notice-info', '正在读取模型使用情况。'));
     if (modelBreakdown.error) wrapper.append(el('p', 'wt-notice wt-notice-warning', `${modelBreakdown.error}；不会把该接口字段当作余额或 Token 数量。`));
     if (!modelBreakdown.rows.length) {
@@ -1684,23 +1732,79 @@
       return wrapper;
     }
     if (modelBreakdown.stale) wrapper.append(el('p', 'wt-notice wt-notice-warning', '模型使用情况显示上次成功结果。'));
-    for (const row of modelBreakdown.rows) {
-      const item = el('div', 'wt-model-usage-row');
-      const heading = el('div', 'wt-model-usage-heading');
-      heading.append(el('strong', 'wt-model-usage-name', formatModelName(row.model)), el('span', 'wt-model-usage-share', formatUsageShare(row.sharePercent)));
-      item.append(heading, el('span', 'wt-model-usage-speed', formatModelSpeed(row.speed)));
-      wrapper.append(item);
+    wrapper.append(el('p', 'wt-window-meta', '数据来自 Analytics；百分比表示模型使用占比，不代表 Credits 或 Tokens。'));
+    const chartShell = el('div', 'wt-model-pie-shell');
+    const visual = setAttributes(el('div', 'wt-model-pie'), {
+      role: 'img',
+      'aria-label': `模型使用占比：${modelBreakdown.rows.map((row) => `${formatModelName(row.model)} ${formatUsageShare(row.sharePercent)}`).join('，')}`
+    });
+    let cursor = 0;
+    const stops = modelBreakdown.rows.map((row, index) => {
+      const start = cursor;
+      cursor += row.sharePercent;
+      return `${modelUsageColor(index)} ${start}% ${cursor}%`;
+    });
+    visual.style.background = `conic-gradient(${stops.join(', ')})`;
+    chartShell.append(visual);
+    const legend = el('div', 'wt-model-pie-legend');
+    const tooltip = setAttributes(el('div', 'wt-pie-tooltip'), { role: 'tooltip', hidden: 'true', 'aria-hidden': 'true' });
+    const showTooltip = (item, temporary = false) => {
+      tooltip.textContent = item.dataset.tooltip || '';
+      tooltip.hidden = false;
+      tooltip.setAttribute('aria-hidden', 'false');
+      if (temporary) setTimeout(() => { tooltip.hidden = true; tooltip.setAttribute('aria-hidden', 'true'); }, 2200);
+    };
+    const hideTooltip = () => {
+      tooltip.hidden = true;
+      tooltip.setAttribute('aria-hidden', 'true');
+    };
+    modelBreakdown.rows.forEach((row, index) => {
+      const item = setAttributes(el('div', 'wt-model-pie-item'), {
+        tabindex: 0,
+        role: 'img',
+        'aria-label': `${formatModelName(row.model)}，${formatModelSpeed(row.speed)}，${formatUsageShare(row.sharePercent)}`,
+        'data-tooltip': `${formatModelName(row.model)} · ${formatModelSpeed(row.speed)}：${formatUsageShare(row.sharePercent)}`
+      });
+      item.append(el('span', 'wt-model-pie-swatch'), el('span', 'wt-model-pie-label', `${formatModelName(row.model)} · ${formatModelSpeed(row.speed)}`), el('strong', 'wt-model-usage-share', formatUsageShare(row.sharePercent)));
+      item.firstChild.style.background = modelUsageColor(index);
+      item.addEventListener('pointerenter', () => showTooltip(item));
+      item.addEventListener('pointerleave', hideTooltip);
+      item.addEventListener('focus', () => showTooltip(item));
+      item.addEventListener('blur', hideTooltip);
+      item.addEventListener('click', () => showTooltip(item, true));
+      legend.append(item);
+    });
+    chartShell.append(legend, tooltip);
+    wrapper.append(chartShell);
+    return wrapper;
+  }
+
+  function modelUsageColor(index) {
+    const colors = ['#3b82f6', '#8b5cf6', '#14b8a6', '#f59e0b', '#ef4444', '#ec4899', '#64748b'];
+    return colors[index % colors.length];
+  }
+
+  function renderDailyModelUsage() {
+    const dailyRows = runtime.state.modelBreakdown.dailyRows;
+    if (!dailyRows.length) return null;
+    const wrapper = el('div', 'wt-subsection wt-daily-model-usage');
+    wrapper.append(el('h4', 'wt-subtitle', '每日模型使用'));
+    for (const dailyRow of dailyRows) {
+      const day = el('div', 'wt-daily-model-day');
+      day.append(el('strong', 'wt-daily-model-date', dailyRow.date));
+      for (const row of dailyRow.rows) {
+        const item = el('div', 'wt-daily-model-row');
+        item.append(el('span', 'wt-model-usage-name', `${formatModelName(row.model)} · ${formatModelSpeed(row.speed)}`), el('strong', 'wt-model-usage-share', formatUsageShare(row.sharePercent)));
+        day.append(item);
+      }
+      wrapper.append(day);
     }
     return wrapper;
   }
 
-  function renderCostEstimate() {
-    return renderCostCard(runtime.state.costEstimate);
-  }
-
   function renderAnalytics(data) {
     const analytics = runtime.state.analytics;
-    const node = section('使用统计');
+    const node = el('div', 'wt-usage-content');
     node.append(renderRangeSelector());
     if (runtime.prefs.range === 'custom') node.append(renderCustomRangeEditor());
     const range = analytics.ranges[runtime.prefs.range] || analytics.ranges[analytics.lastGoodRange] || analytics.ranges['30d'];
@@ -1710,10 +1814,10 @@
     }
     if (!range || !range.stats || (!analytics.dailyRows.length && !analytics.loading)) {
       node.append(el('p', 'wt-empty', '当前账号或套餐未提供详细 Analytics'));
-      node.append(renderModelUsage(), renderCostEstimate());
+      node.append(renderModelUsage());
       return node;
     }
-    node.append(el('p', 'wt-range-caption', `当前范围：${range.label}`), renderStats(range.stats), renderModelUsage(), renderCostEstimate(), renderClientRows(analytics.clientRows, range.stats.tokens), renderChart(range.stats.rows));
+    node.append(el('p', 'wt-range-caption', `当前范围：${range.label}`), renderStats(range.stats), renderModelUsage(), renderClientRows(analytics.clientRows, range.stats.tokens), renderChart(range.stats.rows));
     return node;
   }
 
@@ -1808,7 +1912,7 @@
       const item = el('div', 'wt-client-row');
       const heading = el('div', 'wt-client-heading');
       heading.append(el('strong', 'wt-client-name', prettyName(row.clientId, '其他未知客户端')), el('span', 'wt-client-share', formatPercent(row.tokenShare)));
-      item.append(heading, el('span', 'wt-client-value', `${formatNumber(row.tokens)} Tokens · ${formatNumber(row.credits)} Credits · ${formatNumber(row.threads)} Threads · ${formatNumber(row.turns)} Turns`));
+      item.append(heading, el('span', 'wt-client-value', `${formatNumber(row.tokens)} Tokens · ${formatNumber(row.threads)} Threads · ${formatNumber(row.turns)} Turns`));
       item.append(createProgress(totalTokens ? row.tokenShare : null, `${row.clientId} Token 占比`));
       wrapper.append(item);
     }
@@ -1947,87 +2051,29 @@
     return creditDiagnosticAvailable() ? 'daily-workspace' : 'unavailable';
   }
 
-  function capabilityText(provider, value) {
-    if (provider.status === 'unknown') return '未检测';
-    if (provider.status === 'available' && !provider.threadUsageSupported) return '未返回';
-    return value ? '支持' : '不支持';
-  }
-
-  function renderThreadUsageCapability() {
-    const provider = runtime.state.threadUsageProvider;
-    const block = el('div', 'wt-thread-usage');
-    block.append(el('strong', 'wt-subtitle', 'Thread Usage API'));
-    const fields = el('div', 'wt-field-grid');
-    fields.append(
-      field('状态', threadUsageStatusLabel(provider)),
-      field('Token 明细', capabilityText(provider, provider.supportsTokenBreakdown)),
-      field('USD 服务端估算', capabilityText(provider, provider.supportsUsdEstimate)),
-      field('Credits 服务端估算', capabilityText(provider, provider.supportsCreditEstimate))
-    );
-    if (provider.httpStatus !== null) fields.append(field('HTTP', provider.httpStatus));
-    if (provider.checkedAt !== null) fields.append(field('最后检测', formatDate(provider.checkedAt)));
-    block.append(fields);
-    const message = threadUsageErrorMessage(provider);
-    if (message) block.append(el('p', `wt-notice ${provider.status === 'error' ? 'wt-notice-danger' : 'wt-notice-info'}`, message));
-    const action = setAttributes(el('button', 'wt-button wt-button-secondary'), {
-      type: 'button',
-      'data-action': 'open-thread-usage-dialog',
-      disabled: runtime.ui.threadUsageProbeLoading ? 'true' : null
-    });
-    action.textContent = '检测 Thread Usage 能力';
-    block.append(action);
-    return block;
-  }
-
-  function renderThreadUsageDialog() {
-    const provider = runtime.state.threadUsageProvider;
-    const dialog = setAttributes(el('div', 'wt-thread-usage-dialog'), { role: 'dialog', 'aria-modal': 'false', 'aria-labelledby': 'wt-thread-usage-dialog-title' });
-    const title = el('strong', 'wt-subtitle', 'Thread Usage 能力检测');
-    title.id = 'wt-thread-usage-dialog-title';
-    dialog.append(title);
-    const prompt = el('p', 'wt-thread-usage-prompt', '请输入一个 Codex thread id 用于检测');
-    const label = el('label', 'wt-thread-usage-label', 'Thread ID:');
-    const input = setAttributes(el('input', 'wt-thread-usage-input'), {
-      type: 'text',
-      name: 'thread-usage-id',
-      value: runtime.ui.threadUsageInput,
-      placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
-      autocomplete: 'off',
-      spellcheck: 'false',
-      'aria-describedby': 'wt-thread-usage-dialog-hint'
-    });
-    input.addEventListener('input', () => {
-      runtime.ui.threadUsageInput = input.value;
-      runtime.ui.threadUsageValidationError = null;
-    });
-    label.append(input);
-    const hint = el('p', 'wt-date-hint', '仅在本页内存中使用，不会保存。');
-    hint.id = 'wt-thread-usage-dialog-hint';
-    dialog.append(prompt, label, hint);
-    if (runtime.ui.threadUsageValidationError) dialog.append(el('p', 'wt-date-error', runtime.ui.threadUsageValidationError));
-    const message = threadUsageErrorMessage(provider);
-    if (message) dialog.append(el('p', `wt-notice ${provider.status === 'error' ? 'wt-notice-danger' : 'wt-notice-info'}`, message));
-    const actions = el('div', 'wt-thread-usage-actions');
-    const probe = setAttributes(el('button', 'wt-button'), { type: 'button', 'data-action': 'probe-thread-usage', disabled: runtime.ui.threadUsageProbeLoading ? 'true' : null });
-    probe.textContent = runtime.ui.threadUsageProbeLoading ? '检测中…' : '检测';
-    const close = setAttributes(el('button', 'wt-button wt-button-secondary'), { type: 'button', 'data-action': 'close-thread-usage-dialog' });
-    close.textContent = '关闭';
-    actions.append(probe, close);
-    dialog.append(actions);
-    return dialog;
+  function dataSourceStatus(status, available = false) {
+    if (available) return 'available';
+    return typeof status === 'number' && status >= 200 && status < 300 ? 'available' : 'unavailable';
   }
 
   function renderDiagnostics() {
-    const details = el('details', 'wt-diagnostics');
-    details.append(el('summary', '诊断信息'));
-    const costAnalysis = el('div', 'wt-cost-diagnostics');
-    costAnalysis.append(el('strong', 'wt-subtitle', 'Cost Analysis'));
-    costAnalysis.append(field('creditAvailable', creditDiagnosticAvailable()), field('creditSource', creditDiagnosticSource()), field('costSource', runtime.state.diagnostics.costProviderSource), field('confidence', runtime.state.diagnostics.costConfidence));
-    details.append(costAnalysis);
+    const content = el('div', 'wt-diagnostics');
+    const sources = el('div', 'wt-data-sources');
+    sources.append(el('h4', 'wt-subtitle', 'Data Sources'));
+    const sourceGrid = el('div', 'wt-field-grid');
+    sourceGrid.append(
+      field('Workspace Analytics', dataSourceStatus(runtime.state.diagnostics.analyticsStatus, runtime.state.analytics.dailyRows.length > 0)),
+      field('Model Breakdown', dataSourceStatus(runtime.state.diagnostics.modelBreakdownStatus, runtime.state.modelBreakdown.units === 'percent')),
+      field('Thread Usage', runtime.state.threadUsageProvider.status === 'available' ? 'available' : 'unavailable'),
+      field('Credit', creditDiagnosticAvailable() ? 'available' : 'unavailable'),
+      field('costCapability', 'unavailable')
+    );
+    sources.append(sourceGrid);
+    content.append(sources);
     const lines = [
       ['脚本版本', VERSION], ['当前路径', safeDiagnosticPath()], ['Usage HTTP 状态', runtime.state.diagnostics.usageStatus || '未请求'],
       ['Analytics HTTP 状态', runtime.state.diagnostics.analyticsStatus || '未请求'], ['model breakdown status', runtime.state.diagnostics.modelBreakdownStatus || '未请求'],
-      ['model rows count', runtime.state.diagnostics.modelRows], ['cost provider source', runtime.state.diagnostics.costProviderSource], ['cost confidence', runtime.state.diagnostics.costConfidence], ['请求模式', runtime.state.diagnostics.usageMode],
+      ['model rows count', runtime.state.diagnostics.modelRows], ['请求模式', runtime.state.diagnostics.usageMode],
       ['获取时间', formatDate(runtime.state.fetchedAt)], ['原始 plan_type', runtime.state.data && runtime.state.data.plan.rawType],
       ['当前选中范围', runtime.prefs.range], ['自定义开始日期', runtime.prefs.customStart || '未提供'], ['自定义结束日期', runtime.prefs.customEnd || '未提供'],
       ['Analytics coverage', runtime.state.analytics.coverage.start ? `${runtime.state.analytics.coverage.start}..${runtime.state.analytics.coverage.end}` : '未覆盖'],
@@ -2036,34 +2082,30 @@
       ['成功解析窗口数量', runtime.state.diagnostics.windowCount], ['主额度窗口数量', runtime.state.diagnostics.primaryWindowCount], ['额外额度窗口数量', runtime.state.diagnostics.additionalWindowCount], ['每日数据行数', runtime.state.diagnostics.dailyRows],
       ['客户端类型', runtime.state.diagnostics.clientTypes.join(', ') || '未提供'], ['未识别顶层字段', runtime.state.diagnostics.unknownFields.join(', ') || '无'], ['错误代码', runtime.state.diagnostics.errors.join(', ') || '无']
     ];
-    for (const [label, value] of lines) details.append(field(label, value));
+    for (const [label, value] of lines) content.append(field(label, value));
     for (const window of runtime.state.diagnostics.windows) {
       const summary = `${window.label} · ${window.sourcePath}`;
-      details.append(field('窗口', `${summary} · 周期 ${window.durationSeconds === null ? '未提供' : `${window.durationSeconds} 秒`} · used ${window.hasUsedPercent ? '已识别' : '未提供'} · resetAt ${window.hasResetAt ? '已识别' : '未提供'}`));
+      content.append(field('窗口', `${summary} · 周期 ${window.durationSeconds === null ? '未提供' : `${window.durationSeconds} 秒`} · used ${window.hasUsedPercent ? '已识别' : '未提供'} · resetAt ${window.hasResetAt ? '已识别' : '未提供'}`));
     }
-    details.append(renderThreadUsageCapability());
-    if (runtime.ui.threadUsageDialogOpen) details.append(renderThreadUsageDialog());
     const copy = el('button', 'wt-button wt-button-secondary', '复制诊断信息');
     copy.type = 'button';
     copy.dataset.action = 'copy-diagnostics';
-    details.append(copy);
-    return details;
+    content.append(copy);
+    return collapsibleSection('diagnostics', '诊断信息', content, true);
   }
 
   function diagnosticText() {
-    const threadUsage = runtime.state.threadUsageProvider;
     const lines = [
       `脚本版本: ${VERSION}`, `当前路径: ${safeDiagnosticPath()}`, `Usage HTTP 状态: ${runtime.state.diagnostics.usageStatus || '未请求'}`,
-      `Analytics HTTP 状态: ${runtime.state.diagnostics.analyticsStatus || '未请求'}`, `model breakdown status: ${runtime.state.diagnostics.modelBreakdownStatus || '未请求'}`, `model rows count: ${runtime.state.diagnostics.modelRows}`, `cost provider source: ${runtime.state.diagnostics.costProviderSource}`, `cost confidence: ${runtime.state.diagnostics.costConfidence}`, `请求模式: ${runtime.state.diagnostics.usageMode}`,
+      `Analytics HTTP 状态: ${runtime.state.diagnostics.analyticsStatus || '未请求'}`, `model breakdown status: ${runtime.state.diagnostics.modelBreakdownStatus || '未请求'}`, `model rows count: ${runtime.state.diagnostics.modelRows}`, `请求模式: ${runtime.state.diagnostics.usageMode}`,
       `获取时间: ${formatDate(runtime.state.fetchedAt)}`, `原始 plan_type: ${runtime.state.data ? runtime.state.data.plan.rawType || '未提供' : '未提供'}`,
       `当前选中范围: ${runtime.prefs.range}`, `自定义开始日期: ${runtime.prefs.customStart || '未提供'}`, `自定义结束日期: ${runtime.prefs.customEnd || '未提供'}`,
       `Analytics coverage: ${runtime.state.analytics.coverage.start ? `${runtime.state.analytics.coverage.start}..${runtime.state.analytics.coverage.end}` : '未覆盖'}`,
       `最后一次 Analytics 请求范围: ${runtime.state.analytics.lastRequest ? `${runtime.state.analytics.lastRequest.start}..${runtime.state.analytics.lastRequest.end}` : '未请求'}`,
       `命中内存 coverage: ${runtime.state.analytics.cacheHit ? '是' : '否'}`, `当前范围日期桶数: ${runtime.state.analytics.selectedBucketCount}`,
-      `creditAvailable=${creditDiagnosticAvailable()}`, `creditSource=${creditDiagnosticSource()}`, `costSource=${runtime.state.diagnostics.costProviderSource}`, `confidence=${runtime.state.diagnostics.costConfidence}`,
+      `Workspace Analytics=${dataSourceStatus(runtime.state.diagnostics.analyticsStatus, runtime.state.analytics.dailyRows.length > 0)}`, `Model Breakdown=${dataSourceStatus(runtime.state.diagnostics.modelBreakdownStatus, runtime.state.modelBreakdown.units === 'percent')}`, `Thread Usage=${runtime.state.threadUsageProvider.status === 'available' ? 'available' : 'unavailable'}`, `Credit=${creditDiagnosticAvailable() ? 'available' : 'unavailable'}`, 'costCapability=unavailable',
       `成功解析窗口数量: ${runtime.state.diagnostics.windowCount}`, `主额度窗口数量: ${runtime.state.diagnostics.primaryWindowCount}`, `额外额度窗口数量: ${runtime.state.diagnostics.additionalWindowCount}`, `每日数据行数: ${runtime.state.diagnostics.dailyRows}`,
-      `客户端类型: ${runtime.state.diagnostics.clientTypes.join(', ') || '未提供'}`, `未识别顶层字段: ${runtime.state.diagnostics.unknownFields.join(', ') || '无'}`, `错误代码: ${runtime.state.diagnostics.errors.join(', ') || '无'}`,
-      `threadUsageStatus=${threadUsage.status}`, `threadUsageTokenBreakdown=${threadUsage.supportsTokenBreakdown}`, `threadUsageUsdEstimate=${threadUsage.supportsUsdEstimate}`, `threadUsageCreditEstimate=${threadUsage.supportsCreditEstimate}`, `threadUsageCheckedAt=${threadUsage.checkedAt === null ? '未检测' : formatDate(threadUsage.checkedAt)}`
+      `客户端类型: ${runtime.state.diagnostics.clientTypes.join(', ') || '未提供'}`, `未识别顶层字段: ${runtime.state.diagnostics.unknownFields.join(', ') || '无'}`, `错误代码: ${runtime.state.diagnostics.errors.join(', ') || '无'}`
     ];
     for (const window of runtime.state.diagnostics.windows) {
       lines.push(`窗口: ${window.label} | ${window.sourcePath} | durationSeconds=${window.durationSeconds === null ? 'null' : window.durationSeconds} | usedPercent=${window.hasUsedPercent ? 'present' : 'missing'} | resetAt=${window.hasResetAt ? 'present' : 'missing'}`);
@@ -2124,14 +2166,13 @@
     if (runtime.state.loading && !runtime.state.data) body.append(el('div', 'wt-loading', '正在读取账户与额度…'));
     if (runtime.state.error) body.append(el('div', `wt-notice ${runtime.state.data ? 'wt-notice-warning' : 'wt-notice-danger'}`, `${runtime.state.data ? '刷新未完成，继续显示上次成功数据：' : ''}${runtime.state.error}`));
     if (runtime.state.data) {
-      const credits = renderCredits(runtime.state.data);
-      body.append(renderAccountSummary(runtime.state.data));
-      const windows = section('额度窗口');
+      body.append(collapsibleSection('account', '账户摘要', renderAccountSummary(runtime.state.data)));
+      const windows = el('div', 'wt-quota-content');
       if (runtime.state.data.windows.length) runtime.state.data.windows.forEach((item) => windows.append(renderWindow(item)));
       else windows.append(el('p', 'wt-empty', '接口未提供有效额度窗口'));
-      body.append(windows, renderCycleAnalysis(runtime.state.data));
-      if (credits) body.append(credits);
-      body.append(renderAnalytics(runtime.state.data));
+      body.append(collapsibleSection('quota', '额度窗口', windows));
+      body.append(collapsibleSection('stats', '使用统计', renderAnalytics(runtime.state.data)));
+      body.append(collapsibleSection('cycle', '周期分析', renderCycleAnalysis(runtime.state.data)));
     }
     body.addEventListener('scroll', () => {
       const tooltip = runtime.shadow?.querySelector('.wt-chart-tooltip');
@@ -2161,7 +2202,8 @@
       session: runtime.ui.panelSession,
       scrollTop: body.scrollTop,
       focus,
-      details: [...body.querySelectorAll('details')].map((detail) => detail.open)
+      details: [...body.querySelectorAll('details')].map((detail) => detail.open),
+      sections: SECTION_IDS.map((id) => ({ id, collapsed: runtime.prefs.sectionCollapsed[id] === true }))
     };
   }
 
@@ -2174,6 +2216,14 @@
     [...body.querySelectorAll('details')].forEach((detail, index) => {
       if (state.details[index] !== undefined) detail.open = state.details[index];
     });
+    for (const sectionState of state.sections || []) {
+      const section = [...body.querySelectorAll('[data-section]')].find((node) => node.dataset.section === sectionState.id);
+      const sectionBody = section?.querySelector('.wt-section-body');
+      const toggle = section?.querySelector('[data-action="toggle-section"]');
+      if (!sectionBody || !toggle) continue;
+      sectionBody.hidden = sectionState.collapsed;
+      toggle.setAttribute('aria-expanded', String(!sectionState.collapsed));
+    }
     const focus = state.focus;
     if (!focus) return;
     let target = null;
@@ -2391,24 +2441,14 @@
     if (action === 'toggle') {
       if (runtime.dragSuppressUntil && Date.now() < runtime.dragSuppressUntil) return;
       runtime.prefs.collapsed = !runtime.prefs.collapsed; writePreference(PREF_KEYS.collapsed, runtime.prefs.collapsed); render();
+    } else if (action === 'toggle-section') {
+      const id = actionTarget.dataset.sectionId;
+      if (!SECTION_IDS.includes(id)) return;
+      runtime.prefs.sectionCollapsed[id] = !runtime.prefs.sectionCollapsed[id];
+      writePreference(PREF_KEYS.sections, runtime.prefs.sectionCollapsed);
+      render();
     } else if (action === 'refresh') {
       refresh();
-    } else if (action === 'open-thread-usage-dialog') {
-      runtime.ui.threadUsageDialogOpen = true;
-      runtime.ui.threadUsageInput = currentPageThreadId();
-      runtime.ui.threadUsageValidationError = null;
-      render();
-      requestAnimationFrame(() => runtime.shadow?.querySelector('[name="thread-usage-id"]')?.focus());
-    } else if (action === 'close-thread-usage-dialog') {
-      runtime.threadUsageAbortController?.abort();
-      runtime.threadUsageAbortController = null;
-      runtime.ui.threadUsageDialogOpen = false;
-      runtime.ui.threadUsageInput = '';
-      runtime.ui.threadUsageValidationError = null;
-      runtime.ui.threadUsageProbeLoading = false;
-      render();
-    } else if (action === 'probe-thread-usage') {
-      beginThreadUsageProbe();
     } else if (action === 'copy-diagnostics') {
       if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
         actionTarget.textContent = '复制不可用';
@@ -2449,6 +2489,30 @@
       .wt-diagnostics { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 12px; padding-top: 10px; } .wt-diagnostics summary { margin-bottom: 8px; } .wt-diagnostics .wt-field { margin: 6px 0; } .wt-thread-usage { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 10px; padding-top: 10px; } .wt-thread-usage-dialog { background: var(--wt-color-surface); border: 1px solid var(--wt-color-border); border-radius: 10px; margin-top: 10px; padding: 10px; } .wt-thread-usage-prompt, .wt-thread-usage-label { color: var(--wt-color-text-secondary); font-size: 12px; } .wt-thread-usage-prompt { margin: 6px 0 8px; } .wt-thread-usage-label { display: flex; flex-direction: column; gap: 4px; } .wt-thread-usage-input { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 8px; color: var(--wt-color-text); min-height: 38px; min-width: 0; padding: 7px; } .wt-thread-usage-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; } .wt-button:disabled, .wt-icon-button:disabled { cursor: wait; opacity: .6; } .wt-loading { min-height: 120px; padding-top: 18px; } .wt-chart-select { margin-left: auto; }
       @keyframes wt-spin { to { transform: rotate(360deg); } } @media (max-width: 480px) { :host([data-wt-mode="expanded"]) { width: calc(100vw - 24px); } .wt-body { max-height: 68vh; padding-left: 12px; padding-right: 12px; } .wt-header { padding-left: 12px; padding-right: 12px; } } @media (max-width: 340px) { .wt-account-summary { align-items: start; } .wt-account-side { align-items: flex-start; grid-column: 1 / -1; padding-left: 44px; } .wt-date-fields { grid-template-columns: 1fr; } .wt-range-button { padding-left: 8px; padding-right: 8px; } }
       @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; } }
+    `;
+    style.textContent += `
+      .wt-progress::after { background: var(--wt-progress-color, var(--wt-color-chart)); }
+      .wt-section-toggle { align-items: center; background: transparent; border: 0; color: var(--wt-color-text); cursor: pointer; display: flex; font: inherit; justify-content: space-between; min-height: 36px; padding: 0; text-align: left; width: 100%; }
+      .wt-section-toggle:hover { color: var(--wt-color-primary-hover); }
+      .wt-section-toggle .wt-section-title { margin: 0; }
+      .wt-section-chevron { color: var(--wt-color-text-secondary); font-size: 17px; line-height: 1; transition: transform 140ms ease; }
+      .wt-section-toggle[aria-expanded="false"] .wt-section-chevron { transform: rotate(-90deg); }
+      .wt-section-body { padding-bottom: 2px; }
+      .wt-account-credits { margin-top: 12px; }
+      .wt-model-pie-shell { align-items: center; display: grid; gap: 14px; grid-template-columns: 132px minmax(0, 1fr); margin-top: 10px; position: relative; }
+      .wt-model-pie { aspect-ratio: 1; border: 1px solid var(--wt-color-border); border-radius: 50%; box-shadow: inset 0 0 0 22px var(--wt-color-bg); min-width: 0; }
+      .wt-model-pie-legend { min-width: 0; }
+      .wt-model-pie-item { align-items: center; border-bottom: 1px solid var(--wt-color-border-subtle); cursor: default; display: grid; gap: 6px; grid-template-columns: 9px minmax(0, 1fr) auto; padding: 7px 0; }
+      .wt-model-pie-item:focus-visible { outline: 2px solid var(--wt-color-focus); outline-offset: 2px; }
+      .wt-model-pie-swatch { border-radius: 50%; height: 9px; width: 9px; }
+      .wt-model-pie-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .wt-pie-tooltip { background: var(--wt-color-surface); border: 1px solid var(--wt-color-border); border-radius: 8px; box-shadow: 0 8px 24px rgb(0 0 0 / 18%); color: var(--wt-color-text); font-size: 11px; left: 50%; max-width: calc(100% - 8px); padding: 7px 9px; pointer-events: none; position: absolute; top: 4px; transform: translateX(-50%); white-space: nowrap; z-index: 2; }
+      .wt-pie-tooltip[hidden] { display: none; }
+      .wt-daily-model-day { border-bottom: 1px solid var(--wt-color-border-subtle); padding: 8px 0; }
+      .wt-daily-model-date { display: block; margin-bottom: 4px; }
+      .wt-daily-model-row { align-items: center; color: var(--wt-color-text-secondary); display: flex; font-size: 11px; gap: 8px; justify-content: space-between; padding: 3px 0; }
+      .wt-daily-model-row .wt-model-usage-share { color: var(--wt-color-text); }
+      @media (max-width: 340px) { .wt-model-pie-shell { grid-template-columns: 1fr; } .wt-model-pie { margin: auto; width: 132px; } }
     `;
     return style;
   }
