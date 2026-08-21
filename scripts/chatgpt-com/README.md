@@ -2,7 +2,7 @@
 
 `account-usage-dashboard.user.js` adds a small floating usage icon to `chatgpt.com`. Click it to open the full, draggable account-usage panel. It is a standalone Tampermonkey/Violentmonkey userscript and does not require a build step, package manager, or remote dependency.
 
-Version 1.3.0 adds model-usage semantics and a diagnostic-only Thread Usage capability probe. The probe checks whether the current account can query one real Codex thread; it does not calculate billing.
+Version 1.4.0 adds cycle analysis, Codex Credit consumption analysis, API-equivalent value, and a daily cost breakdown. It keeps the model-breakdown endpoint's percentage semantics separate from real Codex Credits.
 
 ## Installation
 
@@ -15,6 +15,7 @@ The script only makes same-origin, read-only requests to the current ChatGPT pag
 - `/api/auth/session` supplies the display name, masked email, and narrowly selected in-memory authentication fallback fields.
 - `/backend-api/wham/usage` supplies the plan, rate-limit windows, credits, and usage state.
 - `/backend-api/wham/analytics/daily-workspace-usage-counts` supplies one date range of optional daily statistics, which is then filtered and aggregated in memory for the displayed ranges.
+- `daily-workspace-usage-counts[].totals.credits` is the Codex Credit source. Positive Credits are converted at `USD = Credits * 0.04` (`1000 Credits ≈ $40`); missing or zero Credits remain unavailable rather than becoming a fake `$0`.
 - `/backend-api/wham/usage/daily-token-usage-breakdown` is the Analytics data source for the model-usage breakdown. Its `credits` field is interpreted according to the response's `units: "percent"` declaration as a percentage/model-usage share, not as the dashboard's Credits field and not as a token percentage.
 - `/backend-api/wham/usage/thread_usage/query` is used only after the user starts the diagnostic action and supplies a real UUID-form Codex thread ID. It receives one `POST` body containing that ID and is never used for automatic history scanning.
 
@@ -27,10 +28,12 @@ The compact view is only an icon with an optional health dot; it does not show t
 - signed-in state, display name, masked email, plan context (including `Pro Lite` as a plan tier), usage status, and update time;
 - every recognized primary and additional rate-limit window, with duration, used/remaining percentages, progress, reset time, countdown, and limit state;
 - optional Credits and spend-control fields only when the server supplies values, without treating missing or `null` values as zero;
+- current cycle analysis derived from each quota window's `reset_at - limit_window_seconds`, including Tokens, Turns, Credits, API-equivalent value, and an optional estimated cycle capacity;
+- a daily breakdown with date, Tokens, Credits, API value, and Turns. Daily API value is shown only when that row has positive `totals.credits`;
 - current quota period, month, last 7 days, and last 30 days, including server-supplied Credits, token classes, threads, turns, and dates with data;
 - client aggregates sorted by tokens and a native CSS bar chart for the selected daily metric;
 - model usage rows when the model-breakdown data is available: the same model and speed are merged, rows are sorted in descending share order, zero-valued rows are hidden, and the value is shown as a percentage/model-usage share. The field is never presented as `Credits`, `Token usage`, or a fabricated token count;
-- source-aware cost status. A real server-side cost is labeled separately from an API-equivalent estimate. When model-level Token attribution is unavailable, no dollar amount is shown and the UI explains `API 等价成本暂不可计算` because the current interface provides model share but not model-level Token details;
+- source-aware API-equivalent value status with a visible source and confidence. The dashboard never labels subscription usage as actual billing;
 - manual refresh;
 - fixed five-minute automatic refresh;
 - opening official Analytics in a new tab;
@@ -50,29 +53,31 @@ The launcher and expanded panel share one size-independent viewport anchor. Expa
 
 The model-usage breakdown belongs to Usage Statistics and comes from ChatGPT Analytics. A response with `units: "percent"` makes each model/speed value a usage percentage or model share. The source field is named `credits`, but the UI must not call it Credits, Token usage, or token percentage. Same-model/same-speed entries are merged before descending sorting; zero values are omitted, and no token count is inferred from a percentage.
 
-Cost presentation must distinguish two meanings:
+Cost source priority is explicit:
 
-- **Real server cost:** an authoritative amount from a future `thread_api` source, labeled as a server-reported cost.
-- **API-equivalent estimate:** an estimate from reliable model-level input, cached-input, and output Token attribution, labeled as an estimate rather than billing.
+1. authoritative USD returned by `/backend-api/wham/usage/thread_usage/query`;
+2. positive `daily-workspace-usage-counts[].totals.credits`, converted with `Credits * 0.04`;
+3. reliable model-level Token pricing;
+4. unavailable.
 
-If neither source is available, the panel must show no dollar amount and explain that the current interface provides model share but not model-level Token details. The dashboard does not claim real billing from model percentages.
+Every result contains `valueUsd`, `source`, and `confidence`. A value is labeled `API 等价价值`, never actual billing. When the source field is `units: "percent"`, model `credits` values remain percentages (`模型消耗占比`) and never enter the USD conversion.
 
-The integration boundary reserves the following internal architecture for 1.3.0-compatible implementations:
+The integration boundary uses the following provider architecture:
 
 - `MODEL_PRICING` is a per-model table with input, cached-input, output prices, and an effective date. It must cover `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5`; it must not substitute one global price for all models.
 - A rate card entry with no source-confirmed price remains unavailable rather than becoming a guessed amount; the current UI never turns model share into a dollar value.
 - `estimateApiCost({ model, inputTokens, cachedInputTokens, outputTokens })` calculates uncached input cost plus cached input cost plus output cost. It must not multiply total Tokens by an average price or multiply a percentage by USD.
-- `usageCostProviders` keeps `analyticsProvider` separate from `threadUsageProvider`. The Thread Usage provider is diagnostic-only: it reports endpoint and response capabilities but does not feed cost calculation, USD display, Credits conversion, or token billing estimation.
+- `usageCostProviders` contains `threadUsageProvider`, `creditProvider`, and `tokenPricingProvider`. The Credit provider is the only provider allowed to convert daily-workspace Credits. A zero Credit value with positive Tokens is shown as `Credit数据不可用`, not `$0`.
 
 ## Thread Usage capability probe
 
 The collapsed `诊断信息` area contains `检测 Thread Usage 能力`. The small dialog accepts a UUID-form Codex thread ID, prefilling the current `/c/<thread-id>` page ID only when it is already present in the page URL. A valid ID triggers exactly one `POST /backend-api/wham/usage/thread_usage/query` request with `{"thread_ids":["<thread-id>"]}`; an invalid UUID is rejected before any request. The value is kept in memory only and is cleared on page refresh or when the dialog closes.
 
-The probe reports four independent facts: whether the endpoint responded, whether thread data was returned, whether any group exposed Token fields, and whether the response exposed server-estimated USD or Credits micros fields. A 200 response with an empty `threads` array is reported as `接口可访问，但没有返回可查询线程数据`, not as a definitive account restriction. A 403 means the endpoint exists but the account may not have permission; a 404 means the endpoint is unavailable or hidden; a timeout is reported as `检测超时`. The thread ID is visible only in the temporary input; no response body, thread ID, account ID, cookie, access token, or authorization header is shown in diagnostics or copied.
+The probe reports four independent facts: whether the endpoint responded, whether thread data was returned, whether any group exposed Token fields, and whether the response exposed server-estimated USD or Credits micros fields. If authoritative USD micros are present, that in-memory result has the highest cost priority; otherwise daily Codex Credits remain the next source. A 200 response with an empty `threads` array is reported as `接口可访问，但没有返回可查询线程数据`, not as a definitive account restriction. A 403 means the endpoint exists but the account may not have permission; a 404 means the endpoint is unavailable or hidden; a timeout is reported as `检测超时`. The thread ID is visible only in the temporary input; no response body, thread ID, account ID, cookie, access token, or authorization header is shown in diagnostics or copied.
 
 ## Safe diagnostics
 
-Diagnostics may expose only redacted state useful for troubleshooting: model-breakdown status, model-row count, cost-provider source, cost confidence, and Thread Usage status/capabilities/check time. They must never expose Tokens, cookies, authorization values, account IDs, thread IDs, raw responses, or other authentication material. The same rule applies to the UI, console, clipboard, and persistent storage.
+Diagnostics may expose only redacted state useful for troubleshooting: `creditAvailable`, `creditSource=daily-workspace`, `costSource`, confidence, model-breakdown status, model-row count, and Thread Usage status/capabilities/check time. They must never expose Token values, cookies, authorization values, account IDs, thread IDs, raw responses, or other authentication material. The same rule applies to the UI, console, clipboard, and persistent storage.
 
 ## Plan labels and quota semantics
 
@@ -105,7 +110,7 @@ The script only sends requests to `chatgpt.com`. It does not upload account or u
 - `plan_type` is a plan label, not proof of the complete billing or subscription lifecycle. The panel does not infer subscription validity from a plan name.
 - Analytics data may be delayed or unavailable for an account or plan. Daily aggregation uses UTC date buckets where possible; the trend does not estimate or interpolate values.
 - The model-breakdown Analytics data may be delayed or unavailable. Its percentages describe model usage share only; they do not provide model-level Token attribution, and therefore cannot support a dollar amount on their own.
-- The Thread Usage capability probe does not calculate cost. Even when server-estimated USD or Credits fields are detected, they are reported only as capabilities; the dashboard does not display them as billing or convert Credits to USD.
+- Thread Usage is queried only after an explicit diagnostic action and needs a real thread ID. Its authoritative USD, when returned, has priority for the in-memory value result; absence of that field falls through to daily Codex Credits. No result is presented as actual ChatGPT billing.
 - When a current quota period is represented as daily rows, the reset day can include data from outside the exact quota boundary.
 - Percentages are shown only when supplied or safely derived from the other percentage; unknown percentages use an empty track and an explicit notice rather than a fabricated grey fill. The script does not invent an official total quota, message count, or token total.
 - A real signed-in browser session is required for live account data. This repository validation cannot guarantee access to a user's private ChatGPT session.
@@ -120,11 +125,11 @@ On a disposable browser profile or a signed-in ChatGPT session, verify:
 4. Light and dark themes, narrow viewports, keyboard focus, reduced motion, and screen-reader labels remain usable.
 5. Signed-out, 401/403, 404, 429, timeout, empty-analytics, and partial-schema states remain understandable.
 6. A usage response with missing, `null`, unknown, snake_case, camelCase, single-window, array, object, and additional-window shapes renders without an uncaught exception.
-7. Analytics ranges and client aggregates derive from one daily request, the daily trend Tooltip matches the returned row value, the model breakdown is identified as a percentage/model share from Analytics, and the title-bar Analytics link works.
+7. Analytics ranges and client aggregates derive from one daily request, the daily trend Tooltip matches the returned row value, the model breakdown is identified as a percentage/model share from Analytics, the cycle summary uses the quota window reset calculation, and the title-bar Analytics link works.
 8. The title bar contains only refresh, official Analytics, and collapse; no footer settings/link block is rendered.
 9. The Thread Usage diagnostic rejects an invalid UUID without a network request, sends only the documented POST for a valid ID, and keeps the input out of storage and copied diagnostics.
 10. Mock 403, 404, 429, 5xx, timeout, and 200-empty-thread responses remain understandable; the empty response is not labeled as a definitive unsupported account.
-11. Cost UI shows no amount without authoritative cost or reliable model-level Token attribution, and distinguishes server cost from API-equivalent estimation.
+11. Positive `totals.credits` displays Credits and `Credits * 0.04`; `credits=0` with positive Tokens displays `Credit数据不可用` without `$0`; the daily table never shows API value without row Credits; model percentages never become USD.
 12. The console and copied diagnostics contain no token, cookie, account ID, thread ID, raw response, or full email; safe Thread Usage fields are limited to status, HTTP result, capability booleans, and check time.
 
 ## Maintenance notes

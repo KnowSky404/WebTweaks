@@ -2,7 +2,7 @@
 // @name         ChatGPT Account Usage Dashboard
 // @name:zh-CN   ChatGPT 账户用量浮窗
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.3.0
+// @version      1.4.0
 // @description  Display the current ChatGPT account plan, Codex limits, credits, and usage analytics in a private floating dashboard.
 // @description:zh-CN 在 ChatGPT 页面显示当前账号套餐、Codex 额度、Credits 与使用统计。
 // @author       KnowSky404
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.3.0';
+  const VERSION = '1.4.0';
   const HOST_ID = 'wt-chatgpt-account-usage-host';
   const SESSION_ENDPOINT = '/api/auth/session';
   const USAGE_ENDPOINT = '/backend-api/wham/usage';
@@ -40,6 +40,7 @@
     offsetY: 96
   });
   const MAX_CUSTOM_RANGE_DAYS = 366;
+  const CREDIT_USD_RATE = 0.04;
   const METRIC_KEYS = Object.freeze(['credits', 'tokens', 'cachedInputTokens', 'uncachedInputTokens', 'outputTokens', 'threads', 'turns']);
   // Keep unsupported rate cards explicit; missing prices must never become a guessed UI amount.
   const MODEL_PRICING = Object.freeze({
@@ -52,15 +53,30 @@
     source: 'thread_api',
     confidence: 'authoritative',
     endpoint: THREAD_USAGE_ENDPOINT,
-    diagnosticOnly: true,
-    costAvailable: false,
+    diagnosticOnly: false,
+    costAvailable: true,
     createState: createThreadUsageProviderState,
     inspect: inspectThreadUsageResponse,
+    resolveCost: resolveThreadUsageCost,
     probe: probeThreadUsage
   });
+  const creditProvider = Object.freeze({
+    source: 'codex-credit',
+    confidence: 'high',
+    endpoint: ANALYTICS_ENDPOINT,
+    readCredits: readDailyCredits,
+    resolveCost: resolveCreditCost
+  });
+  const tokenPricingProvider = Object.freeze({
+    source: 'token-pricing',
+    confidence: 'estimated',
+    estimate: estimateApiCost,
+    resolve: resolveTokenPricingCost
+  });
   const usageCostProviders = Object.freeze({
-    analyticsProvider: Object.freeze({ source: 'unknown', confidence: 'unknown', endpoint: MODEL_BREAKDOWN_ENDPOINT }),
-    threadUsageProvider
+    threadUsageProvider,
+    creditProvider,
+    tokenPricingProvider
   });
   // OpenAI Codex exposes ProLite and Pro plan types; this product surface names them Pro 5X and Pro 20X.
   // These are tier names, not a quota calculator. The server window remains authoritative.
@@ -149,7 +165,7 @@
       analytics: createAnalyticsState(),
       modelBreakdown: createModelBreakdownState(),
       threadUsageProvider: threadUsageProvider.createState(),
-      costEstimate: createCostEstimate({ notes: ['当前接口提供模型占比，但未提供模型级 Token 明细'] }),
+      costEstimate: createCostEstimate({ notes: ['等待 Codex Credits 或其他可验证成本来源'] }),
       diagnostics: {
         usageStatus: null,
         analyticsStatus: null,
@@ -180,7 +196,8 @@
       supportsUsdEstimate: false,
       supportsCreditEstimate: false,
       httpStatus: null,
-      lastError: null
+      lastError: null,
+      authoritativeCost: createCostEstimate()
     };
   }
 
@@ -407,6 +424,27 @@
     return metrics;
   }
 
+  function readDailyCredits(row) {
+    const credits = numberOrNull(firstDefined(row, ['totals.credits']));
+    return credits !== null && credits > 0 ? credits : null;
+  }
+
+  function resolveCreditCost(value) {
+    const credits = typeof value === 'number'
+      ? numberOrNull(value)
+      : numberOrNull(firstDefined(value, ['credits', 'totals.credits']));
+    if (credits === null || credits <= 0) {
+      return createCostEstimate({ source: 'credit-unavailable', confidence: 'unknown', notes: ['Credit数据不可用；不会把缺失或零值显示为 $0'] });
+    }
+    return createCostEstimate({
+      valueUsd: credits * CREDIT_USD_RATE,
+      source: 'codex-credit',
+      confidence: 'high',
+      coveragePercent: 100,
+      notes: ['1000 Credits ≈ $40；这是 API 等价价值，不代表 ChatGPT 订阅收费金额']
+    });
+  }
+
   function formatModelName(value) {
     if (typeof value !== 'string' || !value.trim()) return '未命名模型';
     const parts = value.trim().replace(/_/g, '-').split('-').filter(Boolean);
@@ -475,15 +513,38 @@
     return createCostEstimate({ valueUsd, source: 'model_token_estimate', confidence: 'estimated', coveragePercent: 100, notes: ['API 等价估算，不代表 ChatGPT 真实服务端账单'] });
   }
 
+  function resolveUsageCost({ threadCost, credits, tokenCost } = {}) {
+    if (threadCost && numberOrNull(threadCost.valueUsd) !== null && threadCost.valueUsd >= 0) {
+      return { ...threadCost };
+    }
+    const creditCost = usageCostProviders.creditProvider.resolveCost(credits);
+    if (creditCost.valueUsd !== null) return creditCost;
+    if (tokenCost && numberOrNull(tokenCost.valueUsd) !== null && tokenCost.valueUsd >= 0) {
+      return { ...tokenCost };
+    }
+    return createCostEstimate({
+      source: creditCost.source === 'credit-unavailable' ? 'credit-unavailable' : 'unavailable',
+      confidence: 'unknown',
+      notes: creditCost.notes
+    });
+  }
+
   function modelBreakdownCostEstimate() {
     const notes = runtime.state.modelBreakdown.rows.length
       ? ['当前接口提供模型占比，但未提供模型级 Token 明细']
       : ['模型占比接口不可用或没有非零数据，未获得模型级 Token 明细'];
-    return createCostEstimate({ source: usageCostProviders.analyticsProvider.source, confidence: usageCostProviders.analyticsProvider.confidence, notes });
+    return createCostEstimate({ source: 'unavailable', confidence: 'unknown', notes });
+  }
+
+  function resolveTokenPricingCost() {
+    return modelBreakdownCostEstimate();
   }
 
   function updateCostEstimate() {
-    runtime.state.costEstimate = modelBreakdownCostEstimate();
+    const cycle = runtime.state.analytics.ranges.cycle;
+    const threadCost = runtime.state.threadUsageProvider.authoritativeCost;
+    const tokenCost = usageCostProviders.tokenPricingProvider.resolve();
+    runtime.state.costEstimate = resolveUsageCost({ threadCost, credits: cycle?.stats?.credits, tokenCost });
     runtime.state.diagnostics.costProviderSource = runtime.state.costEstimate.source;
     runtime.state.diagnostics.costConfidence = runtime.state.costEstimate.confidence;
   }
@@ -766,6 +827,37 @@
     return windows.filter((item, index, all) => all.findIndex((candidate) => [candidate.scope, candidate.feature, candidate.sourcePath, candidate.durationSeconds, candidate.resetAt].join('|') === [item.scope, item.feature, item.sourcePath, item.durationSeconds, item.resetAt].join('|')) === index);
   }
 
+  function cycleUsageAnalyzer(windows, now = Date.now()) {
+    const candidates = asArray(windows)
+      .filter((window) => window && window.durationSeconds > 0 && window.resetAt !== null && window.resetAt > now)
+      .map((window) => {
+        const startAt = window.resetAt - window.durationSeconds * 1000;
+        return {
+          window,
+          startAt,
+          endAt: window.resetAt,
+          durationSeconds: window.durationSeconds,
+          usedPercent: window.usedPercent,
+          startDate: dateKeyUTC(startAt),
+          endDateExclusive: addDays(dateKeyUTC(now), 1)
+        };
+      })
+      .filter((cycle) => cycle.startDate !== null)
+      .sort((left, right) => {
+        const scopeOrder = (left.window.scope === 'primary' ? 0 : 1) - (right.window.scope === 'primary' ? 0 : 1);
+        return scopeOrder || (left.endAt - now) - (right.endAt - now) || left.durationSeconds - right.durationSeconds;
+      });
+    return candidates[0] || {
+      window: null,
+      startAt: null,
+      endAt: null,
+      durationSeconds: null,
+      usedPercent: null,
+      startDate: null,
+      endDateExclusive: addDays(dateKeyUTC(now), 1)
+    };
+  }
+
   function normalizeUsage(payload, session, fetchedAt) {
     const usage = unwrapData(payload);
     if (!isRecord(usage)) throw new Error('schema');
@@ -829,9 +921,12 @@
       const rawDate = firstDefined(item, ['date', 'day', 'usage_date', 'usageDate']);
       const date = typeof rawDate === 'string' && /^\d{4}-\d{2}-\d{2}/.test(rawDate) ? rawDate.slice(0, 10) : dateKeyUTC(parseTimestamp(rawDate));
       const totals = coalesceMetricValues(normalizeMetrics(firstDefined(item, ['totals', 'total'])), normalizeMetrics(item));
+      totals.credits = readDailyCredits(item);
       const clients = asArray(firstDefined(item, ['clients', 'client_usage', 'clientUsage'])).map((client) => {
         if (!isRecord(client)) return null;
-        return { clientId: String(firstDefined(client, ['client_id', 'clientId', 'id', 'name']) || 'UNKNOWN'), metrics: coalesceMetricValues(normalizeMetrics(firstDefined(client, ['totals', 'total'])), normalizeMetrics(client)) };
+        const clientMetrics = coalesceMetricValues(normalizeMetrics(firstDefined(client, ['totals', 'total'])), normalizeMetrics(client));
+        clientMetrics.credits = readDailyCredits(client);
+        return { clientId: String(firstDefined(client, ['client_id', 'clientId', 'id', 'name']) || 'UNKNOWN'), metrics: clientMetrics };
       }).filter(Boolean);
       return date ? { date, metrics: totals, clients } : null;
     }).filter(Boolean);
@@ -847,11 +942,16 @@
     const monthStart = `${new Date(now).getUTCFullYear()}-${String(new Date(now).getUTCMonth() + 1).padStart(2, '0')}-01`;
     const seven = lastNDaysRange(7);
     const thirty = lastNDaysRange(30);
-    const longWindow = windows.filter((item) => item.durationSeconds && item.durationSeconds >= 24 * 3600).sort((a, b) => (b.durationSeconds || 0) - (a.durationSeconds || 0))[0] || windows[0];
-    const cycleStart = longWindow && longWindow.resetAt && longWindow.durationSeconds ? dateKeyUTC(longWindow.resetAt - longWindow.durationSeconds * 1000) : thirty.start;
+    const cycle = cycleUsageAnalyzer(windows, now);
+    const cycleStart = cycle.startDate || thirty.start;
+    const todayExclusive = addDays(todayKeyUTC(), 1);
+    const cycleStats = aggregateRows(rows, cycleStart, cycle.endDateExclusive || todayExclusive);
+    const estimatedTotalCredits = cycleStats.credits !== null && cycleStats.credits > 0 && cycle.usedPercent !== null && cycle.usedPercent > 0
+      ? cycleStats.credits / (cycle.usedPercent / 100)
+      : null;
     return {
-      cycle: { label: '当前周期', start: cycleStart || thirty.start, end: thirty.end, stats: aggregateRows(rows, cycleStart || thirty.start, thirty.end) },
-      month: { label: '本月', start: monthStart, end: thirty.end, stats: aggregateRows(rows, monthStart, thirty.end) },
+      cycle: { label: cycle.window ? `当前周期 · ${cycle.window.label}` : '当前周期', start: cycleStart, end: cycle.endDateExclusive || todayExclusive, stats: cycleStats, estimatedTotalCredits, cycle },
+      month: { label: '本月', start: monthStart, end: todayExclusive, stats: aggregateRows(rows, monthStart, todayExclusive) },
       '7d': { label: '近 7 天', start: seven.start, end: seven.end, stats: aggregateRows(rows, seven.start, seven.end) },
       '30d': { label: '近 30 天', start: thirty.start, end: thirty.end, stats: aggregateRows(rows, thirty.start, thirty.end) }
     };
@@ -915,6 +1015,7 @@
     const selected = analytics.ranges[runtime.prefs.range] || analytics.ranges[analytics.lastGoodRange] || analytics.ranges['30d'];
     analytics.clientRows = selected ? aggregateClients(analytics.dailyRows, selected.start, selected.end) : [];
     analytics.selectedBucketCount = selected?.stats?.dates || 0;
+    updateCostEstimate();
   }
 
   async function fetchAnalyticsRange(start, endExclusive, headers = {}) {
@@ -1037,6 +1138,42 @@
     return Object.values(value).some((item) => containsAnyKey(item, keys, seen));
   }
 
+  function findNumericKey(value, keys, seen = new Set()) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const found = findNumericKey(item, keys, seen);
+        if (found !== null) return found;
+      }
+      return null;
+    }
+    if (!isRecord(value) || seen.has(value)) return null;
+    seen.add(value);
+    for (const key of keys) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      const number = numberOrNull(value[key]);
+      if (number !== null) return number;
+    }
+    for (const item of Object.values(value)) {
+      const found = findNumericKey(item, keys, seen);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+
+  function resolveThreadUsageCost(payload) {
+    const micros = findNumericKey(payload, THREAD_USD_FIELDS);
+    if (micros === null || micros < 0) {
+      return createCostEstimate({ source: 'thread_api_unavailable', confidence: 'unknown', notes: ['Thread Usage 没有返回可用的权威 USD'] });
+    }
+    return createCostEstimate({
+      valueUsd: micros / 1_000_000,
+      source: 'thread_api',
+      confidence: 'authoritative',
+      coveragePercent: 100,
+      notes: ['来源为 Thread Usage 服务端 USD；这是 API 等价价值，不代表 ChatGPT 订阅收费金额']
+    });
+  }
+
   function containsTokenFieldInGroups(value, seen = new Set()) {
     if (Array.isArray(value)) return value.some((item) => containsTokenFieldInGroups(item, seen));
     if (!isRecord(value) || seen.has(value)) return false;
@@ -1106,6 +1243,7 @@
     provider.supportsTokenBreakdown = capabilities.supportsTokenBreakdown;
     provider.supportsUsdEstimate = capabilities.supportsUsdEstimate;
     provider.supportsCreditEstimate = capabilities.supportsCreditEstimate;
+    provider.authoritativeCost = threadUsageProvider.resolveCost(result.data);
     return provider;
   }
 
@@ -1126,6 +1264,7 @@
     if (runtime.threadUsageAbortController !== controller) return;
     runtime.threadUsageAbortController = null;
     runtime.state.threadUsageProvider = updateThreadUsageProvider(result.result);
+    updateCostEstimate();
     runtime.ui.threadUsageProbeLoading = false;
     render();
   }
@@ -1427,10 +1566,117 @@
     return grid;
   }
 
+  function formatCompactNumber(value) {
+    const number = numberOrNull(value);
+    if (number === null) return '未提供';
+    const absolute = Math.abs(number);
+    if (absolute >= 1_000_000) return `${(number / 1_000_000).toFixed(2).replace(/\.00$/, '')}M`;
+    if (absolute >= 1_000) return `${(number / 1_000).toFixed(1).replace(/\.0$/, '')}K`;
+    return formatNumber(number);
+  }
+
+  function estimatedCycleCredits(cycle, stats) {
+    const usedCredits = numberOrNull(stats?.credits);
+    const usedPercent = numberOrNull(cycle?.usedPercent);
+    if (usedCredits === null || usedCredits <= 0 || usedPercent === null || usedPercent <= 0) return null;
+    return usedCredits / (usedPercent / 100);
+  }
+
+  function costSourceLabel(source) {
+    if (source === 'codex-credit') return 'Codex Credits';
+    if (source === 'thread_api') return 'Thread Usage USD';
+    if (source === 'model_token_estimate') return 'Token 定价估算';
+    return '不可用';
+  }
+
+  function renderCostCard(estimate, title = 'API 等价价值') {
+    const wrapper = el('div', 'wt-subsection wt-cost-estimate');
+    wrapper.append(el('h4', 'wt-subtitle', title));
+    const hasCost = estimate && numberOrNull(estimate.valueUsd) !== null;
+    wrapper.append(statusBadge(`${hasCost ? title : '价值不可用'} · ${costSourceLabel(estimate?.source)}`, hasCost ? 'ok' : 'warning'));
+    const sourceGrid = el('div', 'wt-field-grid wt-cost-meta');
+    sourceGrid.append(field('来源', costSourceLabel(estimate?.source)));
+    sourceGrid.append(field('置信度', estimate?.confidence || 'unknown'));
+    wrapper.append(sourceGrid);
+    if (hasCost) {
+      wrapper.append(el('p', 'wt-cost-value', `${title}：$${estimate.valueUsd.toFixed(2)}`));
+    } else if (estimate?.source === 'credit-unavailable') {
+      wrapper.append(el('p', 'wt-notice wt-notice-warning', 'Credit数据不可用'));
+    } else if (runtime.state.modelBreakdown.rows.length) {
+      wrapper.append(el('p', 'wt-notice wt-notice-warning', '模型消耗占比仅表示百分比，不能换算美元。'));
+    } else {
+      wrapper.append(el('p', 'wt-notice wt-notice-warning', 'API 等价价值暂不可用。'));
+    }
+    wrapper.append(el('p', 'wt-window-meta', 'API 等价价值不代表 ChatGPT 订阅收费金额。'));
+    return wrapper;
+  }
+
+  function renderCycleAnalysis(data) {
+    const range = runtime.state.analytics.ranges.cycle;
+    const cycle = range?.cycle || cycleUsageAnalyzer(data?.windows || []);
+    const stats = range?.stats || normalizeMetrics({});
+    const wrapper = section('周期分析');
+    if (cycle.window) {
+      wrapper.append(el('p', 'wt-range-caption', `当前周期：${cycle.window.label} · ${formatDate(cycle.startAt)} — ${formatDate(cycle.endAt)}`));
+    } else {
+      wrapper.append(el('p', 'wt-notice wt-notice-warning', '接口未提供可计算的当前周期窗口。'));
+    }
+    if (!range || runtime.state.analytics.loading && !runtime.state.analytics.dailyRows.length) {
+      wrapper.append(el('p', 'wt-notice wt-notice-info', '正在读取周期统计。'));
+    }
+    const grid = el('div', 'wt-metric-grid wt-cycle-metric-grid');
+    const metrics = [
+      ['tokens', 'Tokens', stats.tokens === null ? '未提供' : formatCompactNumber(stats.tokens)],
+      ['turns', 'Turns', stats.turns === null ? '未提供' : formatNumber(stats.turns)],
+      ['credits', 'Credits', stats.credits === null ? 'Credit数据不可用' : formatNumber(stats.credits)],
+      ['value', 'API 等价价值', runtime.state.costEstimate.valueUsd === null ? '暂不可用' : `$${runtime.state.costEstimate.valueUsd.toFixed(2)}`]
+    ];
+    metrics.forEach(([, label, value]) => {
+      const card = el('div', 'wt-metric');
+      card.append(el('span', 'wt-metric-label', label), el('strong', 'wt-metric-value', value));
+      grid.append(card);
+    });
+    wrapper.append(grid, renderCostCard(runtime.state.costEstimate));
+    const estimatedTotalCredits = range?.estimatedTotalCredits ?? estimatedCycleCredits(cycle, stats);
+    const estimate = el('div', 'wt-notice wt-notice-info');
+    estimate.append(el('strong', '', '周期额度推算：'), el('span', '', estimatedTotalCredits === null ? '暂无法推算' : `${formatNumber(estimatedTotalCredits)} Credits`));
+    if (cycle.usedPercent !== null) estimate.append(el('span', 'wt-window-meta', `（已使用 ${formatPercent(cycle.usedPercent)}）`));
+    wrapper.append(estimate, renderDailyBreakdown(range));
+    return wrapper;
+  }
+
+  function renderDailyBreakdown(range) {
+    const wrapper = el('div', 'wt-subsection wt-daily-breakdown');
+    wrapper.append(el('h4', 'wt-subtitle', '每日明细'));
+    const rows = range?.stats?.rows || [];
+    if (!rows.length) {
+      wrapper.append(el('p', 'wt-empty', '当前周期没有可显示的每日数据'));
+      return wrapper;
+    }
+    const table = el('table', 'wt-daily-table');
+    const head = el('thead');
+    const headerRow = el('tr');
+    ['日期', 'Tokens', 'Credits', 'API价值', 'Turns'].forEach((label) => headerRow.append(el('th', '', label)));
+    head.append(headerRow);
+    const body = el('tbody');
+    rows.slice().reverse().forEach((row) => {
+      const creditCost = usageCostProviders.creditProvider.resolveCost(row.metrics.credits);
+      const tr = el('tr');
+      const tokenText = row.metrics.tokens === null ? '未提供' : formatCompactNumber(row.metrics.tokens);
+      const creditText = row.metrics.credits === null ? 'Credit数据不可用' : `${formatNumber(row.metrics.credits)} Credits`;
+      const valueText = creditCost.valueUsd === null ? 'Credit数据不可用' : `$${creditCost.valueUsd.toFixed(2)}`;
+      [row.date, tokenText, creditText, valueText, row.metrics.turns === null ? '未提供' : formatNumber(row.metrics.turns)].forEach((value) => tr.append(el('td', '', value)));
+      body.append(tr);
+    });
+    table.append(head, body);
+    wrapper.append(table);
+    return wrapper;
+  }
+
   function renderModelUsage() {
     const modelBreakdown = runtime.state.modelBreakdown;
     const wrapper = el('div', 'wt-subsection wt-model-usage');
-    wrapper.append(el('h4', 'wt-subtitle', '模型使用情况'));
+    wrapper.append(el('h4', 'wt-subtitle', '模型消耗占比'));
     if (modelBreakdown.loading) wrapper.append(el('p', 'wt-notice wt-notice-info', '正在读取模型使用情况。'));
     if (modelBreakdown.error) wrapper.append(el('p', 'wt-notice wt-notice-warning', `${modelBreakdown.error}；不会把该接口字段当作余额或 Token 数量。`));
     if (!modelBreakdown.rows.length) {
@@ -1449,19 +1695,7 @@
   }
 
   function renderCostEstimate() {
-    const estimate = runtime.state.costEstimate || createCostEstimate();
-    const wrapper = el('div', 'wt-subsection wt-cost-estimate');
-    wrapper.append(el('h4', 'wt-subtitle', '成本估算'));
-    const isAuthoritative = estimate.source === 'thread_api' && estimate.confidence === 'authoritative';
-    const label = isAuthoritative ? '真实服务端成本' : 'API 等价估算';
-    wrapper.append(statusBadge(`${label}${estimate.valueUsd === null ? '：未提供' : ''}`, estimate.valueUsd === null ? 'warning' : 'ok'));
-    if (estimate.valueUsd === null) {
-      wrapper.append(el('p', 'wt-notice wt-notice-warning', 'API 等价成本暂不可计算'));
-      wrapper.append(el('p', 'wt-window-meta', '当前接口提供模型占比，但未提供模型级 Token 明细。模型占比不能换算成美元。'));
-    } else {
-      wrapper.append(el('p', 'wt-cost-value', `${label}：$${estimate.valueUsd.toFixed(6)}`));
-    }
-    return wrapper;
+    return renderCostCard(runtime.state.costEstimate);
   }
 
   function renderAnalytics(data) {
@@ -1705,6 +1939,14 @@
     return location.pathname.split('/').map((segment) => isValidThreadId(segment) ? '[redacted]' : segment).join('/');
   }
 
+  function creditDiagnosticAvailable() {
+    return runtime.state.analytics.dailyRows.some((row) => numberOrNull(row.metrics?.credits) !== null && row.metrics.credits > 0);
+  }
+
+  function creditDiagnosticSource() {
+    return creditDiagnosticAvailable() ? 'daily-workspace' : 'unavailable';
+  }
+
   function capabilityText(provider, value) {
     if (provider.status === 'unknown') return '未检测';
     if (provider.status === 'available' && !provider.threadUsageSupported) return '未返回';
@@ -1778,6 +2020,10 @@
   function renderDiagnostics() {
     const details = el('details', 'wt-diagnostics');
     details.append(el('summary', '诊断信息'));
+    const costAnalysis = el('div', 'wt-cost-diagnostics');
+    costAnalysis.append(el('strong', 'wt-subtitle', 'Cost Analysis'));
+    costAnalysis.append(field('creditAvailable', creditDiagnosticAvailable()), field('creditSource', creditDiagnosticSource()), field('costSource', runtime.state.diagnostics.costProviderSource), field('confidence', runtime.state.diagnostics.costConfidence));
+    details.append(costAnalysis);
     const lines = [
       ['脚本版本', VERSION], ['当前路径', safeDiagnosticPath()], ['Usage HTTP 状态', runtime.state.diagnostics.usageStatus || '未请求'],
       ['Analytics HTTP 状态', runtime.state.diagnostics.analyticsStatus || '未请求'], ['model breakdown status', runtime.state.diagnostics.modelBreakdownStatus || '未请求'],
@@ -1814,6 +2060,7 @@
       `Analytics coverage: ${runtime.state.analytics.coverage.start ? `${runtime.state.analytics.coverage.start}..${runtime.state.analytics.coverage.end}` : '未覆盖'}`,
       `最后一次 Analytics 请求范围: ${runtime.state.analytics.lastRequest ? `${runtime.state.analytics.lastRequest.start}..${runtime.state.analytics.lastRequest.end}` : '未请求'}`,
       `命中内存 coverage: ${runtime.state.analytics.cacheHit ? '是' : '否'}`, `当前范围日期桶数: ${runtime.state.analytics.selectedBucketCount}`,
+      `creditAvailable=${creditDiagnosticAvailable()}`, `creditSource=${creditDiagnosticSource()}`, `costSource=${runtime.state.diagnostics.costProviderSource}`, `confidence=${runtime.state.diagnostics.costConfidence}`,
       `成功解析窗口数量: ${runtime.state.diagnostics.windowCount}`, `主额度窗口数量: ${runtime.state.diagnostics.primaryWindowCount}`, `额外额度窗口数量: ${runtime.state.diagnostics.additionalWindowCount}`, `每日数据行数: ${runtime.state.diagnostics.dailyRows}`,
       `客户端类型: ${runtime.state.diagnostics.clientTypes.join(', ') || '未提供'}`, `未识别顶层字段: ${runtime.state.diagnostics.unknownFields.join(', ') || '无'}`, `错误代码: ${runtime.state.diagnostics.errors.join(', ') || '无'}`,
       `threadUsageStatus=${threadUsage.status}`, `threadUsageTokenBreakdown=${threadUsage.supportsTokenBreakdown}`, `threadUsageUsdEstimate=${threadUsage.supportsUsdEstimate}`, `threadUsageCreditEstimate=${threadUsage.supportsCreditEstimate}`, `threadUsageCheckedAt=${threadUsage.checkedAt === null ? '未检测' : formatDate(threadUsage.checkedAt)}`
@@ -1882,7 +2129,7 @@
       const windows = section('额度窗口');
       if (runtime.state.data.windows.length) runtime.state.data.windows.forEach((item) => windows.append(renderWindow(item)));
       else windows.append(el('p', 'wt-empty', '接口未提供有效额度窗口'));
-      body.append(windows);
+      body.append(windows, renderCycleAnalysis(runtime.state.data));
       if (credits) body.append(credits);
       body.append(renderAnalytics(runtime.state.data));
     }
@@ -2193,11 +2440,12 @@
       .wt-field-grid { display: grid; gap: 8px 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); } .wt-field { display: flex; flex-direction: column; min-width: 0; } .wt-field-label { color: var(--wt-color-text-secondary); font-size: 11px; } .wt-field-value { overflow-wrap: anywhere; }
       .wt-badge { background: var(--wt-color-surface-secondary); border-radius: 9999px; color: var(--wt-color-text-secondary); display: inline-block; font-size: 11px; font-weight: 500; padding: 4px 8px; white-space: nowrap; } .wt-badge-plan { background: var(--wt-color-surface-secondary); color: var(--wt-color-text); } .wt-badge-ok { color: var(--wt-color-success); } .wt-badge-warning { color: var(--wt-color-warning); } .wt-badge-danger { color: var(--wt-color-danger); }
       .wt-window { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border-subtle); border-radius: 11px; margin: 8px 0; padding: 12px; } .wt-window-heading, .wt-subsection-heading, .wt-client-heading { align-items: center; display: flex; gap: 8px; justify-content: space-between; } .wt-window-meta, .wt-empty, .wt-notice, .wt-loading, .wt-range-caption { color: var(--wt-color-text-secondary); font-size: 12px; margin: 6px 0; } .wt-progress-wrap { margin: 9px 0; } .wt-progress { background: var(--wt-color-surface-secondary); border-radius: 9999px; height: 6px; overflow: hidden; position: relative; } .wt-progress::after { background: var(--wt-color-chart); border-radius: inherit; content: ''; display: block; height: 100%; width: var(--wt-progress, 0%); } .wt-window-percent-unknown { color: var(--wt-color-warning); }
-      .wt-notice { border: 1px solid var(--wt-color-border-subtle); border-radius: 10px; padding: 10px; } .wt-notice-warning { color: var(--wt-color-warning); } .wt-notice-danger { color: var(--wt-color-danger); } .wt-notice-info { color: var(--wt-color-text-secondary); } .wt-subsection { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 16px; padding-top: 12px; } .wt-client-row { border-bottom: 1px solid var(--wt-color-border-subtle); padding: 9px 0; } .wt-client-name, .wt-client-value { display: block; } .wt-client-share { color: var(--wt-color-text-secondary); font-size: 11px; } .wt-client-value { color: var(--wt-color-text-secondary); font-size: 11px; margin-top: 3px; } .wt-model-usage-row { border-bottom: 1px solid var(--wt-color-border-subtle); padding: 9px 0; } .wt-model-usage-heading { align-items: center; display: flex; gap: 8px; justify-content: space-between; } .wt-model-usage-name, .wt-model-usage-speed { display: block; } .wt-model-usage-share { color: var(--wt-color-text); font-variant-numeric: tabular-nums; font-weight: 600; } .wt-model-usage-speed { color: var(--wt-color-text-secondary); font-size: 11px; margin-top: 3px; } .wt-cost-value { font-variant-numeric: tabular-nums; font-weight: 600; margin: 8px 0 0; }
+      .wt-notice { border: 1px solid var(--wt-color-border-subtle); border-radius: 10px; padding: 10px; } .wt-notice-warning { color: var(--wt-color-warning); } .wt-notice-danger { color: var(--wt-color-danger); } .wt-notice-info { color: var(--wt-color-text-secondary); } .wt-subsection { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 16px; padding-top: 12px; } .wt-client-row { border-bottom: 1px solid var(--wt-color-border-subtle); padding: 9px 0; } .wt-client-name, .wt-client-value { display: block; } .wt-client-share { color: var(--wt-color-text-secondary); font-size: 11px; } .wt-client-value { color: var(--wt-color-text-secondary); font-size: 11px; margin-top: 3px; } .wt-model-usage-row { border-bottom: 1px solid var(--wt-color-border-subtle); padding: 9px 0; } .wt-model-usage-heading { align-items: center; display: flex; gap: 8px; justify-content: space-between; } .wt-model-usage-name, .wt-model-usage-speed { display: block; } .wt-model-usage-share { color: var(--wt-color-text); font-variant-numeric: tabular-nums; font-weight: 600; } .wt-model-usage-speed { color: var(--wt-color-text-secondary); font-size: 11px; margin-top: 3px; } .wt-cost-value { font-variant-numeric: tabular-nums; font-weight: 600; margin: 8px 0 0; } .wt-cost-meta { margin-top: 8px; }
       .wt-metric-grid { border: 1px solid var(--wt-color-border-subtle); border-radius: 11px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: hidden; } .wt-metric { border-bottom: 1px solid var(--wt-color-border-subtle); display: flex; flex-direction: column; min-width: 0; padding: 11px; } .wt-metric:nth-child(odd) { border-right: 1px solid var(--wt-color-border-subtle); } .wt-metric:nth-last-child(-n+2) { border-bottom: 0; } .wt-metric-label { color: var(--wt-color-text-secondary); font-size: 11px; } .wt-metric-value { font-size: 17px; font-weight: 600; margin-top: 3px; } .wt-secondary-metrics { border-top: 1px solid var(--wt-color-border-subtle); grid-column: 1 / -1; padding: 9px 11px; } .wt-secondary-metrics summary, .wt-diagnostics summary { color: var(--wt-color-text-secondary); cursor: pointer; font-size: 12px; font-weight: 500; }
       .wt-range-selector { display: flex; gap: 3px; margin-bottom: 10px; max-width: 100%; overflow-x: auto; padding: 2px; scrollbar-width: thin; } .wt-range-button { background: transparent; border: 1px solid transparent; border-radius: 8px; color: var(--wt-color-text-secondary); cursor: pointer; flex: 0 0 auto; min-height: 36px; padding: 6px 10px; white-space: nowrap; } .wt-range-button:hover { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-range-button-active { background: var(--wt-color-surface-secondary); border-color: var(--wt-color-border); color: var(--wt-color-text); font-weight: 600; }
       .wt-custom-range { background: var(--wt-color-surface); border-radius: 10px; margin-bottom: 10px; padding: 10px; } .wt-date-fields { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); } .wt-date-label { color: var(--wt-color-text-secondary); display: flex; flex-direction: column; font-size: 11px; gap: 4px; } .wt-date-input { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 8px; color: var(--wt-color-text); min-height: 38px; min-width: 0; padding: 7px; } .wt-date-hint { color: var(--wt-color-text-tertiary); font-size: 11px; margin: 7px 0 0; } .wt-date-error { color: var(--wt-color-danger); font-size: 11px; min-height: 16px; margin: 5px 0 0; } .wt-custom-actions { display: flex; flex-wrap: wrap; gap: 6px; }
       .wt-chart-shell { position: relative; } .wt-chart-scroll { align-items: end; border-bottom: 1px solid var(--wt-color-border); display: flex; gap: 4px; height: 132px; overflow-x: auto; padding: 8px 2px 0; } .wt-chart-column { align-items: center; border-radius: 4px; display: flex; flex: 1 0 16px; flex-direction: column; height: 100%; justify-content: end; min-width: 16px; } .wt-chart-column:focus-visible { outline: 2px solid var(--wt-color-focus); outline-offset: 2px; } .wt-chart-bar { background: var(--wt-color-chart); border-radius: 3px 3px 0 0; min-height: 3px; width: 100%; } .wt-chart-label { color: var(--wt-color-text-tertiary); font-size: 9px; margin-top: 4px; white-space: nowrap; } .wt-chart-tooltip { background: var(--wt-color-surface); border: 1px solid var(--wt-color-border); border-radius: 8px; box-shadow: 0 8px 24px rgb(0 0 0 / 18%); color: var(--wt-color-text); display: flex; flex-direction: column; font-size: 11px; max-width: calc(100% - 8px); padding: 7px 9px; pointer-events: none; position: absolute; white-space: nowrap; z-index: 2; } .wt-chart-tooltip[hidden] { display: none; } .wt-chart-tooltip-date { color: var(--wt-color-text-secondary); } .wt-chart-tooltip-value { font-variant-numeric: tabular-nums; margin-top: 2px; }
+      .wt-daily-table { border-collapse: collapse; font-size: 11px; min-width: 100%; table-layout: auto; } .wt-daily-table th, .wt-daily-table td { border-bottom: 1px solid var(--wt-color-border-subtle); padding: 8px 5px; text-align: right; white-space: nowrap; } .wt-daily-table th:first-child, .wt-daily-table td:first-child { text-align: left; } .wt-daily-table th { color: var(--wt-color-text-secondary); font-size: 10px; font-weight: 500; } .wt-daily-breakdown { overflow-x: auto; } .wt-cost-diagnostics { border: 1px solid var(--wt-color-border-subtle); border-radius: 10px; margin: 8px 0 12px; padding: 10px; }
       .wt-diagnostics { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 12px; padding-top: 10px; } .wt-diagnostics summary { margin-bottom: 8px; } .wt-diagnostics .wt-field { margin: 6px 0; } .wt-thread-usage { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 10px; padding-top: 10px; } .wt-thread-usage-dialog { background: var(--wt-color-surface); border: 1px solid var(--wt-color-border); border-radius: 10px; margin-top: 10px; padding: 10px; } .wt-thread-usage-prompt, .wt-thread-usage-label { color: var(--wt-color-text-secondary); font-size: 12px; } .wt-thread-usage-prompt { margin: 6px 0 8px; } .wt-thread-usage-label { display: flex; flex-direction: column; gap: 4px; } .wt-thread-usage-input { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 8px; color: var(--wt-color-text); min-height: 38px; min-width: 0; padding: 7px; } .wt-thread-usage-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; } .wt-button:disabled, .wt-icon-button:disabled { cursor: wait; opacity: .6; } .wt-loading { min-height: 120px; padding-top: 18px; } .wt-chart-select { margin-left: auto; }
       @keyframes wt-spin { to { transform: rotate(360deg); } } @media (max-width: 480px) { :host([data-wt-mode="expanded"]) { width: calc(100vw - 24px); } .wt-body { max-height: 68vh; padding-left: 12px; padding-right: 12px; } .wt-header { padding-left: 12px; padding-right: 12px; } } @media (max-width: 340px) { .wt-account-summary { align-items: start; } .wt-account-side { align-items: flex-start; grid-column: 1 / -1; padding-left: 44px; } .wt-date-fields { grid-template-columns: 1fr; } .wt-range-button { padding-left: 8px; padding-right: 8px; } }
       @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; } }

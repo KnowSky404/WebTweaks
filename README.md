@@ -12,7 +12,7 @@ Install a compatible userscript manager, then open a script's raw `.user.js` fil
 
 | Website | Script | Description | Install |
 | --- | --- | --- | --- |
-| [chatgpt.com](https://chatgpt.com/) | ChatGPT Account Usage Dashboard | Private, read-only floating dashboard for the current plan, Codex limits, credits, and available usage analytics. | [Install raw script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/chatgpt-com/account-usage-dashboard.user.js) |
+| [chatgpt.com](https://chatgpt.com/) | ChatGPT Account Usage Dashboard | Private, read-only floating dashboard for the current plan, Codex limits, Credit-to-USD-equivalent value, cycle analysis, and usage analytics. | [Install raw script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/chatgpt-com/account-usage-dashboard.user.js) |
 | [V2EX](https://v2ex.com/) | V2EX Conversation Enhancer | Cross-page threaded replies, client-side image previews and lightbox viewing, Imgur uploads, and scroll-to-top. | [Install raw script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/v2ex-com/conversation-enhancer.user.js) |
 
 ## Repository structure
