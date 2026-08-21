@@ -27,6 +27,7 @@
   const THREAD_USAGE_ENDPOINT = '/backend-api/wham/usage/thread_usage/query';
   const ANALYTICS_URL = 'https://chatgpt.com/codex/cloud/settings/analytics';
   const REQUEST_TIMEOUT_MS = 8000;
+  const THREAD_USAGE_TIMEOUT_MS = 10_000;
   const AUTO_REFRESH_INTERVAL_MS = 300_000;
   const LEGACY_REFRESH_PREF_KEY = 'wt-chatgpt-account-usage:refresh-interval';
   const POSITION_VERSION = 2;
@@ -47,9 +48,19 @@
     'gpt-5.6-luna': Object.freeze({ inputPerMillion: null, cachedInputPerMillion: null, outputPerMillion: null, effectiveDate: null }),
     'gpt-5.5': Object.freeze({ inputPerMillion: null, cachedInputPerMillion: null, outputPerMillion: null, effectiveDate: null })
   });
+  const threadUsageProvider = Object.freeze({
+    source: 'thread_api',
+    confidence: 'authoritative',
+    endpoint: THREAD_USAGE_ENDPOINT,
+    diagnosticOnly: true,
+    costAvailable: false,
+    createState: createThreadUsageProviderState,
+    inspect: inspectThreadUsageResponse,
+    probe: probeThreadUsage
+  });
   const usageCostProviders = Object.freeze({
     analyticsProvider: Object.freeze({ source: 'unknown', confidence: 'unknown', endpoint: MODEL_BREAKDOWN_ENDPOINT }),
-    threadUsageProvider: Object.freeze({ source: 'thread_api', confidence: 'authoritative', endpoint: THREAD_USAGE_ENDPOINT, available: false })
+    threadUsageProvider
   });
   // OpenAI Codex exposes ProLite and Pro plan types; this product surface names them Pro 5X and Pro 20X.
   // These are tier names, not a quota calculator. The server window remains authoritative.
@@ -112,12 +123,17 @@
     visibilityHandler: null,
     analyticsPromise: null,
     modelBreakdownPromise: null,
+    threadUsageAbortController: null,
     lastUsageHeaders: {},
     ui: {
       panelSession: 0,
       pendingPanelState: null,
       tooltipTimer: null,
-      positionFrame: null
+      positionFrame: null,
+      threadUsageDialogOpen: false,
+      threadUsageInput: '',
+      threadUsageValidationError: null,
+      threadUsageProbeLoading: false
     }
   };
 
@@ -132,6 +148,7 @@
       fetchedAt: null,
       analytics: createAnalyticsState(),
       modelBreakdown: createModelBreakdownState(),
+      threadUsageProvider: threadUsageProvider.createState(),
       costEstimate: createCostEstimate({ notes: ['当前接口提供模型占比，但未提供模型级 Token 明细'] }),
       diagnostics: {
         usageStatus: null,
@@ -150,6 +167,20 @@
         unknownFields: [],
         errors: []
       }
+    };
+  }
+
+  function createThreadUsageProviderState() {
+    return {
+      status: 'unknown',
+      checkedAt: null,
+      endpointAvailable: false,
+      threadUsageSupported: false,
+      supportsTokenBreakdown: false,
+      supportsUsdEstimate: false,
+      supportsCreditEstimate: false,
+      httpStatus: null,
+      lastError: null
     };
   }
 
@@ -528,17 +559,20 @@
   }
 
   async function requestJSON(url, options = {}) {
-    const key = `${url}|${options.headers && options.headers.Authorization ? 'auth' : 'cookie'}`;
+    const method = options.method || 'GET';
+    const authMode = options.headers && (options.headers.Authorization || options.headers['ChatGPT-Account-Id']) ? 'auth' : 'cookie';
+    const key = `${url}|${method}|${authMode}|${options.body || ''}`;
     if (runtime.inFlight.has(key)) return runtime.inFlight.get(key);
     const promise = (async () => {
       const controller = options.controller || new AbortController();
-      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      const timer = setTimeout(() => controller.abort(), options.timeoutMs || REQUEST_TIMEOUT_MS);
       try {
         const response = await fetch(url, {
-          method: 'GET',
+          method,
           credentials: 'include',
           cache: 'no-store',
           headers: { Accept: 'application/json', ...(options.headers || {}) },
+          body: options.body,
           signal: controller.signal
         });
         const text = await response.text();
@@ -975,10 +1009,153 @@
     return analytics ? '详细统计暂不可用' : '用量数据暂不可用';
   }
 
-  async function getUsageWithFallback(controller) {
-    const cookieResult = await requestJSON(USAGE_ENDPOINT, { controller });
+  const THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const THREAD_TOKEN_FIELDS = Object.freeze(['input_tokens', 'cached_input_tokens', 'output_tokens', 'total_tokens', 'inputTokens', 'cachedInputTokens', 'outputTokens', 'totalTokens']);
+  const THREAD_USD_FIELDS = Object.freeze(['estimated_usage_usd_micros', 'estimatedUsageUsdMicros']);
+  const THREAD_CREDIT_FIELDS = Object.freeze(['estimated_usage_credits_micros', 'estimatedUsageCreditsMicros']);
+
+  function isValidThreadId(value) {
+    return typeof value === 'string' && THREAD_ID_PATTERN.test(value.trim());
+  }
+
+  function currentPageThreadId() {
+    const match = location.pathname.match(/^\/c\/([^/]+)/i);
+    let candidate = '';
+    try {
+      candidate = match ? decodeURIComponent(match[1]) : '';
+    } catch (_error) {
+      candidate = '';
+    }
+    return isValidThreadId(candidate) ? candidate : '';
+  }
+
+  function containsAnyKey(value, keys, seen = new Set()) {
+    if (Array.isArray(value)) return value.some((item) => containsAnyKey(item, keys, seen));
+    if (!isRecord(value) || seen.has(value)) return false;
+    seen.add(value);
+    if (keys.some((key) => Object.prototype.hasOwnProperty.call(value, key))) return true;
+    return Object.values(value).some((item) => containsAnyKey(item, keys, seen));
+  }
+
+  function containsTokenFieldInGroups(value, seen = new Set()) {
+    if (Array.isArray(value)) return value.some((item) => containsTokenFieldInGroups(item, seen));
+    if (!isRecord(value) || seen.has(value)) return false;
+    seen.add(value);
+    const groups = value.groups;
+    if (Array.isArray(groups) && groups.some((group) => isRecord(group) && THREAD_TOKEN_FIELDS.some((key) => Object.prototype.hasOwnProperty.call(group, key)))) return true;
+    return Object.values(value).some((item) => containsTokenFieldInGroups(item, seen));
+  }
+
+  function inspectThreadUsageResponse(payload) {
+    const root = unwrapData(payload);
+    const threads = Array.isArray(root) ? root : asArray(firstDefined(root, ['threads']));
+    return {
+      hasThreads: threads.length > 0,
+      supportsTokenBreakdown: containsTokenFieldInGroups(root),
+      supportsUsdEstimate: containsAnyKey(root, THREAD_USD_FIELDS),
+      supportsCreditEstimate: containsAnyKey(root, THREAD_CREDIT_FIELDS)
+    };
+  }
+
+  function threadUsageErrorMessage(provider) {
+    if (provider.status === 'available' && !provider.threadUsageSupported) return '接口可访问，但没有返回可查询线程数据';
+    if (provider.status === 'unavailable' && provider.httpStatus === 403) return '接口存在，但当前账号可能没有开放线程级用量接口';
+    if (provider.status === 'unavailable' && provider.httpStatus === 404) return '接口不可用或当前账号不可见';
+    if (provider.status === 'unavailable' && provider.httpStatus === 401) return '请先登录 ChatGPT';
+    if (provider.lastError === 'timeout') return '检测超时';
+    if (provider.lastError === 'network') return '检测请求失败';
+    if (provider.httpStatus === 400) return '线程 ID 无法查询或请求参数不被接口接受';
+    if (provider.httpStatus === 429) return '请求过于频繁，请稍后再试';
+    if (provider.httpStatus >= 500) return 'Thread Usage 接口暂时不可用';
+    if (provider.status === 'error') return 'Thread Usage 能力检测失败';
+    return '';
+  }
+
+  function threadUsageStatusLabel(provider) {
+    if (provider.status === 'available') return '可用';
+    if (provider.status === 'unavailable') return '不可用';
+    if (provider.status === 'error') return '检测失败';
+    return '未检测';
+  }
+
+  function updateThreadUsageProvider(result) {
+    const provider = threadUsageProvider.createState();
+    provider.checkedAt = Date.now();
+    provider.httpStatus = result.status || null;
+    provider.endpointAvailable = typeof result.status === 'number' && result.status !== 404 && result.status !== 0;
+    if (result.error) {
+      provider.status = 'error';
+      provider.lastError = result.error;
+      return provider;
+    }
+    if (result.status === 401 || result.status === 403 || result.status === 404) {
+      provider.status = 'unavailable';
+      provider.lastError = `http_${result.status}`;
+      provider.endpointAvailable = result.status !== 404;
+      return provider;
+    }
+    if (!result.ok || !result.data) {
+      provider.status = 'error';
+      provider.lastError = result.status ? `http_${result.status}` : 'empty_response';
+      return provider;
+    }
+    const capabilities = threadUsageProvider.inspect(result.data);
+    provider.status = 'available';
+    provider.endpointAvailable = true;
+    provider.threadUsageSupported = capabilities.hasThreads;
+    provider.supportsTokenBreakdown = capabilities.supportsTokenBreakdown;
+    provider.supportsUsdEstimate = capabilities.supportsUsdEstimate;
+    provider.supportsCreditEstimate = capabilities.supportsCreditEstimate;
+    return provider;
+  }
+
+  async function probeThreadUsage(threadId) {
+    runtime.ui.threadUsageProbeLoading = true;
+    runtime.ui.threadUsageValidationError = null;
+    render();
+    const controller = new AbortController();
+    runtime.threadUsageAbortController?.abort();
+    runtime.threadUsageAbortController = controller;
+    const result = await requestWithSessionFallback(THREAD_USAGE_ENDPOINT, {
+      method: 'POST',
+      body: JSON.stringify({ thread_ids: [threadId] }),
+      controller,
+      timeoutMs: THREAD_USAGE_TIMEOUT_MS,
+      headers: { 'Content-Type': 'application/json' }
+    });
+    if (runtime.threadUsageAbortController !== controller) return;
+    runtime.threadUsageAbortController = null;
+    runtime.state.threadUsageProvider = updateThreadUsageProvider(result.result);
+    runtime.ui.threadUsageProbeLoading = false;
+    render();
+  }
+
+  function beginThreadUsageProbe() {
+    const input = runtime.shadow?.querySelector('[name="thread-usage-id"]');
+    const threadId = (input ? input.value : runtime.ui.threadUsageInput).trim();
+    runtime.ui.threadUsageInput = threadId;
+    runtime.ui.threadUsageValidationError = isValidThreadId(threadId) ? null : '请输入有效的 UUID 格式 Codex thread id';
+    if (runtime.ui.threadUsageValidationError) {
+      render();
+      return;
+    }
+    void threadUsageProvider.probe(threadId);
+  }
+
+  function resetThreadUsageProbe() {
+    runtime.threadUsageAbortController?.abort();
+    runtime.threadUsageAbortController = null;
+    runtime.state.threadUsageProvider = threadUsageProvider.createState();
+    runtime.ui.threadUsageDialogOpen = false;
+    runtime.ui.threadUsageInput = '';
+    runtime.ui.threadUsageValidationError = null;
+    runtime.ui.threadUsageProbeLoading = false;
+  }
+
+  async function requestWithSessionFallback(url, options = {}) {
+    const cookieResult = await requestJSON(url, options);
     if (cookieResult.ok || (cookieResult.status !== 401 && cookieResult.status !== 403)) return { result: cookieResult, session: null, headers: {}, mode: 'cookie-only' };
-    const sessionResult = await requestJSON(SESSION_ENDPOINT, { controller });
+    const sessionResult = await requestJSON(SESSION_ENDPOINT, { controller: options.controller });
     if (!sessionResult.ok) return { result: cookieResult, session: null, headers: {}, mode: 'cookie-only' };
     const token = getAccessToken(sessionResult.data);
     const accountId = getAccountId(sessionResult.data, token);
@@ -986,8 +1163,12 @@
     if (typeof token === 'string' && token.trim()) headers.Authorization = `Bearer ${token}`;
     if (typeof accountId === 'string' && accountId.trim()) headers['ChatGPT-Account-Id'] = accountId;
     if (!Object.keys(headers).length) return { result: cookieResult, session: sessionResult.data, headers, mode: 'cookie-only' };
-    const authenticated = await requestJSON(USAGE_ENDPOINT, { controller, headers });
+    const authenticated = await requestJSON(url, { ...options, headers: { ...(options.headers || {}), ...headers } });
     return { result: authenticated, session: sessionResult.data, headers, mode: 'authenticated-fallback' };
+  }
+
+  async function getUsageWithFallback(controller) {
+    return requestWithSessionFallback(USAGE_ENDPOINT, { controller });
   }
 
   async function refresh() {
@@ -1015,6 +1196,7 @@
           runtime.state.data = null;
           runtime.state.analytics = createAnalyticsState();
           runtime.state.modelBreakdown = createModelBreakdownState();
+          resetThreadUsageProbe();
           runtime.state.costEstimate = createCostEstimate({ notes: ['请先登录 ChatGPT 读取模型使用情况'] });
           runtime.state.analyticsError = null;
           runtime.state.diagnostics.analyticsStatus = null;
@@ -1047,6 +1229,7 @@
         runtime.state.data = null;
         runtime.state.analytics = createAnalyticsState();
         runtime.state.modelBreakdown = createModelBreakdownState();
+        resetThreadUsageProbe();
         runtime.state.costEstimate = createCostEstimate({ notes: ['账户已切换，等待新的模型使用数据'] });
         runtime.state.analyticsError = null;
         runtime.state.diagnostics.analyticsStatus = null;
@@ -1518,11 +1701,85 @@
     return link;
   }
 
+  function safeDiagnosticPath() {
+    return location.pathname.split('/').map((segment) => isValidThreadId(segment) ? '[redacted]' : segment).join('/');
+  }
+
+  function capabilityText(provider, value) {
+    if (provider.status === 'unknown') return '未检测';
+    if (provider.status === 'available' && !provider.threadUsageSupported) return '未返回';
+    return value ? '支持' : '不支持';
+  }
+
+  function renderThreadUsageCapability() {
+    const provider = runtime.state.threadUsageProvider;
+    const block = el('div', 'wt-thread-usage');
+    block.append(el('strong', 'wt-subtitle', 'Thread Usage API'));
+    const fields = el('div', 'wt-field-grid');
+    fields.append(
+      field('状态', threadUsageStatusLabel(provider)),
+      field('Token 明细', capabilityText(provider, provider.supportsTokenBreakdown)),
+      field('USD 服务端估算', capabilityText(provider, provider.supportsUsdEstimate)),
+      field('Credits 服务端估算', capabilityText(provider, provider.supportsCreditEstimate))
+    );
+    if (provider.httpStatus !== null) fields.append(field('HTTP', provider.httpStatus));
+    if (provider.checkedAt !== null) fields.append(field('最后检测', formatDate(provider.checkedAt)));
+    block.append(fields);
+    const message = threadUsageErrorMessage(provider);
+    if (message) block.append(el('p', `wt-notice ${provider.status === 'error' ? 'wt-notice-danger' : 'wt-notice-info'}`, message));
+    const action = setAttributes(el('button', 'wt-button wt-button-secondary'), {
+      type: 'button',
+      'data-action': 'open-thread-usage-dialog',
+      disabled: runtime.ui.threadUsageProbeLoading ? 'true' : null
+    });
+    action.textContent = '检测 Thread Usage 能力';
+    block.append(action);
+    return block;
+  }
+
+  function renderThreadUsageDialog() {
+    const provider = runtime.state.threadUsageProvider;
+    const dialog = setAttributes(el('div', 'wt-thread-usage-dialog'), { role: 'dialog', 'aria-modal': 'false', 'aria-labelledby': 'wt-thread-usage-dialog-title' });
+    const title = el('strong', 'wt-subtitle', 'Thread Usage 能力检测');
+    title.id = 'wt-thread-usage-dialog-title';
+    dialog.append(title);
+    const prompt = el('p', 'wt-thread-usage-prompt', '请输入一个 Codex thread id 用于检测');
+    const label = el('label', 'wt-thread-usage-label', 'Thread ID:');
+    const input = setAttributes(el('input', 'wt-thread-usage-input'), {
+      type: 'text',
+      name: 'thread-usage-id',
+      value: runtime.ui.threadUsageInput,
+      placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+      autocomplete: 'off',
+      spellcheck: 'false',
+      'aria-describedby': 'wt-thread-usage-dialog-hint'
+    });
+    input.addEventListener('input', () => {
+      runtime.ui.threadUsageInput = input.value;
+      runtime.ui.threadUsageValidationError = null;
+    });
+    label.append(input);
+    const hint = el('p', 'wt-date-hint', '仅在本页内存中使用，不会保存。');
+    hint.id = 'wt-thread-usage-dialog-hint';
+    dialog.append(prompt, label, hint);
+    if (runtime.ui.threadUsageValidationError) dialog.append(el('p', 'wt-date-error', runtime.ui.threadUsageValidationError));
+    const message = threadUsageErrorMessage(provider);
+    if (message) dialog.append(el('p', `wt-notice ${provider.status === 'error' ? 'wt-notice-danger' : 'wt-notice-info'}`, message));
+    const actions = el('div', 'wt-thread-usage-actions');
+    const probe = setAttributes(el('button', 'wt-button'), { type: 'button', 'data-action': 'probe-thread-usage', disabled: runtime.ui.threadUsageProbeLoading ? 'true' : null });
+    probe.textContent = runtime.ui.threadUsageProbeLoading ? '检测中…' : '检测';
+    const close = setAttributes(el('button', 'wt-button wt-button-secondary'), { type: 'button', 'data-action': 'close-thread-usage-dialog' });
+    close.textContent = '关闭';
+    actions.append(probe, close);
+    dialog.append(actions);
+    return dialog;
+  }
+
   function renderDiagnostics() {
     const details = el('details', 'wt-diagnostics');
     details.append(el('summary', '诊断信息'));
     const lines = [
-      ['脚本版本', VERSION], ['当前路径', location.pathname], ['Usage HTTP 状态', runtime.state.diagnostics.usageStatus || '未请求'],
+      ['脚本版本', VERSION], ['当前路径', safeDiagnosticPath()], ['Usage HTTP 状态', runtime.state.diagnostics.usageStatus || '未请求'],
       ['Analytics HTTP 状态', runtime.state.diagnostics.analyticsStatus || '未请求'], ['model breakdown status', runtime.state.diagnostics.modelBreakdownStatus || '未请求'],
       ['model rows count', runtime.state.diagnostics.modelRows], ['cost provider source', runtime.state.diagnostics.costProviderSource], ['cost confidence', runtime.state.diagnostics.costConfidence], ['请求模式', runtime.state.diagnostics.usageMode],
       ['获取时间', formatDate(runtime.state.fetchedAt)], ['原始 plan_type', runtime.state.data && runtime.state.data.plan.rawType],
@@ -1538,6 +1795,8 @@
       const summary = `${window.label} · ${window.sourcePath}`;
       details.append(field('窗口', `${summary} · 周期 ${window.durationSeconds === null ? '未提供' : `${window.durationSeconds} 秒`} · used ${window.hasUsedPercent ? '已识别' : '未提供'} · resetAt ${window.hasResetAt ? '已识别' : '未提供'}`));
     }
+    details.append(renderThreadUsageCapability());
+    if (runtime.ui.threadUsageDialogOpen) details.append(renderThreadUsageDialog());
     const copy = el('button', 'wt-button wt-button-secondary', '复制诊断信息');
     copy.type = 'button';
     copy.dataset.action = 'copy-diagnostics';
@@ -1546,8 +1805,9 @@
   }
 
   function diagnosticText() {
+    const threadUsage = runtime.state.threadUsageProvider;
     const lines = [
-      `脚本版本: ${VERSION}`, `当前路径: ${location.pathname}`, `Usage HTTP 状态: ${runtime.state.diagnostics.usageStatus || '未请求'}`,
+      `脚本版本: ${VERSION}`, `当前路径: ${safeDiagnosticPath()}`, `Usage HTTP 状态: ${runtime.state.diagnostics.usageStatus || '未请求'}`,
       `Analytics HTTP 状态: ${runtime.state.diagnostics.analyticsStatus || '未请求'}`, `model breakdown status: ${runtime.state.diagnostics.modelBreakdownStatus || '未请求'}`, `model rows count: ${runtime.state.diagnostics.modelRows}`, `cost provider source: ${runtime.state.diagnostics.costProviderSource}`, `cost confidence: ${runtime.state.diagnostics.costConfidence}`, `请求模式: ${runtime.state.diagnostics.usageMode}`,
       `获取时间: ${formatDate(runtime.state.fetchedAt)}`, `原始 plan_type: ${runtime.state.data ? runtime.state.data.plan.rawType || '未提供' : '未提供'}`,
       `当前选中范围: ${runtime.prefs.range}`, `自定义开始日期: ${runtime.prefs.customStart || '未提供'}`, `自定义结束日期: ${runtime.prefs.customEnd || '未提供'}`,
@@ -1555,7 +1815,8 @@
       `最后一次 Analytics 请求范围: ${runtime.state.analytics.lastRequest ? `${runtime.state.analytics.lastRequest.start}..${runtime.state.analytics.lastRequest.end}` : '未请求'}`,
       `命中内存 coverage: ${runtime.state.analytics.cacheHit ? '是' : '否'}`, `当前范围日期桶数: ${runtime.state.analytics.selectedBucketCount}`,
       `成功解析窗口数量: ${runtime.state.diagnostics.windowCount}`, `主额度窗口数量: ${runtime.state.diagnostics.primaryWindowCount}`, `额外额度窗口数量: ${runtime.state.diagnostics.additionalWindowCount}`, `每日数据行数: ${runtime.state.diagnostics.dailyRows}`,
-      `客户端类型: ${runtime.state.diagnostics.clientTypes.join(', ') || '未提供'}`, `未识别顶层字段: ${runtime.state.diagnostics.unknownFields.join(', ') || '无'}`, `错误代码: ${runtime.state.diagnostics.errors.join(', ') || '无'}`
+      `客户端类型: ${runtime.state.diagnostics.clientTypes.join(', ') || '未提供'}`, `未识别顶层字段: ${runtime.state.diagnostics.unknownFields.join(', ') || '无'}`, `错误代码: ${runtime.state.diagnostics.errors.join(', ') || '无'}`,
+      `threadUsageStatus=${threadUsage.status}`, `threadUsageTokenBreakdown=${threadUsage.supportsTokenBreakdown}`, `threadUsageUsdEstimate=${threadUsage.supportsUsdEstimate}`, `threadUsageCreditEstimate=${threadUsage.supportsCreditEstimate}`, `threadUsageCheckedAt=${threadUsage.checkedAt === null ? '未检测' : formatDate(threadUsage.checkedAt)}`
     ];
     for (const window of runtime.state.diagnostics.windows) {
       lines.push(`窗口: ${window.label} | ${window.sourcePath} | durationSeconds=${window.durationSeconds === null ? 'null' : window.durationSeconds} | usedPercent=${window.hasUsedPercent ? 'present' : 'missing'} | resetAt=${window.hasResetAt ? 'present' : 'missing'}`);
@@ -1885,6 +2146,22 @@
       runtime.prefs.collapsed = !runtime.prefs.collapsed; writePreference(PREF_KEYS.collapsed, runtime.prefs.collapsed); render();
     } else if (action === 'refresh') {
       refresh();
+    } else if (action === 'open-thread-usage-dialog') {
+      runtime.ui.threadUsageDialogOpen = true;
+      runtime.ui.threadUsageInput = currentPageThreadId();
+      runtime.ui.threadUsageValidationError = null;
+      render();
+      requestAnimationFrame(() => runtime.shadow?.querySelector('[name="thread-usage-id"]')?.focus());
+    } else if (action === 'close-thread-usage-dialog') {
+      runtime.threadUsageAbortController?.abort();
+      runtime.threadUsageAbortController = null;
+      runtime.ui.threadUsageDialogOpen = false;
+      runtime.ui.threadUsageInput = '';
+      runtime.ui.threadUsageValidationError = null;
+      runtime.ui.threadUsageProbeLoading = false;
+      render();
+    } else if (action === 'probe-thread-usage') {
+      beginThreadUsageProbe();
     } else if (action === 'copy-diagnostics') {
       if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
         actionTarget.textContent = '复制不可用';
@@ -1921,7 +2198,7 @@
       .wt-range-selector { display: flex; gap: 3px; margin-bottom: 10px; max-width: 100%; overflow-x: auto; padding: 2px; scrollbar-width: thin; } .wt-range-button { background: transparent; border: 1px solid transparent; border-radius: 8px; color: var(--wt-color-text-secondary); cursor: pointer; flex: 0 0 auto; min-height: 36px; padding: 6px 10px; white-space: nowrap; } .wt-range-button:hover { background: var(--wt-color-surface); color: var(--wt-color-text); } .wt-range-button-active { background: var(--wt-color-surface-secondary); border-color: var(--wt-color-border); color: var(--wt-color-text); font-weight: 600; }
       .wt-custom-range { background: var(--wt-color-surface); border-radius: 10px; margin-bottom: 10px; padding: 10px; } .wt-date-fields { display: grid; gap: 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); } .wt-date-label { color: var(--wt-color-text-secondary); display: flex; flex-direction: column; font-size: 11px; gap: 4px; } .wt-date-input { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 8px; color: var(--wt-color-text); min-height: 38px; min-width: 0; padding: 7px; } .wt-date-hint { color: var(--wt-color-text-tertiary); font-size: 11px; margin: 7px 0 0; } .wt-date-error { color: var(--wt-color-danger); font-size: 11px; min-height: 16px; margin: 5px 0 0; } .wt-custom-actions { display: flex; flex-wrap: wrap; gap: 6px; }
       .wt-chart-shell { position: relative; } .wt-chart-scroll { align-items: end; border-bottom: 1px solid var(--wt-color-border); display: flex; gap: 4px; height: 132px; overflow-x: auto; padding: 8px 2px 0; } .wt-chart-column { align-items: center; border-radius: 4px; display: flex; flex: 1 0 16px; flex-direction: column; height: 100%; justify-content: end; min-width: 16px; } .wt-chart-column:focus-visible { outline: 2px solid var(--wt-color-focus); outline-offset: 2px; } .wt-chart-bar { background: var(--wt-color-chart); border-radius: 3px 3px 0 0; min-height: 3px; width: 100%; } .wt-chart-label { color: var(--wt-color-text-tertiary); font-size: 9px; margin-top: 4px; white-space: nowrap; } .wt-chart-tooltip { background: var(--wt-color-surface); border: 1px solid var(--wt-color-border); border-radius: 8px; box-shadow: 0 8px 24px rgb(0 0 0 / 18%); color: var(--wt-color-text); display: flex; flex-direction: column; font-size: 11px; max-width: calc(100% - 8px); padding: 7px 9px; pointer-events: none; position: absolute; white-space: nowrap; z-index: 2; } .wt-chart-tooltip[hidden] { display: none; } .wt-chart-tooltip-date { color: var(--wt-color-text-secondary); } .wt-chart-tooltip-value { font-variant-numeric: tabular-nums; margin-top: 2px; }
-      .wt-diagnostics { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 12px; padding-top: 10px; } .wt-diagnostics summary { margin-bottom: 8px; } .wt-diagnostics .wt-field { margin: 6px 0; } .wt-loading { min-height: 120px; padding-top: 18px; } .wt-chart-select { margin-left: auto; }
+      .wt-diagnostics { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 12px; padding-top: 10px; } .wt-diagnostics summary { margin-bottom: 8px; } .wt-diagnostics .wt-field { margin: 6px 0; } .wt-thread-usage { border-top: 1px solid var(--wt-color-border-subtle); margin-top: 10px; padding-top: 10px; } .wt-thread-usage-dialog { background: var(--wt-color-surface); border: 1px solid var(--wt-color-border); border-radius: 10px; margin-top: 10px; padding: 10px; } .wt-thread-usage-prompt, .wt-thread-usage-label { color: var(--wt-color-text-secondary); font-size: 12px; } .wt-thread-usage-prompt { margin: 6px 0 8px; } .wt-thread-usage-label { display: flex; flex-direction: column; gap: 4px; } .wt-thread-usage-input { background: var(--wt-color-bg); border: 1px solid var(--wt-color-border); border-radius: 8px; color: var(--wt-color-text); min-height: 38px; min-width: 0; padding: 7px; } .wt-thread-usage-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; } .wt-button:disabled, .wt-icon-button:disabled { cursor: wait; opacity: .6; } .wt-loading { min-height: 120px; padding-top: 18px; } .wt-chart-select { margin-left: auto; }
       @keyframes wt-spin { to { transform: rotate(360deg); } } @media (max-width: 480px) { :host([data-wt-mode="expanded"]) { width: calc(100vw - 24px); } .wt-body { max-height: 68vh; padding-left: 12px; padding-right: 12px; } .wt-header { padding-left: 12px; padding-right: 12px; } } @media (max-width: 340px) { .wt-account-summary { align-items: start; } .wt-account-side { align-items: flex-start; grid-column: 1 / -1; padding-left: 44px; } .wt-date-fields { grid-template-columns: 1fr; } .wt-range-button { padding-left: 8px; padding-right: 8px; } }
       @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; } }
     `;
@@ -1992,6 +2269,7 @@
     cancelPositionFrame();
     runtime.ui.tooltipTimer = null;
     runtime.abortController?.abort();
+    resetThreadUsageProbe();
     runtime.observers.forEach((observer) => observer.disconnect());
     runtime.bodyObserver?.disconnect();
     runtime.bodyObserver = null;

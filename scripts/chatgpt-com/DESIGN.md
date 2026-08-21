@@ -39,7 +39,7 @@ The references inform roles, contrast, density, accessible component behavior, a
 
 ## Data semantics and integration contracts
 
-The 1.3.0 contract treats `/backend-api/wham/usage/daily-token-usage-breakdown` as a ChatGPT Analytics data source. When the response declares `units: "percent"`, its `credits` values mean percentage/model-usage share. The UI must not render that field as Credits, Token usage, or token percentage. This document describes the integration contract; the future thread-level cost provider remains unavailable.
+The 1.3.0 contract treats `/backend-api/wham/usage/daily-token-usage-breakdown` as a ChatGPT Analytics data source. When the response declares `units: "percent"`, its `credits` values mean percentage/model-usage share. The UI must not render that field as Credits, Token usage, or token percentage. Thread Usage is a separate diagnostic capability provider and must not be mixed into the normal quota or cost surfaces.
 
 ### Model usage component
 
@@ -57,7 +57,13 @@ The cost component must label its source and confidence:
 
 The internal cost result should preserve `valueUsd`, `source`, `confidence`, `coveragePercent`, and safe `notes` fields. The pricing seam is a per-model `MODEL_PRICING` table containing input, cached-input, output prices, and an effective date for `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5`. `estimateApiCost({ model, inputTokens, cachedInputTokens, outputTokens })` uses uncached input cost plus cached input cost plus output cost; it must not use total Tokens times an average price or percentage times USD.
 
-`usageCostProviders` keeps `analyticsProvider` separate from `threadUsageProvider`. The thread provider is currently unavailable. `/backend-api/wham/usage/thread_usage/query` is a future integration boundary and must not be treated as an available endpoint or replaced with a fake query.
+`usageCostProviders` keeps `analyticsProvider` separate from `threadUsageProvider`. The Thread Usage provider may probe `/backend-api/wham/usage/thread_usage/query` only after an explicit diagnostic action with one real UUID-form thread ID. Its result is capability metadata, not a cost source: it must not calculate billing, convert Credits, or display server-estimated micros values as a dollar amount.
+
+### Thread Usage capability diagnostic
+
+Place the probe inside the existing collapsed `诊断信息` disclosure. The compact action opens a small dialog with a labeled Thread ID input and `检测`/`关闭` buttons. Prefill only an already available `/c/<thread-id>` page ID; do not implement broad thread discovery, history crawling, or automatic probing. Reject malformed UUIDs before the network layer.
+
+The provider state is kept in memory and exposes `status`, `checkedAt`, `endpointAvailable`, `threadUsageSupported`, `supportsTokenBreakdown`, `supportsUsdEstimate`, `supportsCreditEstimate`, and a safe `lastError` code. A 200 empty `threads` result means that the endpoint is reachable but returned no queryable thread data; it is not a definitive unsupported-account conclusion. 403 means the endpoint exists but the account may lack permission, 404 means unavailable or hidden, and timeout means the check timed out. The UI may show status, HTTP code, capability booleans, and check time, but never the input ID, response body, account ID, cookie, token, or authorization header.
 
 ## Color tokens
 
@@ -147,10 +153,11 @@ The panel should use a small number of clear sections rather than a stack of vis
 - **Client distribution:** client name, token share, and a compact secondary metrics line; avoid an unreadable sentence of equal-weight numbers.
 - **Model usage distribution:** model and speed labels with merged, descending percentage shares; hide zero values and never invent token counts. This component should identify the values as Analytics/model usage share, not Token usage.
 - **Cost estimate:** a compact amount/status row with an explicit `Real server cost` or `API-equivalent estimate` label when supported. Without authoritative cost or reliable model-level Token attribution, render only the unavailable explanation and no dollar amount.
+- **Thread Usage diagnostic:** a compact status block inside diagnostics with endpoint status, Token breakdown support, server-estimate field support, and check time. It is not part of daily usage or cost UI.
 - **Daily trend:** native CSS only; each bar is the actual Analytics value for one UTC date bucket, with a custom Tooltip for hover, focus, and touch that preserves source precision and does not estimate missing dates as zero.
 - **Range selector:** compact keyboard-operable control for current cycle, month, 7 days, 30 days, and custom.
 - **Custom date editor:** native date inputs with labels, inclusive end-date language, inline validation, apply/cancel, and an `aria-live` error region.
-- **Footer and diagnostics:** necessary explanatory notices and a safe, collapsed diagnostic disclosure; no settings or official-link footer. Safe diagnostics may include model-breakdown status, model-row count, cost-provider source, and cost confidence only.
+- **Footer and diagnostics:** necessary explanatory notices and a safe, collapsed diagnostic disclosure; no settings or official-link footer. Safe diagnostics may include model-breakdown status, model-row count, cost-provider source, cost confidence, and Thread Usage status/capabilities/check time only.
 
 ## Theme behavior
 
@@ -195,6 +202,7 @@ Use only generic activity, usage, gauge, chart, refresh, settings, and collapse 
 - Treating `5X` or `20X` as a quota calculator, billing amount, renewal state, or guaranteed message count.
 - Hardcoding plan prices or replacing server-provided quota windows with marketing-tier assumptions.
 - Displaying a raw token, account ID, cookie, session, full email, or original response in the UI, console, clipboard, or persistent storage.
+- Displaying or persisting a manually entered Thread ID outside the temporary diagnostic input, automatically scanning thread history, or probing Thread Usage during ordinary refresh.
 - Saving analytics rows, client aggregates, token totals, or usage history in `localStorage` or IndexedDB; analytics is memory-only.
 - Requesting analytics once per day or once per range bucket; one requested range must not become a per-day request loop.
 - Showing empty metric cards, fabricated percentages, or a gray “completed” bar when the source value is unknown.
@@ -206,6 +214,7 @@ Use only generic activity, usage, gauge, chart, refresh, settings, and collapse 
 - Using a large primary “manual refresh” block that competes with account and quota data.
 - Rendering the Analytics model-breakdown `credits` field as Credits, Token usage, or a token percentage.
 - Showing a dollar amount from model share alone, or presenting an API-equivalent estimate as real server cost.
+- Treating detected server-estimated USD/Credits fields as billing output; the capability probe only reports that those fields exist.
 - Copying Tokens, cookies, authorization values, account IDs, or raw responses into diagnostics.
 - Building a custom calendar, adding a chart library, adding a remote dependency, or introducing a broad permission solely for visual polish.
 - Depending only on `prefers-color-scheme`, creating a new host on each theme change, or attaching duplicate listeners during SPA navigation.

@@ -2,7 +2,7 @@
 
 `account-usage-dashboard.user.js` adds a small floating usage icon to `chatgpt.com`. Click it to open the full, draggable account-usage panel. It is a standalone Tampermonkey/Violentmonkey userscript and does not require a build step, package manager, or remote dependency.
 
-Version 1.3.0 adds the model-usage and source-aware cost semantics described below. Availability remains determined by the installed script and its data sources.
+Version 1.3.0 adds model-usage semantics and a diagnostic-only Thread Usage capability probe. The probe checks whether the current account can query one real Codex thread; it does not calculate billing.
 
 ## Installation
 
@@ -10,14 +10,15 @@ Install Tampermonkey or Violentmonkey, then open the [raw userscript](https://ra
 
 ## Data sources and fallback behavior
 
-The script only makes same-origin, read-only GET requests to the current ChatGPT page:
+The script only makes same-origin, read-only requests to the current ChatGPT page:
 
 - `/api/auth/session` supplies the display name, masked email, and narrowly selected in-memory authentication fallback fields.
 - `/backend-api/wham/usage` supplies the plan, rate-limit windows, credits, and usage state.
 - `/backend-api/wham/analytics/daily-workspace-usage-counts` supplies one date range of optional daily statistics, which is then filtered and aggregated in memory for the displayed ranges.
 - `/backend-api/wham/usage/daily-token-usage-breakdown` is the Analytics data source for the model-usage breakdown. Its `credits` field is interpreted according to the response's `units: "percent"` declaration as a percentage/model-usage share, not as the dashboard's Credits field and not as a token percentage.
+- `/backend-api/wham/usage/thread_usage/query` is used only after the user starts the diagnostic action and supplies a real UUID-form Codex thread ID. It receives one `POST` body containing that ID and is never used for automatic history scanning.
 
-The usage request first uses cookie-only credentials. A 401/403 response may trigger a session lookup and one authenticated retry using an access token and account ID held only in memory. Analytics is optional: a 403, 404, timeout, empty response, or schema change leaves the account and quota sections available and marks only the analytics area as unavailable or partial. The normalizer understands primary/secondary windows inside `rate_limit`, arrays and maps under `rate_limits`, and wrapped `additional_rate_limits` entries. The model-breakdown endpoint is also optional and is treated as Analytics data; it is not a thread-level token ledger.
+The usage and Thread Usage requests first use cookie-only credentials. A 401/403 response may trigger a session lookup and one authenticated retry using an access token and account ID held only in memory; neither value is persisted or displayed. Analytics is optional: a 403, 404, timeout, empty response, or schema change leaves the account and quota sections available and marks only the analytics area as unavailable or partial. The normalizer understands primary/secondary windows inside `rate_limit`, arrays and maps under `rate_limits`, and wrapped `additional_rate_limits` entries. The model-breakdown endpoint is also optional and is treated as Analytics data; it is not a thread-level token ledger.
 
 ## Displayed fields
 
@@ -34,7 +35,8 @@ The compact view is only an icon with an optional health dot; it does not show t
 - fixed five-minute automatic refresh;
 - opening official Analytics in a new tab;
 - collapsing the panel;
-- safe diagnostics.
+- safe diagnostics;
+- a collapsed Thread Usage API diagnostic showing endpoint status, capability fields, and last-check time. The entered thread ID is never shown in diagnostics.
 
 ## UI design and product boundary
 
@@ -60,11 +62,17 @@ The integration boundary reserves the following internal architecture for 1.3.0-
 - `MODEL_PRICING` is a per-model table with input, cached-input, output prices, and an effective date. It must cover `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5`; it must not substitute one global price for all models.
 - A rate card entry with no source-confirmed price remains unavailable rather than becoming a guessed amount; the current UI never turns model share into a dollar value.
 - `estimateApiCost({ model, inputTokens, cachedInputTokens, outputTokens })` calculates uncached input cost plus cached input cost plus output cost. It must not multiply total Tokens by an average price or multiply a percentage by USD.
-- `usageCostProviders` separates `analyticsProvider` from `threadUsageProvider`. The latter is currently unavailable; `/backend-api/wham/usage/thread_usage/query` is a future provider boundary, not an endpoint the current documentation claims is usable, and no fake thread query should be added.
+- `usageCostProviders` keeps `analyticsProvider` separate from `threadUsageProvider`. The Thread Usage provider is diagnostic-only: it reports endpoint and response capabilities but does not feed cost calculation, USD display, Credits conversion, or token billing estimation.
+
+## Thread Usage capability probe
+
+The collapsed `诊断信息` area contains `检测 Thread Usage 能力`. The small dialog accepts a UUID-form Codex thread ID, prefilling the current `/c/<thread-id>` page ID only when it is already present in the page URL. A valid ID triggers exactly one `POST /backend-api/wham/usage/thread_usage/query` request with `{"thread_ids":["<thread-id>"]}`; an invalid UUID is rejected before any request. The value is kept in memory only and is cleared on page refresh or when the dialog closes.
+
+The probe reports four independent facts: whether the endpoint responded, whether thread data was returned, whether any group exposed Token fields, and whether the response exposed server-estimated USD or Credits micros fields. A 200 response with an empty `threads` array is reported as `接口可访问，但没有返回可查询线程数据`, not as a definitive account restriction. A 403 means the endpoint exists but the account may not have permission; a 404 means the endpoint is unavailable or hidden; a timeout is reported as `检测超时`. The thread ID is visible only in the temporary input; no response body, thread ID, account ID, cookie, access token, or authorization header is shown in diagnostics or copied.
 
 ## Safe diagnostics
 
-Diagnostics may expose only redacted state useful for troubleshooting: model-breakdown status, model-row count, cost-provider source, and cost confidence. They must never expose Tokens, cookies, authorization values, account IDs, raw responses, or other authentication material. The same rule applies to the UI, console, clipboard, and persistent storage.
+Diagnostics may expose only redacted state useful for troubleshooting: model-breakdown status, model-row count, cost-provider source, cost confidence, and Thread Usage status/capabilities/check time. They must never expose Tokens, cookies, authorization values, account IDs, thread IDs, raw responses, or other authentication material. The same rule applies to the UI, console, clipboard, and persistent storage.
 
 ## Plan labels and quota semantics
 
@@ -85,11 +93,11 @@ Analytics supports the current cycle, current month, last 7 days, last 30 days, 
 
 Custom dates use UTC date buckets and an inclusive UI end date: `2026-08-01 — 2026-08-14` includes August 14. The request boundary converts that end date to the next UTC date for exclusive filtering. A custom range must be valid, must not end in the future, and is limited to a maximum of 366 days as a project-side defensive limit, not an OpenAI API limit.
 
-Daily analytics rows and derived client/metric aggregates are kept in memory only. The dashboard does not persist usage history, raw analytics responses, tokens, Credits, account identifiers, or client aggregates in `localStorage` or IndexedDB. Non-sensitive UI preferences may be persisted separately.
+Daily analytics rows, derived client/metric aggregates, and Thread Usage probe input/results are kept in memory only. The dashboard does not persist usage history, raw analytics responses, tokens, Credits, account identifiers, thread IDs, or client aggregates in `localStorage` or IndexedDB. Non-sensitive UI preferences may be persisted separately.
 
 ## Privacy and security
 
-The script only sends requests to `chatgpt.com`. It does not upload account or usage data, add telemetry, call third-party services, or perform account mutations. It does not persist tokens, cookies, account IDs, session objects, email addresses, usernames, raw payloads, or usage snapshots. Only non-sensitive UI preferences are saved: panel position, collapsed state, selected range, email visibility, chart metric, and custom start/end dates. Refresh is always fixed at five minutes and has no saved setting. Authentication values are never placed in the DOM, console, clipboard, or error text.
+The script only sends requests to `chatgpt.com`. It does not upload account or usage data, add telemetry, call third-party services, or perform account mutations. It does not persist tokens, cookies, account IDs, thread IDs, session objects, email addresses, usernames, raw payloads, or usage snapshots. Only non-sensitive UI preferences are saved: panel position, collapsed state, selected range, email visibility, chart metric, and custom start/end dates. Refresh is always fixed at five minutes and has no saved setting. Authentication values and Thread Usage input are never placed in the console, clipboard, or error text.
 
 ## Known limitations
 
@@ -97,7 +105,7 @@ The script only sends requests to `chatgpt.com`. It does not upload account or u
 - `plan_type` is a plan label, not proof of the complete billing or subscription lifecycle. The panel does not infer subscription validity from a plan name.
 - Analytics data may be delayed or unavailable for an account or plan. Daily aggregation uses UTC date buckets where possible; the trend does not estimate or interpolate values.
 - The model-breakdown Analytics data may be delayed or unavailable. Its percentages describe model usage share only; they do not provide model-level Token attribution, and therefore cannot support a dollar amount on their own.
-- Authoritative thread-level cost remains unavailable until a supported `thread_api` provider exists. The documentation reserves `MODEL_PRICING`, `estimateApiCost`, and `usageCostProviders` as integration seams; it does not treat `/backend-api/wham/usage/thread_usage/query` as currently available.
+- The Thread Usage capability probe does not calculate cost. Even when server-estimated USD or Credits fields are detected, they are reported only as capabilities; the dashboard does not display them as billing or convert Credits to USD.
 - When a current quota period is represented as daily rows, the reset day can include data from outside the exact quota boundary.
 - Percentages are shown only when supplied or safely derived from the other percentage; unknown percentages use an empty track and an explicit notice rather than a fabricated grey fill. The script does not invent an official total quota, message count, or token total.
 - A real signed-in browser session is required for live account data. This repository validation cannot guarantee access to a user's private ChatGPT session.
@@ -114,8 +122,10 @@ On a disposable browser profile or a signed-in ChatGPT session, verify:
 6. A usage response with missing, `null`, unknown, snake_case, camelCase, single-window, array, object, and additional-window shapes renders without an uncaught exception.
 7. Analytics ranges and client aggregates derive from one daily request, the daily trend Tooltip matches the returned row value, the model breakdown is identified as a percentage/model share from Analytics, and the title-bar Analytics link works.
 8. The title bar contains only refresh, official Analytics, and collapse; no footer settings/link block is rendered.
-9. Cost UI shows no amount without authoritative cost or reliable model-level Token attribution, and distinguishes server cost from API-equivalent estimation.
-10. The console and copied diagnostics contain no token, cookie, account ID, raw response, or full email; safe diagnostics are limited to model-breakdown status, row count, provider source, and confidence.
+9. The Thread Usage diagnostic rejects an invalid UUID without a network request, sends only the documented POST for a valid ID, and keeps the input out of storage and copied diagnostics.
+10. Mock 403, 404, 429, 5xx, timeout, and 200-empty-thread responses remain understandable; the empty response is not labeled as a definitive unsupported account.
+11. Cost UI shows no amount without authoritative cost or reliable model-level Token attribution, and distinguishes server cost from API-equivalent estimation.
+12. The console and copied diagnostics contain no token, cookie, account ID, thread ID, raw response, or full email; safe Thread Usage fields are limited to status, HTTP result, capability booleans, and check time.
 
 ## Maintenance notes
 
