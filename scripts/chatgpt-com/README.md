@@ -2,6 +2,8 @@
 
 `account-usage-dashboard.user.js` adds a small floating usage icon to `chatgpt.com`. Click it to open the full, draggable account-usage panel. It is a standalone Tampermonkey/Violentmonkey userscript and does not require a build step, package manager, or remote dependency.
 
+Version 1.3.0 adds the model-usage and source-aware cost semantics described below. Availability remains determined by the installed script and its data sources.
+
 ## Installation
 
 Install Tampermonkey or Violentmonkey, then open the [raw userscript](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/chatgpt-com/account-usage-dashboard.user.js) and confirm installation. Open or reload a `https://chatgpt.com/` page while signed in.
@@ -13,8 +15,9 @@ The script only makes same-origin, read-only GET requests to the current ChatGPT
 - `/api/auth/session` supplies the display name, masked email, and narrowly selected in-memory authentication fallback fields.
 - `/backend-api/wham/usage` supplies the plan, rate-limit windows, credits, and usage state.
 - `/backend-api/wham/analytics/daily-workspace-usage-counts` supplies one date range of optional daily statistics, which is then filtered and aggregated in memory for the displayed ranges.
+- `/backend-api/wham/usage/daily-token-usage-breakdown` is the Analytics data source for the model-usage breakdown. Its `credits` field is interpreted according to the response's `units: "percent"` declaration as a percentage/model-usage share, not as the dashboard's Credits field and not as a token percentage.
 
-The usage request first uses cookie-only credentials. A 401/403 response may trigger a session lookup and one authenticated retry using an access token and account ID held only in memory. Analytics is optional: a 403, 404, timeout, empty response, or schema change leaves the account and quota sections available and marks only the analytics area as unavailable or partial. The normalizer understands primary/secondary windows inside `rate_limit`, arrays and maps under `rate_limits`, and wrapped `additional_rate_limits` entries.
+The usage request first uses cookie-only credentials. A 401/403 response may trigger a session lookup and one authenticated retry using an access token and account ID held only in memory. Analytics is optional: a 403, 404, timeout, empty response, or schema change leaves the account and quota sections available and marks only the analytics area as unavailable or partial. The normalizer understands primary/secondary windows inside `rate_limit`, arrays and maps under `rate_limits`, and wrapped `additional_rate_limits` entries. The model-breakdown endpoint is also optional and is treated as Analytics data; it is not a thread-level token ledger.
 
 ## Displayed fields
 
@@ -23,8 +26,10 @@ The compact view is only an icon with an optional health dot; it does not show t
 - signed-in state, display name, masked email, plan context (including `Pro Lite` as a plan tier), usage status, and update time;
 - every recognized primary and additional rate-limit window, with duration, used/remaining percentages, progress, reset time, countdown, and limit state;
 - optional Credits and spend-control fields only when the server supplies values, without treating missing or `null` values as zero;
-- current quota period, month, last 7 days, and last 30 days, including credits, token classes, threads, turns, and dates with data;
+- current quota period, month, last 7 days, and last 30 days, including server-supplied Credits, token classes, threads, turns, and dates with data;
 - client aggregates sorted by tokens and a native CSS bar chart for the selected daily metric;
+- model usage rows when the model-breakdown data is available: the same model and speed are merged, rows are sorted in descending share order, zero-valued rows are hidden, and the value is shown as a percentage/model-usage share. The field is never presented as `Credits`, `Token usage`, or a fabricated token count;
+- source-aware cost status. A real server-side cost is labeled separately from an API-equivalent estimate. When model-level Token attribution is unavailable, no dollar amount is shown and the UI explains `API 等价成本暂不可计算` because the current interface provides model share but not model-level Token details;
 - manual refresh;
 - fixed five-minute automatic refresh;
 - opening official Analytics in a new tab;
@@ -38,6 +43,28 @@ The launcher is a 44–48px draggable utility button with a generic usage/activi
 The visual direction is a local adaptation of public [OpenAI Apps SDK UI](DESIGN.md#official-references) patterns. This is an unofficial userscript, not an OpenAI, ChatGPT, or Codex product. It does not use the OpenAI Logo, Blossom, wordmark, or other OpenAI marks; launcher icons are generic usage/activity symbols. See [`DESIGN.md`](DESIGN.md) for the complete site-level specification.
 
 The launcher and expanded panel share one size-independent viewport anchor. Expanding and collapsing therefore do not change the saved user position; dragging either state updates that anchor. Window-size changes may temporarily clamp the visible surface into the viewport without overwriting the saved position.
+
+## Model usage and cost contract
+
+The model-usage breakdown belongs to Usage Statistics and comes from ChatGPT Analytics. A response with `units: "percent"` makes each model/speed value a usage percentage or model share. The source field is named `credits`, but the UI must not call it Credits, Token usage, or token percentage. Same-model/same-speed entries are merged before descending sorting; zero values are omitted, and no token count is inferred from a percentage.
+
+Cost presentation must distinguish two meanings:
+
+- **Real server cost:** an authoritative amount from a future `thread_api` source, labeled as a server-reported cost.
+- **API-equivalent estimate:** an estimate from reliable model-level input, cached-input, and output Token attribution, labeled as an estimate rather than billing.
+
+If neither source is available, the panel must show no dollar amount and explain that the current interface provides model share but not model-level Token details. The dashboard does not claim real billing from model percentages.
+
+The integration boundary reserves the following internal architecture for 1.3.0-compatible implementations:
+
+- `MODEL_PRICING` is a per-model table with input, cached-input, output prices, and an effective date. It must cover `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5`; it must not substitute one global price for all models.
+- A rate card entry with no source-confirmed price remains unavailable rather than becoming a guessed amount; the current UI never turns model share into a dollar value.
+- `estimateApiCost({ model, inputTokens, cachedInputTokens, outputTokens })` calculates uncached input cost plus cached input cost plus output cost. It must not multiply total Tokens by an average price or multiply a percentage by USD.
+- `usageCostProviders` separates `analyticsProvider` from `threadUsageProvider`. The latter is currently unavailable; `/backend-api/wham/usage/thread_usage/query` is a future provider boundary, not an endpoint the current documentation claims is usable, and no fake thread query should be added.
+
+## Safe diagnostics
+
+Diagnostics may expose only redacted state useful for troubleshooting: model-breakdown status, model-row count, cost-provider source, and cost confidence. They must never expose Tokens, cookies, authorization values, account IDs, raw responses, or other authentication material. The same rule applies to the UI, console, clipboard, and persistent storage.
 
 ## Plan labels and quota semantics
 
@@ -69,6 +96,8 @@ The script only sends requests to `chatgpt.com`. It does not upload account or u
 - `/backend-api/wham/*` is an internal ChatGPT interface and may change without notice. Unknown fields are ignored and recognized fields remain best-effort.
 - `plan_type` is a plan label, not proof of the complete billing or subscription lifecycle. The panel does not infer subscription validity from a plan name.
 - Analytics data may be delayed or unavailable for an account or plan. Daily aggregation uses UTC date buckets where possible; the trend does not estimate or interpolate values.
+- The model-breakdown Analytics data may be delayed or unavailable. Its percentages describe model usage share only; they do not provide model-level Token attribution, and therefore cannot support a dollar amount on their own.
+- Authoritative thread-level cost remains unavailable until a supported `thread_api` provider exists. The documentation reserves `MODEL_PRICING`, `estimateApiCost`, and `usageCostProviders` as integration seams; it does not treat `/backend-api/wham/usage/thread_usage/query` as currently available.
 - When a current quota period is represented as daily rows, the reset day can include data from outside the exact quota boundary.
 - Percentages are shown only when supplied or safely derived from the other percentage; unknown percentages use an empty track and an explicit notice rather than a fabricated grey fill. The script does not invent an official total quota, message count, or token total.
 - A real signed-in browser session is required for live account data. This repository validation cannot guarantee access to a user's private ChatGPT session.
@@ -83,9 +112,10 @@ On a disposable browser profile or a signed-in ChatGPT session, verify:
 4. Light and dark themes, narrow viewports, keyboard focus, reduced motion, and screen-reader labels remain usable.
 5. Signed-out, 401/403, 404, 429, timeout, empty-analytics, and partial-schema states remain understandable.
 6. A usage response with missing, `null`, unknown, snake_case, camelCase, single-window, array, object, and additional-window shapes renders without an uncaught exception.
-7. Analytics ranges and client aggregates derive from one daily request, the daily trend Tooltip matches the returned row value, and the title-bar Analytics link works.
+7. Analytics ranges and client aggregates derive from one daily request, the daily trend Tooltip matches the returned row value, the model breakdown is identified as a percentage/model share from Analytics, and the title-bar Analytics link works.
 8. The title bar contains only refresh, official Analytics, and collapse; no footer settings/link block is rendered.
-9. The console and copied diagnostics contain no token, cookie, account ID, raw response, or full email.
+9. Cost UI shows no amount without authoritative cost or reliable model-level Token attribution, and distinguishes server cost from API-equivalent estimation.
+10. The console and copied diagnostics contain no token, cookie, account ID, raw response, or full email; safe diagnostics are limited to model-breakdown status, row count, provider source, and confidence.
 
 ## Maintenance notes
 

@@ -34,7 +34,30 @@ The references inform roles, contrast, density, accessible component behavior, a
 4. **Truthful uncertainty:** missing percentages, limits, dates, or analytics remain visibly unknown instead of becoming invented zeroes.
 5. **Neutral surfaces:** use restrained borders and elevation; do not turn every row into a heavy card.
 6. **Local adaptation:** borrow public design-system patterns and semantic roles, not OpenAI marks, proprietary product chrome, or an official-looking identity.
-7. **Defensive interaction:** initialization, navigation, theme synchronization, drag behavior, and event binding must be idempotent.
+7. **Source-aware cost:** distinguish authoritative server cost from API-equivalent estimation, and do not display an amount without the evidence needed to support it.
+8. **Defensive interaction:** initialization, navigation, theme synchronization, drag behavior, and event binding must be idempotent.
+
+## Data semantics and integration contracts
+
+The 1.3.0 contract treats `/backend-api/wham/usage/daily-token-usage-breakdown` as a ChatGPT Analytics data source. When the response declares `units: "percent"`, its `credits` values mean percentage/model-usage share. The UI must not render that field as Credits, Token usage, or token percentage. This document describes the integration contract; the future thread-level cost provider remains unavailable.
+
+### Model usage component
+
+The model-usage component sits inside Usage Statistics and uses a compact list rather than implying a token ledger. Normalize rows by merging the same model and speed, sort the merged rows in descending share order, hide zero-valued rows, and show the resulting percentage. Do not infer or display fake token counts from these shares. Keep the existing server-supplied Credits metric semantically separate from the Analytics response field named `credits`.
+
+### Cost estimate component
+
+The cost component must label its source and confidence:
+
+| Display meaning | Source | Confidence | Display rule |
+| --- | --- | --- | --- |
+| Real server cost | `thread_api` | `authoritative` | Show only an amount reported by an authoritative server source. |
+| API-equivalent estimate | `model_token_estimate` | `estimated` | Show only with reliable model-level input, cached-input, and output Token attribution. |
+| Cost unavailable | `unknown` | `unknown` | Show no dollar amount; explain that model share exists without model-level Token details. |
+
+The internal cost result should preserve `valueUsd`, `source`, `confidence`, `coveragePercent`, and safe `notes` fields. The pricing seam is a per-model `MODEL_PRICING` table containing input, cached-input, output prices, and an effective date for `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5`. `estimateApiCost({ model, inputTokens, cachedInputTokens, outputTokens })` uses uncached input cost plus cached input cost plus output cost; it must not use total Tokens times an average price or percentage times USD.
+
+`usageCostProviders` keeps `analyticsProvider` separate from `threadUsageProvider`. The thread provider is currently unavailable. `/backend-api/wham/usage/thread_usage/query` is a future integration boundary and must not be treated as an available endpoint or replaced with a fake query.
 
 ## Color tokens
 
@@ -100,7 +123,7 @@ The expanded panel is approximately 400px wide with `max-width: calc(100vw - 24p
 1. Header: `用量与额度`, update/status text, refresh, official Analytics icon, and collapse control.
 2. Compact account summary: identity and plan badge in one block, with no redundant full-width “signed in” row.
 3. Quota windows: primary and additional windows, percentages when known, progress, reset time, countdown, and state.
-4. Analytics: selected range, metric summary, client distribution, and a native CSS/SVG daily trend.
+4. Analytics: selected range, metric summary, client distribution, model usage distribution, source-aware cost state, and a native CSS/SVG daily trend.
 5. Footer: diagnostics and necessary explanatory notices only; automatic refresh is fixed at five minutes and has no settings UI.
 6. Diagnostics: collapsed by default and safe to copy.
 
@@ -120,12 +143,14 @@ The panel should use a small number of clear sections rather than a stack of vis
 - **Account summary:** display name and masked email together when available; show a plan badge beside that identity; omit missing fields rather than leaving blank rows.
 - **Quota window:** name, primary/additional context, used and remaining values, progressbar, reset information, and textual state.
 - **Badge and indicator:** compact semantic status, never status by color alone.
-- **Metric grid:** Tokens, Credits, Threads, and Turns first; token subtypes and date count are secondary detail.
+- **Metric grid:** Tokens, server-supplied Credits, Threads, and Turns first; token subtypes and date count are secondary detail. The Analytics model-breakdown `credits` field is a percentage/model share and must not be placed in the Credits metric.
 - **Client distribution:** client name, token share, and a compact secondary metrics line; avoid an unreadable sentence of equal-weight numbers.
-- **Daily trend:** native CSS only; each bar is the actual Analytics value for one UTC date bucket, with a custom Tooltip for hover, focus, and touch that preserves Credits precision and does not estimate missing dates as zero.
+- **Model usage distribution:** model and speed labels with merged, descending percentage shares; hide zero values and never invent token counts. This component should identify the values as Analytics/model usage share, not Token usage.
+- **Cost estimate:** a compact amount/status row with an explicit `Real server cost` or `API-equivalent estimate` label when supported. Without authoritative cost or reliable model-level Token attribution, render only the unavailable explanation and no dollar amount.
+- **Daily trend:** native CSS only; each bar is the actual Analytics value for one UTC date bucket, with a custom Tooltip for hover, focus, and touch that preserves source precision and does not estimate missing dates as zero.
 - **Range selector:** compact keyboard-operable control for current cycle, month, 7 days, 30 days, and custom.
 - **Custom date editor:** native date inputs with labels, inclusive end-date language, inline validation, apply/cancel, and an `aria-live` error region.
-- **Footer and diagnostics:** necessary explanatory notices and a safe, collapsed diagnostic disclosure; no settings or official-link footer.
+- **Footer and diagnostics:** necessary explanatory notices and a safe, collapsed diagnostic disclosure; no settings or official-link footer. Safe diagnostics may include model-breakdown status, model-row count, cost-provider source, and cost confidence only.
 
 ## Theme behavior
 
@@ -179,6 +204,9 @@ Use only generic activity, usage, gauge, chart, refresh, settings, and collapse 
 - Relying on the native `title` attribute as the only daily trend value display.
 - Repeating official links or automatic-refresh settings in a bottom footer.
 - Using a large primary “manual refresh” block that competes with account and quota data.
+- Rendering the Analytics model-breakdown `credits` field as Credits, Token usage, or a token percentage.
+- Showing a dollar amount from model share alone, or presenting an API-equivalent estimate as real server cost.
+- Copying Tokens, cookies, authorization values, account IDs, or raw responses into diagnostics.
 - Building a custom calendar, adding a chart library, adding a remote dependency, or introducing a broad permission solely for visual polish.
 - Depending only on `prefers-color-scheme`, creating a new host on each theme change, or attaching duplicate listeners during SPA navigation.
 - Using thick borders, repeated cards, gradients, logo-like geometry, bounce animations, or unnecessary `!important` rules.
