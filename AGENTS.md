@@ -12,6 +12,10 @@ WebTweaks is a lightweight collection of standalone userscripts. Tampermonkey is
 - Keep initialization idempotent, make DOM operations defensive, and consider SPA navigation when the target site needs it.
 - Prefix injected CSS classes with `wt-`, scope selectors, and avoid unnecessary `!important`.
 - Update a script's SemVer-style metadata version when its behavior changes. Update relevant documentation and the root README index.
+- Userscript versioning requirement:
+  - Any behavior change, feature addition, bug fix, or user-visible modification in a `.user.js` file MUST update the userscript `@version` metadata.
+  - A changed userscript without a version bump is incomplete because Tampermonkey and Violentmonkey use userscript metadata versions to determine available updates.
+  - When modifying a userscript, check the current `@version` before finishing, increment it according to semantic intent, and keep internal version constants synchronized when present.
 - Test syntax and important behaviors before finishing, including installation, page matching, repeated initialization, normal site behavior, relevant navigation, and unexpected console errors.
 - Never commit secrets, credentials, cookies, tokens, account identifiers, tracking, or unrelated local changes.
 - Report assumptions, validation performed, and remaining limitations.
