@@ -2,19 +2,16 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.3.0
-// @description  Threaded cross-page replies, client-side image previews, Imgur uploads, and navigation improvements for V2EX.
-// @description:zh-CN 为 V2EX 提供跨页楼中楼、浏览器侧图片预览、Imgur 上传和返回顶部功能。
+// @version      1.4.0
+// @description  Threaded cross-page replies, client-side image previews, and navigation improvements for V2EX.
+// @description:zh-CN 为 V2EX 提供跨页楼中楼、浏览器侧图片预览和返回顶部功能。
 // @author       KnowSky404
 // @match        https://v2ex.com/*
 // @match        https://*.v2ex.com/*
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
-// @grant        GM_xmlhttpRequest
-// @connect      api.imgur.com
 // @run-at       document-idle
 // @homepageURL  https://github.com/KnowSky404/WebTweaks/tree/main/scripts/v2ex-com
 // @supportURL   https://github.com/KnowSky404/WebTweaks/issues
@@ -26,16 +23,21 @@
   'use strict';
 
   const LOG_PREFIX = '[WebTweaks:V2EX]';
-  const SETTINGS_VERSION = 2;
+  const SETTINGS_VERSION = 3;
   const SETTINGS_KEY = 'wt-v2ex-settings';
   const MAX_PAGE_REQUESTS = 3;
   const PAGE_TIMEOUT_MS = 12_000;
-  const UPLOAD_TIMEOUT_MS = 30_000;
-  const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
   const SCROLL_THRESHOLD = 600;
   const IMAGE_CONTENT_SELECTOR = '.topic_content, .reply_content';
   const IMAGE_EXTENSION_PATTERN = /\.(?:jpe?g|png|gif|webp|avif)$/i;
   const IMAGE_URL_TOKEN_PATTERN = /https?:\/\/[^\s<>"']+/gi;
+  const SETTING_KEYS = new Set([
+    'version',
+    'preferredView',
+    'scrollTopEnabled',
+    'imagePreviewEnabled',
+    'imageLightboxEnabled'
+  ]);
 
   // Verified against public V2EX HTML on 2026-08-18. Fallbacks are intentionally narrow.
   const SELECTORS = Object.freeze({
@@ -56,9 +58,6 @@
   const runtime = {
     settings: loadSettings(),
     topic: null,
-    enhancedEditors: new WeakSet(),
-    editorObserver: null,
-    editorScanFrame: 0,
     controlDock: null,
     conversationToggle: null,
     conversationPanel: null,
@@ -67,6 +66,7 @@
     scrollFrame: 0,
     nativeReplyListenerAttached: false,
     navigationAttached: false,
+    navigationSchedule: 0,
     navigationSync: false,
     imageDelegationAttached: false,
     imageLightbox: null,
@@ -100,26 +100,20 @@
     }
   }
 
-  function safeDelete(key) {
-    try {
-      if (typeof GM_deleteValue === 'function') GM_deleteValue(key);
-    } catch (error) {
-      logError(error);
-    }
-  }
-
   function loadSettings() {
     const stored = safeGet(SETTINGS_KEY, {});
     const value = stored && typeof stored === 'object' ? stored : {};
-    return {
+    const settings = {
       version: SETTINGS_VERSION,
       preferredView: value.preferredView === 'original' ? 'original' : 'threaded',
-      imgurClientId: typeof value.imgurClientId === 'string' ? value.imgurClientId.trim() : '',
       scrollTopEnabled: value.scrollTopEnabled !== false,
-      uploaderEnabled: value.uploaderEnabled !== false,
       imagePreviewEnabled: value.imagePreviewEnabled !== false,
       imageLightboxEnabled: value.imageLightboxEnabled !== false
     };
+    if (value.version !== SETTINGS_VERSION || Object.keys(value).some((key) => !SETTING_KEYS.has(key))) {
+      safeSet(SETTINGS_KEY, settings);
+    }
+    return settings;
   }
 
   function saveSettings() {
@@ -128,19 +122,6 @@
 
   function registerMenuCommands() {
     if (typeof GM_registerMenuCommand !== 'function') return;
-    GM_registerMenuCommand('设置 Imgur Client ID', configureClientId);
-    GM_registerMenuCommand('清除 Imgur Client ID', () => {
-      runtime.settings.imgurClientId = '';
-      safeDelete(`${SETTINGS_KEY}.imgurClientId`);
-      saveSettings();
-      updateAllEditorStatuses('Imgur Client ID 已清除');
-    });
-    GM_registerMenuCommand('开启/关闭图片上传', () => {
-      runtime.settings.uploaderEnabled = !runtime.settings.uploaderEnabled;
-      saveSettings();
-      updateAllEditorStatuses(runtime.settings.uploaderEnabled ? '图片上传已开启' : '图片上传已关闭');
-      scanEditors();
-    });
     GM_registerMenuCommand('开启/关闭评论图片自动展开', () => {
       runtime.settings.imagePreviewEnabled = !runtime.settings.imagePreviewEnabled;
       saveSettings();
@@ -172,20 +153,6 @@
     });
   }
 
-  function configureClientId() {
-    const current = runtime.settings.imgurClientId;
-    const value = window.prompt('请输入 Imgur API Client ID（只需要 Client ID，不要输入 Client Secret）：', current);
-    if (value === null) return;
-    const clientId = value.trim();
-    if (!clientId || /\s/.test(clientId)) {
-      updateAllEditorStatuses('Client ID 不能为空且不能包含空格');
-      return;
-    }
-    runtime.settings.imgurClientId = clientId;
-    saveSettings();
-    updateAllEditorStatuses('Imgur Client ID 已保存，可以上传图片');
-  }
-
   function firstMatch(root, selectors) {
     for (const selector of selectors) {
       const match = root.querySelector(selector);
@@ -211,8 +178,15 @@
   function topicContext() {
     const match = location.pathname.match(/^\/t\/(\d+)\/?$/);
     if (!match) return null;
-    const page = Math.max(1, Number(new URL(location.href).searchParams.get('p') || 1));
-    return { id: match[1], page, key: `${location.origin}${location.pathname}?p=${page}` };
+    const rawPage = new URL(location.href).searchParams.get('p');
+    const parsedPage = Number.parseInt(rawPage || '1', 10);
+    const page = Number.isInteger(parsedPage) && parsedPage > 0 ? parsedPage : 1;
+    return { id: match[1], page, key: `${location.origin}/t/${match[1]}?p=${page}` };
+  }
+
+  function isCurrentTopic(topic) {
+    const context = topicContext();
+    return runtime.topic === topic && context?.key === topic.key && context.page === topic.currentPage;
   }
 
   function discoverPages(context) {
@@ -865,12 +839,15 @@
   }
 
   async function loadAllTopicPages(topic) {
-    if (topic.loading || !topic.incomplete) return;
+    if (topic.loading || !topic.incomplete || !isCurrentTopic(topic)) return;
     topic.loading = true;
     updateTopicPanel(topic);
     setTopicStatus(topic, `正在加载 0 / ${topic.maxPage} 页`);
     const pages = topic.pages.filter((page) => !topic.loadedPages.has(page));
-    const results = await loadPages(topic, pages, (completed, total) => setTopicStatus(topic, `正在加载 ${completed} / ${total} 页`));
+    const results = await loadPages(topic, pages, (completed, total) => {
+      if (isCurrentTopic(topic)) setTopicStatus(topic, `正在加载 ${completed} / ${total} 页`);
+    });
+    if (!isCurrentTopic(topic)) return;
     let failures = 0;
     results.forEach((result) => {
       if (result?.error) failures += 1;
@@ -918,6 +895,7 @@
     const topic = {
       context,
       key: context.key,
+      currentPage: context.page,
       nativeReplies,
       panel: null,
       threadedView,
@@ -943,13 +921,14 @@
     renderThreadedView(topic);
     if (topic.maxPage > 10) {
       topic.incomplete = true;
-      setTopicStatus(topic, `当前显示第 ${context.page} 页；完整关系需要加载全部 ${topic.maxPage} 页`);
+      setTopicStatus(topic, `当前显示第 ${topic.currentPage} 页；完整关系需要加载全部 ${topic.maxPage} 页`);
       updateTopicPanel(topic);
     } else if (topic.pages.length > 1) {
       topic.incomplete = true;
       updateTopicPanel(topic);
       setTopicStatus(topic, `正在加载 0 / ${topic.pages.length - 1} 页`);
       void loadAllTopicPages(topic).catch((error) => {
+        if (!isCurrentTopic(topic)) return;
         topic.loading = false;
         topic.failed = true;
         setTopicStatus(topic, '分页解析失败，已保留原始顺序');
@@ -985,7 +964,10 @@
   }
 
   async function synchronizeTopicPage() {
-    if (runtime.navigationSync) return;
+    if (runtime.navigationSync) {
+      scheduleTopicSynchronization();
+      return;
+    }
     const context = topicContext();
     if (runtime.topic?.key === context?.key) {
       scanImageContent(document);
@@ -1007,11 +989,14 @@
       scanImageContent(document);
     } finally {
       runtime.navigationSync = false;
+      if (runtime.topic && runtime.topic.key !== topicContext()?.key) scheduleTopicSynchronization();
     }
   }
 
   function scheduleTopicSynchronization() {
-    window.setTimeout(() => {
+    if (runtime.navigationSchedule) return;
+    runtime.navigationSchedule = window.setTimeout(() => {
+      runtime.navigationSchedule = 0;
       void synchronizeTopicPage().catch(logError);
     }, 0);
   }
@@ -1046,13 +1031,6 @@
     const action = form?.getAttribute('action') || '';
     const nearbyEditor = editor.closest('#reply-box, #new-topic, #topic-editor, [id*="reply"], [id*="topic"]');
     return id === 'reply_content' || id === 'topic_content' || /\/t\/\d+/.test(action) || /(?:^|\/)new(?:$|[/?#])/.test(action) || Boolean(nearbyEditor);
-  }
-
-  function isReplyEditor(editor) {
-    if (!isSupportedEditor(editor)) return false;
-    if ((editor.id || '').toLowerCase() === 'reply_content') return true;
-    const action = editor.closest('form')?.getAttribute('action') || '';
-    return Boolean(topicContext()) && /\/t\/\d+/.test(action) && (editor.id || '').toLowerCase() !== 'topic_content';
   }
 
   function insertAtSelection(editor, text) {
@@ -1104,221 +1082,6 @@
     if (runtime.nativeReplyListenerAttached) return;
     runtime.nativeReplyListenerAttached = true;
     document.addEventListener('click', enhanceNativeReplyAction, true);
-  }
-
-  function updateAllEditorStatuses(message) {
-    document.querySelectorAll('.wt-v2ex-upload-status').forEach((status) => {
-      status.textContent = message;
-    });
-    document.querySelectorAll('.wt-v2ex-editor-tools').forEach((tools) => {
-      tools.hidden = !runtime.settings.uploaderEnabled;
-      const configure = tools.querySelector('.wt-v2ex-configure-imgur');
-      if (configure) configure.hidden = Boolean(runtime.settings.imgurClientId);
-    });
-  }
-
-  function setUploadStatus(editor, message, type = '') {
-    const status = editor.parentElement?.querySelector('.wt-v2ex-upload-status');
-    if (!status) return;
-    status.className = `wt-v2ex-upload-status ${type ? `wt-v2ex-upload-status-${type}` : ''}`.trim();
-    status.textContent = message;
-  }
-
-  function describeUploadError(error) {
-    if (error.code === 'client-id') return 'Imgur Client ID 无效';
-    if (error.code === 'quota') return 'Imgur 上传额度已用尽';
-    if (error.code === 'too-large') return '图片过大，未上传';
-    if (error.code === 'timeout') return '网络超时';
-    if (error.code === 'network' || error.code === 'server') return 'Imgur 暂时不可用';
-    return error.message || '响应格式异常';
-  }
-
-  function requestImgur(file, retry = 0) {
-    return new Promise((resolve, reject) => {
-      if (!runtime.settings.imgurClientId) {
-        reject(Object.assign(new Error('需要 Client ID'), { code: 'client-id' }));
-        return;
-      }
-      const form = new FormData();
-      form.append('image', file, file.name || 'image');
-      GM_xmlhttpRequest({
-        method: 'POST',
-        url: 'https://api.imgur.com/3/image',
-        headers: { Authorization: `Client-ID ${runtime.settings.imgurClientId}` },
-        data: form,
-        timeout: UPLOAD_TIMEOUT_MS,
-        onload(response) {
-          let payload;
-          try {
-            payload = JSON.parse(response.responseText || '{}');
-          } catch (error) {
-            reject(Object.assign(new Error('响应格式异常'), { code: 'format' }));
-            return;
-          }
-          if (response.status === 401 || response.status === 403) {
-            reject(Object.assign(new Error('Imgur Client ID 无效'), { code: 'client-id' }));
-            return;
-          }
-          if (response.status === 429) {
-            reject(Object.assign(new Error('Imgur 上传额度已用尽'), { code: 'quota' }));
-            return;
-          }
-          if (response.status === 413) {
-            reject(Object.assign(new Error('图片过大'), { code: 'too-large' }));
-            return;
-          }
-          if (response.status >= 500 && retry < 1) {
-            requestImgur(file, retry + 1).then(resolve, reject);
-            return;
-          }
-          const link = payload?.data?.link;
-          const successfulStatus = response.status >= 200 && response.status < 300;
-          if (!successfulStatus || payload?.success === false || !/^https:\/\//i.test(link || '')) {
-            reject(Object.assign(new Error('响应格式异常'), { code: response.status >= 500 ? 'server' : 'format' }));
-            return;
-          }
-          resolve(link);
-        },
-        onerror() {
-          if (retry < 1) requestImgur(file, retry + 1).then(resolve, reject);
-          else reject(Object.assign(new Error('网络不可用'), { code: 'network' }));
-        },
-        ontimeout() {
-          if (retry < 1) requestImgur(file, retry + 1).then(resolve, reject);
-          else reject(Object.assign(new Error('网络超时'), { code: 'timeout' }));
-        }
-      });
-    });
-  }
-
-  function validateImage(file) {
-    if (!file || !file.type || !file.type.startsWith('image/')) return Object.assign(new Error('只支持图片文件'), { code: 'type' });
-    if (file.size > MAX_IMAGE_BYTES) return Object.assign(new Error('图片超过 10 MiB，未上传'), { code: 'too-large' });
-    return null;
-  }
-
-  async function uploadFiles(editor, files, control) {
-    const validFiles = [...files];
-    if (!validFiles.length) return;
-    if (!runtime.settings.imgurClientId) {
-      setUploadStatus(editor, '需要 Imgur Client ID，图片未发送。', 'error');
-      return;
-    }
-    if (control) control.disabled = true;
-    const notice = editor.parentElement?.querySelector('.wt-v2ex-privacy-note');
-    if (notice) notice.hidden = false;
-    let inserted = 0;
-    for (let index = 0; index < validFiles.length; index += 1) {
-      const file = validFiles[index];
-      const validationError = validateImage(file);
-      if (validationError) {
-        setUploadStatus(editor, describeUploadError(validationError), 'error');
-        continue;
-      }
-      setUploadStatus(editor, `正在上传 ${index + 1} / ${validFiles.length}`);
-      try {
-        const link = await requestImgur(file);
-        const separator = editor.value && !/[\n\r]$/.test(editor.value) ? '\n' : '';
-        insertAtSelection(editor, `${separator}${link}\n`);
-        inserted += 1;
-        setUploadStatus(editor, `上传成功 ${inserted} / ${validFiles.length}`, 'success');
-      } catch (error) {
-        setUploadStatus(editor, describeUploadError(error), 'error');
-      }
-    }
-    if (control) control.disabled = false;
-  }
-
-  function editorFilesFromPaste(event) {
-    return [...(event.clipboardData?.items || [])]
-      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
-      .map((item) => item.getAsFile())
-      .filter(Boolean);
-  }
-
-  function addEditorUpload(editor) {
-    if (!runtime.settings.uploaderEnabled || runtime.enhancedEditors.has(editor) || !isReplyEditor(editor)) return;
-    runtime.enhancedEditors.add(editor);
-    const tools = document.createElement('div');
-    tools.className = 'wt-v2ex-editor-tools';
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'wt-v2ex-upload-button';
-    button.textContent = '上传图片';
-    button.setAttribute('aria-label', '上传图片到 Imgur');
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = 'image/*';
-    input.multiple = true;
-    input.className = 'wt-v2ex-file-input';
-    input.setAttribute('aria-label', '选择要上传的图片');
-    const status = document.createElement('div');
-    status.className = 'wt-v2ex-upload-status';
-    status.setAttribute('role', 'status');
-    status.setAttribute('aria-live', 'polite');
-    status.textContent = runtime.settings.imgurClientId ? '准备上传' : '未设置 Imgur Client ID';
-    const privacy = document.createElement('div');
-    privacy.className = 'wt-v2ex-privacy-note';
-    privacy.hidden = true;
-    privacy.textContent = '图片会发送到第三方 Imgur；匿名上传不等于私密存储，请勿上传敏感内容。';
-    button.addEventListener('click', () => input.click());
-    input.addEventListener('change', () => {
-      void uploadFiles(editor, input.files, button).finally(() => { input.value = ''; });
-    });
-    editor.addEventListener('paste', (event) => {
-      if (!runtime.settings.uploaderEnabled) return;
-      const files = editorFilesFromPaste(event);
-      if (!files.length) return;
-      event.preventDefault();
-      void uploadFiles(editor, files, button);
-    });
-    editor.addEventListener('dragover', (event) => {
-      if (!runtime.settings.uploaderEnabled) return;
-      if ([...(event.dataTransfer?.types || [])].includes('Files')) {
-        event.preventDefault();
-        tools.classList.add('wt-v2ex-editor-dragging');
-      }
-    });
-    editor.addEventListener('dragleave', () => tools.classList.remove('wt-v2ex-editor-dragging'));
-    editor.addEventListener('drop', (event) => {
-      if (!runtime.settings.uploaderEnabled) return;
-      tools.classList.remove('wt-v2ex-editor-dragging');
-      const files = [...(event.dataTransfer?.files || [])].filter((file) => file.type.startsWith('image/'));
-      if (!files.length) return;
-      event.preventDefault();
-      void uploadFiles(editor, files, button);
-    });
-    const configure = document.createElement('button');
-    configure.type = 'button';
-    configure.className = 'wt-v2ex-configure-imgur';
-    configure.textContent = '设置 Client ID';
-    configure.setAttribute('aria-label', '设置 Imgur Client ID');
-    configure.hidden = Boolean(runtime.settings.imgurClientId);
-    configure.addEventListener('click', configureClientId);
-    tools.append(button, input, status, configure, privacy);
-    editor.insertAdjacentElement('afterend', tools);
-  }
-
-  function scanEditors() {
-    document.querySelectorAll('.wt-v2ex-editor-tools').forEach((tools) => {
-      tools.hidden = !runtime.settings.uploaderEnabled;
-    });
-    if (!runtime.settings.uploaderEnabled) return;
-    allMatches(document, SELECTORS.editor).filter(isReplyEditor).forEach(addEditorUpload);
-  }
-
-  function observeEditors() {
-    scanEditors();
-    if (!document.body || runtime.editorObserver) return;
-    runtime.editorObserver = new MutationObserver(() => {
-      if (runtime.editorScanFrame) return;
-      runtime.editorScanFrame = requestAnimationFrame(() => {
-        runtime.editorScanFrame = 0;
-        scanEditors();
-      });
-    });
-    const editorRoot = document.querySelector('#Main, #Wrapper') || document.body;
-    runtime.editorObserver.observe(editorRoot, { childList: true, subtree: true });
   }
 
   function imageContentContainers(root = document) {
@@ -1658,8 +1421,6 @@
       .wt-v2ex-conversation-panel-group { display:flex; flex-wrap:wrap; gap:6px; }
       .wt-v2ex-panel-action { border:1px solid rgba(127,127,127,.35); border-radius:4px; padding:5px 8px; background:transparent; color:inherit; cursor:pointer; font:inherit; }
       .wt-v2ex-panel-action:hover, .wt-v2ex-panel-action[aria-pressed="true"] { background:rgba(127,127,127,.12); }
-      .wt-v2ex-upload-button, .wt-v2ex-configure-imgur { border:1px solid rgba(127,127,127,.35); border-radius:4px; padding:5px 9px; background:transparent; color:inherit; cursor:pointer; font:inherit; }
-      .wt-v2ex-upload-button:hover, .wt-v2ex-configure-imgur:hover { background:rgba(127,127,127,.12); }
       .wt-v2ex-thread-status { color:#666; font-size:12px; }
       .wt-v2ex-threaded-view { margin:10px 0; }
       #Main .cell[id^="r_"].wt-v2ex-native-hidden, #Wrapper .cell[id^="r_"].wt-v2ex-native-hidden { display:none !important; }
@@ -1688,16 +1449,9 @@
       .wt-v2ex-child-depth-5 { margin-left:20px; }
       .wt-v2ex-child-depth-6 { margin-left:24px; }
       .wt-v2ex-child-depth-6 .wt-v2ex-child-depth-6 { margin-left:0; padding-left:0; border-left:0; }
-      .wt-v2ex-panel-action:focus-visible, .wt-v2ex-upload-button:focus-visible, .wt-v2ex-configure-imgur:focus-visible, .wt-v2ex-conversation-toggle:focus-visible, .wt-v2ex-scroll-top:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
-      .wt-v2ex-editor-tools { display:flex; flex-wrap:wrap; align-items:center; gap:7px; margin:6px 0 10px; padding:5px 0; color:inherit; font-size:12px; }
-      .wt-v2ex-file-input { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%); }
-      .wt-v2ex-upload-status { color:#666; }
-      .wt-v2ex-upload-status-error { color:#a33; }
-      .wt-v2ex-upload-status-success { color:#176b3a; }
-      .wt-v2ex-privacy-note { flex-basis:100%; color:#805b00; }
-      .wt-v2ex-editor-dragging { outline:2px dashed #1677ff; outline-offset:3px; }
+      .wt-v2ex-panel-action:focus-visible, .wt-v2ex-conversation-toggle:focus-visible, .wt-v2ex-scroll-top:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
       @media (max-width:600px) { .wt-v2ex-control-dock { right:max(10px, env(safe-area-inset-right)); bottom:max(10px, env(safe-area-inset-bottom)); } .wt-v2ex-conversation-panel { max-height:60vh; } .wt-v2ex-threaded-view { width:calc(100vw - 40px); max-width:calc(100vw - 40px); overflow-x:hidden; } .wt-v2ex-threaded-reply { box-sizing:border-box; max-width:100%; min-width:0; overflow:hidden; } .wt-v2ex-threaded-reply table { width:100%; max-width:100%; table-layout:fixed; } .wt-v2ex-threaded-reply .wt-v2ex-reply-header { min-width:0; } .wt-v2ex-threaded-reply .wt-v2ex-native-reply-controls { max-width:100%; } }
-      @media (prefers-color-scheme:dark) { .wt-v2ex-conversation-panel, .wt-v2ex-conversation-toggle, .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); } .wt-v2ex-thread-status, .wt-v2ex-upload-status { color:#aaa; } }
+      @media (prefers-color-scheme:dark) { .wt-v2ex-conversation-panel, .wt-v2ex-conversation-toggle, .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); } .wt-v2ex-thread-status { color:#aaa; } }
       html.night .wt-v2ex-conversation-panel, html.night .wt-v2ex-conversation-toggle, html.night .wt-v2ex-scroll-top, body.night .wt-v2ex-conversation-panel, body.night .wt-v2ex-conversation-toggle, body.night .wt-v2ex-scroll-top, [data-theme="dark"] .wt-v2ex-conversation-panel, [data-theme="dark"] .wt-v2ex-conversation-toggle, [data-theme="dark"] .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); }
       @media (prefers-reduced-motion:reduce) { .wt-v2ex-scroll-top { scroll-behavior:auto; } }
     `;
@@ -1724,7 +1478,6 @@
       }
       logError(error);
     }
-    try { observeEditors(); } catch (error) { logError(error); }
     try { if (runtime.settings.scrollTopEnabled) initializeScrollToTop(); } catch (error) { logError(error); }
   }
 
