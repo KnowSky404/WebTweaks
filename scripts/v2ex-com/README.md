@@ -12,7 +12,7 @@ The script matches `https://v2ex.com/*` and `https://*.v2ex.com/*`. Thread recon
 
 ### Threaded replies
 
-The script parses the rendered reply HTML, discovers actual V2EX pagination links, and fetches other pages from the current V2EX origin with same-origin credentials. A relationship is shown as:
+The script parses the rendered reply HTML, discovers actual V2EX pagination links, and fetches other pages from the current V2EX origin with same-origin credentials. Fetched pages extend the in-memory relationship dataset; they do not replace the active native page's rendering scope. A relationship is shown as:
 
 - **exact** (`回复 #12`): the reply starts with one linked username and `#12`, the floor exists earlier, and its author matches the username;
 - **inferred** (`推断回复`): one leading username has no floor number, so the reply is attached to the nearest earlier reply by that username;
@@ -21,13 +21,13 @@ The script parses the rendered reply HTML, discovers actual V2EX pagination link
 
 V2EX does not expose a reliable public parent-reply identifier. Inferred relationships are therefore a heuristic, not a guarantee. Replies are never discarded when inference fails. The visual indentation is capped while the logical tree remains intact, and rendering uses an iterative stack so unusually deep content does not require recursive JavaScript calls.
 
-For topics of up to 10 pages, the script loads the remaining pages automatically with at most three concurrent requests. A request has a timeout and may be retried once for a transient/network or 5xx failure. Progress is shown in the lower-right floating conversation panel, and partial failures leave the native list available. Topics over 10 pages are not fetched in full automatically; use `加载全部 N 页并构建楼中楼` when desired.
+For topics of up to 10 pages, the script loads the remaining pages automatically with at most three concurrent requests. A request has a timeout and may be retried once for a transient/network or 5xx failure. Progress is shown in the lower-right floating conversation panel, and partial failures leave the native list available. Topics over 10 pages are not fetched in full automatically; use `加载全部 N 页并构建楼中楼` when desired. In either case, threaded mode shows every reply from the active native page plus only the ancestor chain needed to explain cross-page relationships; unrelated earlier-page and future-page replies remain hidden.
 
 The `会话` control sits in a fixed lower-right dock above the `↑` scroll-to-top button. The panel is closed by default: the script sets `hidden = true`, `aria-expanded="false"`, and a scoped `.wt-v2ex-conversation-panel[hidden] { display:none !important; }` rule ensures that the CSS grid layout cannot override the hidden attribute. Clicking `会话` opens or closes the panel; Escape, an outside pointer click, and supported topic navigation close it as well. Opening and closing does not scroll the page, and the open state is not persisted.
 
 The panel has exactly two view controls:
 
-- **楼中楼**: shows the inferred hierarchy in a custom container. Every loaded child remains visible beneath its detected parent, including exact and inferred children; unresolved replies remain roots. Children are rendered iteratively with capped visual indentation and a guide line, with no per-branch state.
+- **楼中楼**: shows the inferred hierarchy in a custom container. All loaded pages contribute to relationship inference, while the visible projection contains every reply from the active native page plus only the required cross-page ancestors. Exact and inferred children appear beneath their detected parent; unresolved replies remain roots. Children are rendered iteratively with capped visual indentation and a guide line, with no per-branch state.
 - **原始顺序**: hides the custom container and restores V2EX's untouched flat chronological reply list. The native floor, reply action, event behavior, and `aria-hidden` state are restored; switching views does not refetch or rebuild the threaded model.
 
 Threaded replies reuse sanitized clones of V2EX's native `.cell` reply structure and `.reply_content`, so native typography, content elements, theme surfaces, and user CSS remain applicable. In each clone, the native reply control and floor are extracted only from the reply header's `.fr` group. Reply controls are identified by a scoped V2EX-owned `img[alt="Reply"]` or reply-asset filename, the existing `a.reply`/`.reply a`/`[data-action="reply"]` candidates, or a narrowly scoped native `replyOne(...)` handler; the live native reply cells are never modified.
@@ -65,6 +65,14 @@ The following versioned settings are stored through the userscript manager only:
 
 The conversation panel's open/closed state is not persisted. The metadata grants are limited to `GM_addStyle`, the manager value APIs, and `GM_registerMenuCommand`. The script has no `@require`, telemetry, remote configuration, credential collection, or cross-origin request permission.
 
+## Maintainer validation
+
+The page-projection regression fixture runs without a browser or external dependencies:
+
+```bash
+node scripts/v2ex-com/validate-threaded-projection.mjs
+```
+
 ## Known limitations and troubleshooting
 
 - A reply containing only an ambiguous `@username` cannot guarantee a hierarchy; the UI marks that relationship inferred or unresolved rather than presenting it as fact.
@@ -76,7 +84,7 @@ The conversation panel's open/closed state is not persisted. The metadata grants
 
 ## 中文使用说明
 
-安装脚本后打开 V2EX 主题页。工具栏中的“楼中楼”会读取当前主题的分页并重建会话关系；带有 `@用户 #楼层` 且作者匹配的是“精确”关系，不带楼层的单用户前缀只是“推断”关系，多用户或无效楼层会保留在顶层并标记“关系未确定”。超过 10 页的主题不会自动全部请求，点击“加载全部”后才会开始。
+安装脚本后打开 V2EX 主题页。工具栏中的“楼中楼”会读取当前主题的分页来重建会话关系，但显示范围仍以当前原生分页为准；当前页回复会保留，跨页时只补充解释这些回复所需的父级链路，不会把无关的前页或后页回复注入当前视图。带有 `@用户 #楼层` 且作者匹配的是“精确”关系，不带楼层的单用户前缀只是“推断”关系，多用户或无效楼层会保留在顶层并标记“关系未确定”。超过 10 页的主题不会自动全部请求，点击“加载全部”后才会开始。
 
 回复或主题正文中的 HTTP(S) 图片链接会在浏览器侧自动展开，支持 JPG、JPEG、PNG、GIF、WebP 和 AVIF；原始链接与 V2EX 服务端内容不会被修改。点击正文图片可打开全屏预览，Escape、关闭按钮或点击遮罩空白处可以关闭，按住 Ctrl/Cmd/Shift/Alt 点击时保留浏览器原行为。图片直接由原始图片站点加载，WebTweaks 不跟踪查看记录。
 

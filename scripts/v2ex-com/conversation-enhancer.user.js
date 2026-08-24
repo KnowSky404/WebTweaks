@@ -2,7 +2,7 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.4.0
+// @version      1.4.1
 // @description  Threaded cross-page replies, client-side image previews, and navigation improvements for V2EX.
 // @description:zh-CN 为 V2EX 提供跨页楼中楼、浏览器侧图片预览和返回顶部功能。
 // @author       KnowSky404
@@ -556,6 +556,76 @@
     return sorted;
   }
 
+  function deriveVisibleThread(topic) {
+    const allReplies = topic.models;
+    const replyById = new Map(allReplies.map((reply) => [reply.id, reply]));
+    const currentPageReplies = allReplies.filter((reply) => reply.page === topic.currentPage);
+    const visibleIds = new Set(currentPageReplies.map((reply) => reply.id));
+
+    currentPageReplies.forEach((reply) => {
+      const visited = new Set([reply.id]);
+      let parentId = reply.parentId;
+      while (parentId && !visited.has(parentId)) {
+        visited.add(parentId);
+        const parent = replyById.get(parentId);
+        if (!parent) break;
+        visibleIds.add(parent.id);
+        parentId = parent.parentId;
+      }
+    });
+
+    const childrenByParent = new Map();
+    const roots = [];
+    const rootIds = new Set();
+    allReplies.forEach((reply) => {
+      if (!visibleIds.has(reply.id)) return;
+      if (reply.parentId && visibleIds.has(reply.parentId)) {
+        const children = childrenByParent.get(reply.parentId) || [];
+        children.push(reply);
+        childrenByParent.set(reply.parentId, children);
+      } else if (!rootIds.has(reply.id)) {
+        rootIds.add(reply.id);
+        roots.push(reply);
+      }
+    });
+
+    const firstCurrentFloorByRoot = new Map();
+    currentPageReplies.forEach((reply) => {
+      let root = reply;
+      const visited = new Set();
+      while (root.parentId && visibleIds.has(root.parentId)) {
+        if (visited.has(root.id)) {
+          if (!rootIds.has(root.id)) {
+            rootIds.add(root.id);
+            roots.push(root);
+          }
+          break;
+        }
+        visited.add(root.id);
+        const parent = replyById.get(root.parentId);
+        if (!parent) break;
+        root = parent;
+      }
+      const floor = reply.floor === null ? Number.MAX_SAFE_INTEGER : reply.floor;
+      const previous = firstCurrentFloorByRoot.get(root.id);
+      if (previous === undefined || floor < previous) firstCurrentFloorByRoot.set(root.id, floor);
+    });
+
+    roots.sort((left, right) => {
+      const leftFloor = firstCurrentFloorByRoot.get(left.id) ?? Number.MAX_SAFE_INTEGER;
+      const rightFloor = firstCurrentFloorByRoot.get(right.id) ?? Number.MAX_SAFE_INTEGER;
+      return leftFloor - rightFloor || (left.floor ?? Number.MAX_SAFE_INTEGER) - (right.floor ?? Number.MAX_SAFE_INTEGER);
+    });
+
+    return {
+      currentPageReplies,
+      visibleIds,
+      visibleReplies: allReplies.filter((reply) => visibleIds.has(reply.id)),
+      roots,
+      childrenByParent
+    };
+  }
+
   async function fetchPage(url, retry = 0) {
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), PAGE_TIMEOUT_MS);
@@ -663,6 +733,7 @@
         applyTopicView(topic, button.dataset.view);
       } else if (button.classList.contains('wt-v2ex-load-pages')) {
         void loadAllTopicPages(topic).catch((error) => {
+          if (!isCurrentTopic(topic)) return;
           topic.loading = false;
           topic.failed = true;
           setTopicStatus(topic, '分页解析失败，已保留原始顺序');
@@ -735,7 +806,7 @@
     });
   }
 
-  function createReplyCard(reply, depth) {
+  function createReplyCard(reply, depth, hasVisibleChildren) {
     const cell = reply.nativeTemplate?.cloneNode(true) || document.createElement('div');
     if (!cell.classList.contains('cell')) cell.classList.add('cell');
     cell.classList.add('wt-v2ex-threaded-reply', `wt-v2ex-depth-${Math.min(depth, 6)}`);
@@ -781,7 +852,7 @@
       }
       if (controls.childElementCount) header.append(controls);
     }
-    if (reply.children.length) {
+    if (hasVisibleChildren) {
       const children = document.createElement('div');
       children.className = `wt-v2ex-thread-children wt-v2ex-child-depth-${Math.min(depth + 1, 6)}`;
       cell.append(children);
@@ -790,14 +861,37 @@
     return { cell, children: null };
   }
 
+  function captureThreadedScrollAnchor(topic) {
+    if (topic.view !== 'threaded' || topic.threadedView.hidden) return null;
+    const viewportBottom = window.innerHeight || document.documentElement.clientHeight || 0;
+    const anchor = [...topic.threadedView.querySelectorAll('[data-wt-v2ex-reply-id]')].find((element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.bottom > 0 && rect.top < viewportBottom;
+    });
+    if (!anchor) return null;
+    const rect = anchor.getBoundingClientRect();
+    return { id: anchor.dataset.wtV2exReplyId, top: rect.top };
+  }
+
+  function restoreThreadedScrollAnchor(topic, anchor) {
+    if (!anchor || typeof window.scrollBy !== 'function') return;
+    const replacement = [...topic.threadedView.querySelectorAll('[data-wt-v2ex-reply-id]')]
+      .find((element) => element.dataset.wtV2exReplyId === anchor.id);
+    if (!replacement) return;
+    const delta = replacement.getBoundingClientRect().top - anchor.top;
+    if (Number.isFinite(delta) && Math.abs(delta) > 0.5) window.scrollBy(0, delta);
+  }
+
   function renderThreadedView(topic) {
     const lightboxUrl = runtime.imageLightboxOpener && topic.threadedView.contains(runtime.imageLightboxOpener)
       ? lightboxUrlForImage(runtime.imageLightboxOpener)
       : null;
     if (lightboxUrl) closeImageLightbox(false);
+    const scrollAnchor = captureThreadedScrollAnchor(topic);
     topic.threadedView.replaceChildren();
     const fragment = document.createDocumentFragment();
-    const stack = [...topic.roots].reverse().map((reply) => ({ reply, target: fragment, depth: 0 }));
+    const visibleThread = topic.visibleThread || deriveVisibleThread(topic);
+    const stack = [...visibleThread.roots].reverse().map((reply) => ({ reply, target: fragment, depth: 0 }));
     const renderedReplyIds = new Set();
     while (stack.length) {
       const { reply, target, depth } = stack.pop();
@@ -806,15 +900,17 @@
         continue;
       }
       renderedReplyIds.add(reply.id);
-      const rendered = createReplyCard(reply, depth);
+      const children = visibleThread.childrenByParent.get(reply.id) || [];
+      const rendered = createReplyCard(reply, depth, children.length > 0);
       target.append(rendered.cell);
-      if (reply.children.length && rendered.children) {
-        for (let index = reply.children.length - 1; index >= 0; index -= 1) {
-          stack.push({ reply: reply.children[index], target: rendered.children, depth: depth + 1 });
+      if (children.length && rendered.children) {
+        for (let index = children.length - 1; index >= 0; index -= 1) {
+          stack.push({ reply: children[index], target: rendered.children, depth: depth + 1 });
         }
       }
     }
     topic.threadedView.append(fragment);
+    restoreThreadedScrollAnchor(topic, scrollAnchor);
     scanImageContent(topic.threadedView);
     if (lightboxUrl) {
       const replacement = [...topic.threadedView.querySelectorAll('img')].find((image) => lightboxUrlForImage(image) === lightboxUrl);
@@ -853,12 +949,12 @@
       if (result?.error) failures += 1;
       else if (result) {
         topic.loadedPages.add(result.page);
-        topic.replies.push(...result.replies);
+        topic.allReplies.push(...result.replies);
       }
     });
     const byId = new Map();
     const deduped = [];
-    topic.replies.forEach((reply) => {
+    topic.allReplies.forEach((reply) => {
       if (byId.has(reply.id)) {
         topic.duplicateIds += 1;
         return;
@@ -866,16 +962,18 @@
       byId.set(reply.id, reply);
       deduped.push(reply);
     });
-    topic.replies = deduped;
+    topic.allReplies = deduped;
     topic.incomplete = failures > 0;
     topic.loading = false;
-    topic.failed = topic.replies.length === 0;
-    topic.models = inferRelationships(topic.replies);
-    topic.roots = topic.models.filter((reply) => !reply.parentId);
+    topic.failed = topic.allReplies.length === 0;
+    topic.models = inferRelationships(topic.allReplies);
+    topic.visibleThread = deriveVisibleThread(topic);
     renderThreadedView(topic);
-    if (failures) setTopicStatus(topic, `部分分页加载失败，已显示 ${topic.models.length} 条回复；原始顺序仍可用`);
-    else if (topic.duplicateIds) setTopicStatus(topic, `已加载 ${topic.models.length} 条回复（忽略 ${topic.duplicateIds} 个重复 ID）`);
-    else setTopicStatus(topic, `已加载 ${topic.models.length} 条回复，关系为启发式重建`);
+    const visibleCount = topic.visibleThread.visibleReplies.length;
+    const visibleSummary = `当前线程投影包含 ${visibleCount} 条回复（含必要跨页上下文）`;
+    if (failures) setTopicStatus(topic, `部分分页加载失败，已加载 ${topic.models.length} 条关系数据；${visibleSummary}，原始顺序仍可用`);
+    else if (topic.duplicateIds) setTopicStatus(topic, `已加载 ${topic.models.length} 条关系数据；${visibleSummary}（忽略 ${topic.duplicateIds} 个重复 ID）`);
+    else setTopicStatus(topic, `已加载 ${topic.models.length} 条关系数据；${visibleSummary}，关系为启发式重建`);
     updateTopicPanel(topic);
     if (failures || topic.failed) applyTopicView(topic, 'original');
     else if (runtime.settings.preferredView === 'threaded') applyTopicView(topic, 'threaded');
@@ -902,10 +1000,9 @@
       pages: discoveredPages.pages,
       maxPage: discoveredPages.maxPage,
       loadedPages: new Set([context.page]),
-      replies: parseReplies(document, context.page, location.href),
+      allReplies: parseReplies(document, context.page, location.href),
       nativeReplyControlsTemplate: null,
       models: [],
-      roots: [],
       view: 'original',
       loading: false,
       incomplete: false,
@@ -913,11 +1010,11 @@
       duplicateIds: 0,
       statusMessage: '准备构建楼中楼'
     };
-    topic.nativeReplyControlsTemplate = topic.replies.find((reply) => reply.nativeReplyControlsTemplate)?.nativeReplyControlsTemplate || null;
+    topic.nativeReplyControlsTemplate = topic.allReplies.find((reply) => reply.nativeReplyControlsTemplate)?.nativeReplyControlsTemplate || null;
     firstReply.before(threadedView);
     runtime.topic = topic;
-    topic.models = inferRelationships(topic.replies);
-    topic.roots = topic.models.filter((reply) => !reply.parentId);
+    topic.models = inferRelationships(topic.allReplies);
+    topic.visibleThread = deriveVisibleThread(topic);
     renderThreadedView(topic);
     if (topic.maxPage > 10) {
       topic.incomplete = true;
