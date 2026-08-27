@@ -4,15 +4,29 @@ import vm from 'node:vm';
 const userscriptPath = new URL('./conversation-enhancer.user.js', import.meta.url);
 const source = await readFile(userscriptPath, 'utf8');
 const marker = '\n  initialize();\n})();';
-const instrumented = source.replace(marker, '\n  globalThis.__projection = { inferRelationships, deriveVisibleThread };\n})();');
+const instrumented = source.replace(marker, '\n  globalThis.__projection = { inferRelationships, deriveVisibleThread, topicSnapshotMatches, topicDomMatchesContext };\n})();');
 
 if (instrumented === source) throw new Error('userscript test hook marker not found');
 
-const sandbox = { console };
+const domState = { page: 2, hasCurrentMarker: true };
+const fakeReply = {};
+const sandbox = {
+  console,
+  location: { href: 'https://www.v2ex.com/t/42?p=2', pathname: '/t/42', origin: 'https://www.v2ex.com' },
+  document: {
+    querySelector(selector) {
+      if (selector === '.ps_container .page_current' && domState.hasCurrentMarker) return { textContent: String(domState.page) };
+      return null;
+    },
+    querySelectorAll(selector) {
+      return selector.includes('[id^="r_"]') ? [fakeReply] : [];
+    }
+  }
+};
 sandbox.globalThis = sandbox;
 vm.runInNewContext(instrumented, sandbox, { filename: userscriptPath.pathname });
 
-const { inferRelationships, deriveVisibleThread } = sandbox.__projection;
+const { inferRelationships, deriveVisibleThread, topicSnapshotMatches, topicDomMatchesContext } = sandbox.__projection;
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -83,5 +97,16 @@ const cyclic = deriveVisibleThread({
 });
 assert(cyclic.visibleIds.size === 2, 'ancestor cycle guard failed');
 assert(cyclic.roots.length === 1 && cyclic.roots[0].id === 'cycle-a', 'cycle projection did not retain a renderable root');
+
+const topicSnapshot = { key: 'https://www.v2ex.com/t/42?p=2', currentPage: 2 };
+assert(topicSnapshotMatches(topicSnapshot, { key: topicSnapshot.key, page: 2 }), 'matching topic snapshot was rejected');
+assert(!topicSnapshotMatches(topicSnapshot, { key: 'https://www.v2ex.com/t/42?p=1', page: 1 }), 'stale page snapshot was accepted');
+assert(!topicSnapshotMatches(topicSnapshot, { key: 'https://www.v2ex.com/t/43?p=2', page: 2 }), 'stale topic snapshot was accepted');
+
+assert(topicDomMatchesContext({ page: 2 }), 'matching native page marker was rejected');
+domState.page = 1;
+assert(!topicDomMatchesContext({ page: 2 }), 'old native DOM was accepted under the new page URL');
+domState.hasCurrentMarker = false;
+assert(topicDomMatchesContext({ page: 2 }), 'single-page topic without a page marker was rejected');
 
 console.log('threaded projection regression checks passed');

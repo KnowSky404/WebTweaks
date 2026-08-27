@@ -2,7 +2,7 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.4.1
+// @version      1.4.2
 // @description  Threaded cross-page replies, client-side image previews, and navigation improvements for V2EX.
 // @description:zh-CN 为 V2EX 提供跨页楼中楼、浏览器侧图片预览和返回顶部功能。
 // @author       KnowSky404
@@ -186,7 +186,41 @@
 
   function isCurrentTopic(topic) {
     const context = topicContext();
-    return runtime.topic === topic && context?.key === topic.key && context.page === topic.currentPage;
+    return runtime.topic === topic && topicSnapshotMatches(topic, context);
+  }
+
+  function topicSnapshotMatches(topic, context) {
+    return Boolean(topic && context && context.key === topic.key && context.page === topic.currentPage);
+  }
+
+  function topicDomMatchesContext(context) {
+    if (!context || !allMatches(document, SELECTORS.reply).length) return false;
+    const currentPage = firstMatch(document, ['.ps_container .page_current']);
+    if (!currentPage) return true;
+    return parseFloor(currentPage.textContent) === context.page;
+  }
+
+  function waitForTopicDom(context, timeoutMs = 2_000) {
+    if (topicDomMatchesContext(context)) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (ready) => {
+        if (settled) return;
+        settled = true;
+        observer.disconnect();
+        window.clearTimeout(timer);
+        resolve(ready);
+      };
+      const check = () => {
+        const liveContext = topicContext();
+        if (liveContext?.key !== context.key) finish(false);
+        else if (topicDomMatchesContext(context)) finish(true);
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+      const timer = window.setTimeout(() => finish(false), timeoutMs);
+      check();
+    });
   }
 
   function discoverPages(context) {
@@ -1072,6 +1106,24 @@
     }
     runtime.navigationSync = true;
     try {
+      if (context && !await waitForTopicDom(context)) {
+        if (topicContext()?.key !== context.key) scheduleTopicSynchronization();
+        else {
+          closeImageLightbox();
+          if (runtime.topic) {
+            applyTopicView(runtime.topic, 'original');
+            runtime.topic.threadedView.remove();
+            runtime.topic = null;
+          }
+          removeConversationControl();
+          scanImageContent(document);
+        }
+        return;
+      }
+      if (context?.key !== topicContext()?.key) {
+        scheduleTopicSynchronization();
+        return;
+      }
       closeImageLightbox();
       if (runtime.topic) {
         applyTopicView(runtime.topic, 'original');

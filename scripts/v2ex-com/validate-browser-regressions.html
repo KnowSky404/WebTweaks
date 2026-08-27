@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>V2EX Conversation Enhancer browser regressions</title>
+  <style>
+    body { max-width: 880px; margin: 24px auto; padding: 0 16px; font: 15px/1.5 system-ui, sans-serif; }
+    #fixture-controls { position: sticky; top: 0; z-index: 10; padding: 12px; background: white; border: 1px solid #ddd; }
+    #fixture-results li[data-state="pass"] { color: #176b3a; }
+    #fixture-results li[data-state="fail"] { color: #9b2c2c; }
+    .cell { padding: 12px; border-bottom: 1px solid #ddd; }
+    .fr { float: right; }
+    .page_current { font-weight: 700; }
+  </style>
+</head>
+<body>
+  <section id="fixture-controls">
+    <h1>V2EX 浏览器回归夹具</h1>
+    <p>覆盖分页状态、跨页祖先、旧异步加载和楼中楼/原始顺序切换。</p>
+    <button id="fixture-run" type="button">运行回归检查</button>
+    <ol id="fixture-results" aria-live="polite"></ol>
+  </section>
+  <main id="Main"></main>
+
+  <script>
+    (() => {
+      const pageOne = `
+        <div class="cell ps_container"><span class="page_current">1</span> <a class="page_normal" href="/t/42?p=2">2</a><input class="page_input" max="2"></div>
+        <div id="r_p1-unrelated" class="cell"><span class="fr"><span class="no">1</span></span><strong><a class="dark" href="/member/a">A</a></strong><span class="ago" title="p1">p1</span><div class="sep5"></div><div class="reply_content">unrelated page-one reply</div></div>
+        <div id="r_p1-parent" class="cell"><span class="fr"><span class="no">2</span></span><strong><a class="dark" href="/member/alice">Alice</a></strong><span class="ago" title="p1">p1</span><div class="sep5"></div><div class="reply_content">cross-page parent</div></div>`;
+      const pageTwo = `
+        <div class="cell ps_container"><a class="page_normal" href="/t/42">1</a> <span class="page_current">2</span><input class="page_input" max="2"></div>
+        <div id="r_p2-root" class="cell"><span class="fr"><span class="no">101</span></span><strong><a class="dark" href="/member/d">D</a></strong><span class="ago" title="p2">p2</span><div class="sep5"></div><div class="reply_content">page-two root</div></div>
+        <div id="r_p2-child" class="cell"><span class="fr"><span class="no">102</span></span><strong><a class="dark" href="/member/e">E</a></strong><span class="ago" title="p2">p2</span><div class="sep5"></div><div class="reply_content"><a href="/member/alice">@Alice</a> #2 cross-page child</div></div>`;
+
+      history.replaceState({}, '', '/t/42?p=1');
+      document.querySelector('#Main').innerHTML = pageOne;
+      window.GM_getValue = (_key, fallback) => fallback;
+      window.GM_setValue = () => {};
+      window.GM_addStyle = (css) => {
+        const style = document.createElement('style');
+        style.textContent = css;
+        document.head.append(style);
+      };
+      window.GM_registerMenuCommand = () => {};
+      window.fetch = async (url) => {
+        const page = Number(new URL(url, location.href).searchParams.get('p') || '1');
+        await new Promise((resolve) => setTimeout(resolve, page === 2 ? 450 : 40));
+        return new Response(page === 2 ? pageTwo : pageOne, { status: 200, headers: { 'content-type': 'text/html' } });
+      };
+      window.__fixturePages = { pageOne, pageTwo };
+    })();
+  </script>
+  <script src="/scripts/v2ex-com/conversation-enhancer.user.js"></script>
+  <script>
+    (() => {
+      const results = document.querySelector('#fixture-results');
+      const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const waitFor = async (predicate, message, timeout = 2_500) => {
+        const started = performance.now();
+        while (!predicate()) {
+          if (performance.now() - started > timeout) throw new Error(message);
+          await delay(20);
+        }
+      };
+      const record = (name, pass, detail = '') => {
+        const item = document.createElement('li');
+        item.dataset.state = pass ? 'pass' : 'fail';
+        item.textContent = `${pass ? 'PASS' : 'FAIL'} — ${name}${detail ? `: ${detail}` : ''}`;
+        results.append(item);
+      };
+      const check = (condition, message) => {
+        if (!condition) throw new Error(message);
+      };
+
+      async function run() {
+        results.replaceChildren();
+        document.querySelector('#fixture-run').disabled = true;
+        try {
+          history.pushState({}, '', '/t/42?p=2');
+          window.setTimeout(() => {
+            document.querySelector('#Main').innerHTML = window.__fixturePages.pageTwo;
+          }, 60);
+
+          await waitFor(
+            () => document.querySelector('.wt-v2ex-thread-status')?.textContent.includes('当前线程投影'),
+            'page-two threaded model did not finish'
+          );
+          await delay(500);
+
+          check(location.search === '?p=2', `URL regressed to ${location.search || 'page 1'}`);
+          check(document.querySelector('.ps_container .page_current')?.textContent.trim() === '2', 'native page marker is not page 2');
+          check(document.querySelector('#r_p2-child'), 'page-two native replies were replaced');
+          check(!document.querySelector('#r_p1-parent'), 'stale page-one native reply leaked into the active DOM');
+          record('分页状态在延迟 DOM 切换后保持第 2 页', true);
+
+          const threadedIds = [...document.querySelectorAll('.wt-v2ex-threaded-view [data-wt-v2ex-reply-id]')]
+            .map((node) => node.dataset.wtV2exReplyId);
+          check(threadedIds.includes('p1-parent'), 'required page-one ancestor is missing');
+          check(threadedIds.includes('p2-root') && threadedIds.includes('p2-child'), 'active-page replies are missing');
+          check(!threadedIds.includes('p1-unrelated'), 'unrelated page-one reply leaked into the projection');
+          record('全局推断保留跨页祖先且投影不泄漏无关回复', true, threadedIds.join(', '));
+
+          check(document.querySelector('.wt-v2ex-thread-status')?.textContent.includes('当前线程投影'), 'stale request changed the active status');
+          check(location.search === '?p=2', 'stale request changed the active URL');
+          record('旧分页异步结果未覆盖当前页状态', true);
+
+          document.querySelector('.wt-v2ex-conversation-toggle').click();
+          const original = document.querySelector('[data-view="original"]');
+          const threaded = document.querySelector('[data-view="threaded"]');
+          const expectedThreadedCount = threadedIds.length;
+          for (let index = 0; index < 3; index += 1) {
+            original.click();
+            check(document.querySelector('.wt-v2ex-threaded-view').hidden, 'threaded view remained visible in original mode');
+            check([...document.querySelectorAll('#Main > .cell[id^="r_"]')].every((node) => !node.classList.contains('wt-v2ex-native-hidden') && !node.hasAttribute('aria-hidden')), 'native replies were not fully restored');
+            threaded.click();
+            check(!document.querySelector('.wt-v2ex-threaded-view').hidden, 'threaded view did not become visible');
+            check(document.querySelectorAll('.wt-v2ex-threaded-view [data-wt-v2ex-reply-id]').length === expectedThreadedCount, 'view switching duplicated or removed threaded replies');
+          }
+          record('楼中楼与原始顺序反复切换保持节点和可访问状态', true);
+        } catch (error) {
+          record('浏览器回归检查', false, error.message);
+          console.error(error);
+        } finally {
+          document.querySelector('#fixture-run').disabled = false;
+        }
+      }
+
+      document.querySelector('#fixture-run').addEventListener('click', () => void run());
+    })();
+  </script>
+</body>
+</html>

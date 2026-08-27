@@ -73,6 +73,8 @@ The page-projection regression fixture runs without a browser or external depend
 node scripts/v2ex-com/validate-threaded-projection.mjs
 ```
 
+The browser fixture covers pagination synchronization, cross-page ancestor context, stale asynchronous loads, and repeated switching between threaded and original views. Serve the repository root over HTTP, open `scripts/v2ex-com/validate-browser-regressions.html`, and run the checks shown on the page.
+
 ## Known limitations and troubleshooting
 
 - A reply containing only an ambiguous `@username` cannot guarantee a hierarchy; the UI marks that relationship inferred or unresolved rather than presenting it as fact.
