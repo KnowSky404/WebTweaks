@@ -2,7 +2,7 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.4.2
+// @version      1.4.3
 // @description  Threaded cross-page replies, client-side image previews, and navigation improvements for V2EX.
 // @description:zh-CN 为 V2EX 提供跨页楼中楼、浏览器侧图片预览和返回顶部功能。
 // @author       KnowSky404
@@ -68,6 +68,8 @@
     navigationAttached: false,
     navigationSchedule: 0,
     navigationSync: false,
+    navigationRevision: 0,
+    observedTopicKey: null,
     imageDelegationAttached: false,
     imageLightbox: null,
     imageLightboxImage: null,
@@ -184,13 +186,18 @@
     return { id: match[1], page, key: `${location.origin}/t/${match[1]}?p=${page}` };
   }
 
-  function isCurrentTopic(topic) {
-    const context = topicContext();
-    return runtime.topic === topic && topicSnapshotMatches(topic, context);
+  function topicSnapshotMatches(topic, context, navigationRevision = runtime.navigationRevision) {
+    return Boolean(
+      topic
+      && context
+      && topic.navigationRevision === navigationRevision
+      && context.key === topic.key
+      && context.page === topic.currentPage
+    );
   }
 
-  function topicSnapshotMatches(topic, context) {
-    return Boolean(topic && context && context.key === topic.key && context.page === topic.currentPage);
+  function isCurrentTopic(topic, context = topicContext()) {
+    return runtime.topic === topic && topicSnapshotMatches(topic, context);
   }
 
   function topicDomMatchesContext(context) {
@@ -221,6 +228,10 @@
       const timer = window.setTimeout(() => finish(false), timeoutMs);
       check();
     });
+  }
+
+  function topicStateMatchesLocation(context = topicContext()) {
+    return runtime.topic ? isCurrentTopic(runtime.topic, context) : !context;
   }
 
   function discoverPages(context) {
@@ -968,16 +979,19 @@
     updateTopicPanel(topic);
   }
 
-  async function loadAllTopicPages(topic) {
+  async function loadAllTopicPages(topic, pageLoader = loadPages) {
     if (topic.loading || !topic.incomplete || !isCurrentTopic(topic)) return;
     topic.loading = true;
     updateTopicPanel(topic);
     setTopicStatus(topic, `正在加载 0 / ${topic.maxPage} 页`);
     const pages = topic.pages.filter((page) => !topic.loadedPages.has(page));
-    const results = await loadPages(topic, pages, (completed, total) => {
+    const results = await pageLoader(topic, pages, (completed, total) => {
       if (isCurrentTopic(topic)) setTopicStatus(topic, `正在加载 ${completed} / ${total} 页`);
     });
-    if (!isCurrentTopic(topic)) return;
+    if (!isCurrentTopic(topic)) {
+      topic.loading = false;
+      return;
+    }
     let failures = 0;
     results.forEach((result) => {
       if (result?.error) failures += 1;
@@ -1028,6 +1042,7 @@
       context,
       key: context.key,
       currentPage: context.page,
+      navigationRevision: runtime.navigationRevision,
       nativeReplies,
       panel: null,
       threadedView,
@@ -1100,14 +1115,18 @@
       return;
     }
     const context = topicContext();
-    if (runtime.topic?.key === context?.key) {
+    const synchronizationRevision = runtime.navigationRevision;
+    if (topicStateMatchesLocation(context)) {
       scanImageContent(document);
       return;
     }
     runtime.navigationSync = true;
     try {
       if (context && !await waitForTopicDom(context)) {
-        if (topicContext()?.key !== context.key) scheduleTopicSynchronization();
+        if (
+          synchronizationRevision !== runtime.navigationRevision
+          || topicContext()?.key !== context.key
+        ) scheduleTopicSynchronization();
         else {
           closeImageLightbox();
           if (runtime.topic) {
@@ -1120,7 +1139,10 @@
         }
         return;
       }
-      if (context?.key !== topicContext()?.key) {
+      if (
+        synchronizationRevision !== runtime.navigationRevision
+        || context?.key !== topicContext()?.key
+      ) {
         scheduleTopicSynchronization();
         return;
       }
@@ -1138,7 +1160,7 @@
       scanImageContent(document);
     } finally {
       runtime.navigationSync = false;
-      if (runtime.topic && runtime.topic.key !== topicContext()?.key) scheduleTopicSynchronization();
+      if (runtime.topic && !isCurrentTopic(runtime.topic)) scheduleTopicSynchronization();
     }
   }
 
@@ -1150,9 +1172,19 @@
     }, 0);
   }
 
+  function handleTopicNavigation() {
+    const nextTopicKey = topicContext()?.key || null;
+    if (nextTopicKey !== runtime.observedTopicKey) {
+      runtime.observedTopicKey = nextTopicKey;
+      runtime.navigationRevision += 1;
+    }
+    scheduleTopicSynchronization();
+  }
+
   function observeNavigation() {
     if (runtime.navigationAttached) return;
     runtime.navigationAttached = true;
+    runtime.observedTopicKey = topicContext()?.key || null;
     ['pushState', 'replaceState'].forEach((method) => {
       const original = window.history[method];
       if (typeof original !== 'function') return;
@@ -1162,8 +1194,8 @@
         return result;
       };
     });
-    window.addEventListener('popstate', scheduleTopicSynchronization);
-    window.addEventListener('wt-v2ex-navigation', scheduleTopicSynchronization);
+    window.addEventListener('popstate', handleTopicNavigation);
+    window.addEventListener('wt-v2ex-navigation', handleTopicNavigation);
   }
 
   function findEditor() {
@@ -1608,9 +1640,14 @@
     else { const style = document.createElement('style'); style.textContent = css; document.head.append(style); }
   }
 
-  async function initialize() {
-    if (document.documentElement.dataset.wtV2exInitialized === 'true') return;
+  function claimInitialization() {
+    if (document.documentElement.dataset.wtV2exInitialized === 'true') return false;
     document.documentElement.dataset.wtV2exInitialized = 'true';
+    return true;
+  }
+
+  async function initialize() {
+    if (!claimInitialization()) return;
     addStyles();
     registerMenuCommands();
     initializeImageEnhancement();

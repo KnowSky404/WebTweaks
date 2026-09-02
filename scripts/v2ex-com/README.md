@@ -21,7 +21,7 @@ The script parses the rendered reply HTML, discovers actual V2EX pagination link
 
 V2EX does not expose a reliable public parent-reply identifier. Inferred relationships are therefore a heuristic, not a guarantee. Replies are never discarded when inference fails. The visual indentation is capped while the logical tree remains intact, and rendering uses an iterative stack so unusually deep content does not require recursive JavaScript calls.
 
-For topics of up to 10 pages, the script loads the remaining pages automatically with at most three concurrent requests. A request has a timeout and may be retried once for a transient/network or 5xx failure. Progress is shown in the lower-right floating conversation panel, and partial failures leave the native list available. Topics over 10 pages are not fetched in full automatically; use `加载全部 N 页并构建楼中楼` when desired. In either case, threaded mode shows every reply from the active native page plus only the ancestor chain needed to explain cross-page relationships; unrelated earlier-page and future-page replies remain hidden.
+For topics of up to 10 pages, the script loads the remaining pages automatically with at most three concurrent requests. A request has a timeout and may be retried once for a transient/network or 5xx failure. Progress is shown in the lower-right floating conversation panel, and partial failures leave the native list available. Topics over 10 pages are not fetched in full automatically; use `加载全部 N 页并构建楼中楼` when desired. In either case, threaded mode shows every reply from the active native page plus only the ancestor chain needed to explain cross-page relationships; unrelated earlier-page and future-page replies remain hidden. History API topic transitions carry a monotonic revision, so a delayed load from an older page cannot become current again after a rapid return to the same URL.
 
 The `会话` control sits in a fixed lower-right dock above the `↑` scroll-to-top button. The panel is closed by default: the script sets `hidden = true`, `aria-expanded="false"`, and a scoped `.wt-v2ex-conversation-panel[hidden] { display:none !important; }` rule ensures that the CSS grid layout cannot override the hidden attribute. Clicking `会话` opens or closes the panel; Escape, an outside pointer click, and supported topic navigation close it as well. Opening and closing does not scroll the page, and the open state is not persisted.
 
@@ -67,7 +67,7 @@ The conversation panel's open/closed state is not persisted. The metadata grants
 
 ## Maintainer validation
 
-The page-projection regression fixture runs without a browser or external dependencies:
+The pagination lifecycle regression fixture runs without a browser or external dependencies. It covers active-page replacement, required cross-page ancestors, duplicate rendering, rapid page 1 → page 2 → page 1 switching, delayed callback rejection, and original-view restoration:
 
 ```bash
 node scripts/v2ex-com/validate-threaded-projection.mjs
