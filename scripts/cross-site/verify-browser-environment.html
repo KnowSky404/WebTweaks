@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Browser Environment Spoofer — page verification</title>
+  <script nonce="wt-fixture">
+    // These reads belong to the website, including its earliest parser-executed script.
+    function observeEnvironment() {
+      const instant = '2026-07-15T12:34:56.789Z';
+      const date = new Date(instant);
+      return {
+        language: navigator.language, languages: Array.from(navigator.languages),
+        dateDefaults: Intl.DateTimeFormat().resolvedOptions(),
+        numberDefaults: Intl.NumberFormat().resolvedOptions(),
+        explicit: Intl.DateTimeFormat('fr-FR', { timeZone: 'UTC' }).resolvedOptions(),
+        winter: { offset: new Date('2026-01-15T12:00:00Z').getTimezoneOffset(), hour: new Date('2026-01-15T12:00:00Z').getHours() },
+        summer: { offset: date.getTimezoneOffset(), hour: date.getHours() },
+        spring: ['2026-03-08T09:59:59Z', '2026-03-08T10:00:00Z'].map((iso) => ({ local: new Date(iso).toString(), offset: new Date(iso).getTimezoneOffset() })),
+        autumn: ['2026-11-01T08:59:59Z', '2026-11-01T09:00:00Z'].map((iso) => ({ local: new Date(iso).toString(), offset: new Date(iso).getTimezoneOffset() })),
+        localString: date.toString(), localeString: date.toLocaleString(),
+        invariants: {
+          timestamp: date.getTime() === Date.parse(instant), iso: date.toISOString() === instant,
+          utcHour: date.getUTCHours() === 12, instance: date instanceof Date, constructor: date.constructor === Date,
+          realClock: Math.abs(Date.now() - performance.timeOrigin - performance.now()) < 1000
+        },
+        geolocationAvailable: Boolean(navigator.geolocation), secureContext: isSecureContext
+      };
+    }
+    window.wtFixture = { early: observeEnvironment(), observe: observeEnvironment };
+  </script>
+  <style nonce="wt-fixture">
+    :root { color-scheme: light dark; font: 15px/1.6 system-ui, sans-serif; }
+    body { max-width: 880px; margin: 36px auto; padding: 0 20px; }
+    h1 { font-size: 26px; } button { padding: 8px 12px; margin: 0 8px 10px 0; font: inherit; }
+    pre { padding: 16px; border: 1px solid #8c969e; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.6 monospace; }
+  </style>
+</head>
+<body>
+  <h1>Browser Environment Spoofer — page verification</h1>
+  <p>This page reads its own JavaScript APIs. Install the userscript, open its manager menu, enable this origin, save, and reload. Compare the early and current observations. A difference can indicate late injection.</p>
+  <p>No location request runs on load. The location button calls the current page API; with the override disabled it may request real location permission. Use the settings panel's simulated-only test when that is undesirable.</p>
+  <button type="button" id="observe">Read page APIs again</button>
+  <button type="button" id="location">Test page geolocation + watcher cancellation</button>
+  <button type="button" id="navigate">Test same-origin navigation</button>
+  <p id="navigation" role="status">Navigation clicks: 0</p>
+  <h2>Earliest inline website script</h2><pre id="early"></pre>
+  <h2>Current website observations</h2><pre id="current"></pre>
+  <h2>Geolocation</h2><pre id="geo">Not tested</pre>
+  <script nonce="wt-fixture">
+    const display = (id, value) => { document.getElementById(id).textContent = JSON.stringify(value, null, 2); };
+    display('early', wtFixture.early);
+    const observe = () => display('current', wtFixture.observe());
+    observe();
+    document.getElementById('observe').addEventListener('click', observe);
+    let clicks = 0;
+    document.getElementById('navigate').addEventListener('click', () => {
+      history.pushState({}, '', `?navigation=${++clicks}`);
+      document.getElementById('navigation').textContent = `Navigation clicks: ${clicks}`;
+      observe();
+    });
+    document.getElementById('location').addEventListener('click', () => {
+      if (!navigator.geolocation) { display('geo', { error: 'API unavailable' }); return; }
+      const results = { oneTime: 'Pending', watcher: 'Pending', cancelledCallbacks: 0, asynchronous: true };
+      let synchronous = true;
+      let activeWatch;
+      const update = () => display('geo', results);
+      const capture = (key) => (position) => {
+        if (synchronous) results.asynchronous = false;
+        results[key] = { latitude: position.coords.latitude, longitude: position.coords.longitude, accuracy: position.coords.accuracy, timestamp: position.timestamp };
+        if (key === 'watcher' && activeWatch !== undefined) navigator.geolocation.clearWatch(activeWatch);
+        update();
+      };
+      const failure = (key) => (error) => { results[key] = { error: error.message, code: error.code }; update(); };
+      try {
+        navigator.geolocation.getCurrentPosition(capture('oneTime'), failure('oneTime'), { timeout: 3000 });
+        activeWatch = navigator.geolocation.watchPosition(capture('watcher'), failure('watcher'), { timeout: 3000 });
+        const cancelled = navigator.geolocation.watchPosition(() => { results.cancelledCallbacks++; update(); }, failure('cancelled'));
+        navigator.geolocation.clearWatch(cancelled);
+      } catch (error) { results.error = error.message; }
+      synchronous = false;
+      update();
+    });
+  </script>
+</body>
+</html>

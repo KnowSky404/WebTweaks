@@ -20,6 +20,8 @@ WebTweaks is a lightweight collection of standalone userscripts. Tampermonkey is
 - Never commit secrets, credentials, cookies, tokens, account identifiers, tracking, or unrelated local changes.
 - Report assumptions, validation performed, and remaining limitations.
 
+Documented exception: genuine cross-site tools may use `scripts/cross-site/` and broad HTTP(S) matches. They must default to inactive or explicitly scoped behavior, document privacy/security boundaries, and keep inactive-page overhead minimal. This does not change the narrow-match requirement for website-specific scripts; see `docs/SCRIPT_GUIDE.md`.
+
 Site-specific implementation knowledge belongs near that site's scripts rather than accumulating as unrelated global abstractions.
 
 Do not generalize code shared by two scripts merely because it looks similar. Introduce shared abstractions only when there is a demonstrated maintenance benefit.

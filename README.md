@@ -14,12 +14,15 @@ Install a compatible userscript manager, then open a script's raw `.user.js` fil
 | --- | --- | --- | --- |
 | [chatgpt.com](https://chatgpt.com/) | ChatGPT Account Usage Dashboard | Private, read-only floating dashboard for the current plan, Codex limits, cycle analysis, model usage percentage, and usage analytics. | [Install raw script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/chatgpt-com/account-usage-dashboard.user.js) |
 | [V2EX](https://v2ex.com/) | V2EX Conversation Enhancer | Page-isolated threaded replies with cross-page ancestor context, client-side image previews and lightbox viewing, and scroll-to-top. | [Install raw script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/v2ex-com/conversation-enhancer.user.js) |
+| [Cross-site, opt-in](scripts/cross-site/README.md) | Browser Environment Spoofer | Default-disabled, per-origin JavaScript language, locale, DST-aware timezone, and simulated geolocation with local settings and diagnostics. | [Install raw script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/cross-site/browser-environment.user.js) |
 
 ## Repository structure
 
 ```text
 scripts/<site-slug>/<feature-slug>.user.js
 ```
+
+Genuine cross-site tools live under `scripts/cross-site/` and must default to inactive or explicitly scoped behavior. Their broad matching, privacy boundaries, and limitations are documented beside each script.
 
 See [`scripts/README.md`](scripts/README.md) for the short placement guide and [`docs/SCRIPT_GUIDE.md`](docs/SCRIPT_GUIDE.md) for the canonical authoring rules.
 

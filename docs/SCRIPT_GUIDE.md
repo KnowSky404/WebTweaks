@@ -12,6 +12,8 @@ scripts/<site>/<script-name>.user.js
 
 Do not use broad category directories such as `misc` or `temp`. Add a per-site `README.md` only when it provides useful site-specific context.
 
+An intentional exception is `scripts/cross-site/<feature>.user.js` for genuine tools spanning arbitrary websites. Broad HTTP(S) matching requires default-disabled or explicitly scoped activation, clear privacy/security documentation, and minimal inactive-page overhead. Explain exact site-matching semantics and global opt-in behavior in `scripts/cross-site/README.md`. Website-specific scripts must continue using site directories and narrow matches.
+
 ## Metadata
 
 The metadata block must be the first content in the file. Use the narrowest practical page matches and only the permissions the script actually uses.
