@@ -2,7 +2,7 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.5.1
+// @version      1.5.2
 // @description  Threaded cross-page replies with thanks, client-side image previews, and navigation improvements for V2EX.
 // @description:zh-CN 为 V2EX 提供跨页楼中楼、回复感谢、浏览器侧图片预览和返回顶部功能。
 // @author       KnowSky404
@@ -374,8 +374,22 @@
 
   function sanitizeReplyTemplate(element, base = location.href) {
     const clone = element.cloneNode(true);
+    // Keep the native header positions while extracting controls separately.
+    const replyId = String(clone.id || '').match(/^r_([1-9]\d*)$/)?.[1] || '';
+    const { image } = nativeReplyThanksNodes(clone, replyId);
+    if (image) {
+      const slot = document.createElement('span');
+      slot.className = 'wt-v2ex-native-thank-count-slot';
+      image.parentElement.replaceWith(slot);
+    }
+    const group = nativeReplyGroup(clone);
+    if (group) {
+      const slot = document.createElement('span');
+      slot.className = 'wt-v2ex-native-reply-slot';
+      group.replaceWith(slot);
+    }
     clone.removeAttribute('id');
-    clone.querySelectorAll('script, style, iframe, form, object, embed, template, base, meta, link, input, select, textarea, button, [data-action], a.reply, .reply a, .thank, .thank_area, .thanked, [id^="thank_area_"], .ignore, .moderate, .small.fade').forEach((node) => node.remove());
+    clone.querySelectorAll('script, style, iframe, form, object, embed, template, base, meta, link, input, select, textarea, button, [data-action], a.reply, .reply a, .thank, .thank_area, .thanked, [id^="thank_area_"], .ignore, .moderate').forEach((node) => node.remove());
     clone.querySelectorAll('[id]').forEach((node) => node.removeAttribute('id'));
     clone.querySelectorAll('*').forEach((node) => {
       [...node.attributes].forEach((attribute) => {
@@ -477,10 +491,16 @@
   function extractNativeReplyControls(element, base = location.href) {
     const group = nativeReplyGroup(element);
     if (!group) return null;
-    const action = nativeReplyAction(group);
-    const floor = group.querySelector('.no');
-    if (!action && !floor) return null;
-    const controls = sanitizeNativeControlNode(group.cloneNode(false), base);
+    const controls = group.cloneNode(true);
+    let action = nativeReplyAction(controls);
+    const floor = controls.querySelector('.no');
+    const replyId = String(element.id || '').match(/^r_([1-9]\d*)$/)?.[1];
+    const area = replyId ? controls.querySelector('[id="thank_area_' + replyId + '"]') : null;
+    const thanksSlot = area ? document.createElement('span') : null;
+    if (thanksSlot) {
+      thanksSlot.className = 'wt-v2ex-native-thank-area-slot';
+      area.replaceWith(thanksSlot);
+    }
     controls.classList.add('wt-v2ex-native-reply-controls');
     if (action) {
       const actionClone = sanitizeNativeControlNode(action, base, true);
@@ -501,13 +521,21 @@
           link.className = 'wt-v2ex-native-reply-action';
           link.dataset.wtV2exNativeReplyAction = 'true';
           link.append(actionClone);
-          controls.append(link);
+          action.replaceWith(link);
+          action = link;
         }
-        if (interactive) controls.append(actionClone);
-      }
+        if (interactive) {
+          action.replaceWith(actionClone);
+          action = actionClone;
+        }
+      } else action = null;
     }
-    if (floor) controls.append(' \u00a0 \u00a0 ', sanitizeNativeControlNode(floor, base));
-    return controls.childElementCount ? controls : null;
+    // Retain source spacing/wrappers only around the recognized controls.
+    const retained = [action, floor, thanksSlot].filter(Boolean);
+    [...controls.querySelectorAll('*')].reverse().forEach((node) => {
+      if (!retained.some((control) => control === node || control.contains(node) || node.contains(control))) node.remove();
+    });
+    return retained.length ? sanitizeNativeControlNode(controls, base, true) : null;
   }
 
   function nativeReplyThanksNodes(element, replyId) {
@@ -635,12 +663,17 @@
     source.hidden = state.thanked || state.phase === 'pending' || (!uncertain && (!state.canThank || direct));
     source.href = thanksSourceUrl(topic, reply);
     source.textContent = uncertain ? '到原页核对' : '到原页感谢';
+    const recovery = control.querySelector('.wt-v2ex-thank-recovery');
+    if (recovery) recovery.hidden = check.hidden && source.hidden;
     const status = control.querySelector('.wt-v2ex-thank-status');
     status.textContent = state.thanked ? '感谢已发送'
       : state.phase === 'pending' ? '发送中…'
       : state.phase === 'checking' ? '正在核对…'
       : state.phase === 'unknown' ? state.message || '结果未确认，请核对状态'
       : state.message;
+    if (status.textContent && !state.thanked && (!action.hidden || !check.hidden || !source.hidden)) {
+      status.textContent = ' ' + status.textContent;
+    }
     status.hidden = !status.textContent;
     const area = control.querySelector('.wt-v2ex-thank-area');
     area.classList.toggle('thanked', state.thanked);
@@ -660,9 +693,13 @@
     const value = document.createElement('span');
     value.className = 'wt-v2ex-thank-count-value';
     count.replaceChildren(...(image ? [image, ' '] : []), value);
-    const time = header.querySelector('.ago');
-    if (time) time.after(' \u00a0 ', count);
-    else header.append(' \u00a0 ', count);
+    const countSlot = header.querySelector('.wt-v2ex-native-thank-count-slot');
+    if (countSlot) countSlot.replaceWith(count);
+    else {
+      const time = header.querySelector('.ago');
+      if (time) time.after(' \u00a0 ', count);
+      else header.append(' \u00a0 ', count);
+    }
 
     const area = presentation?.area?.cloneNode(true) || document.createElement('span');
     area.classList.add('thank_area', 'wt-v2ex-thank-area');
@@ -684,12 +721,17 @@
     status.setAttribute('role', 'status');
     status.setAttribute('aria-live', 'polite');
     [action, check, source].forEach((node) => { node.dataset.replyId = reply.id; });
-    area.replaceChildren(action, ' ', check, ' ', source, ' ', status);
-    controls.prepend(area, ' \u00a0 ');
+    // Hidden fallback controls must not add whitespace to the native action.
+    const recovery = document.createElement('span');
+    recovery.className = 'wt-v2ex-thank-recovery';
+    recovery.append(check, ' ', source);
+    area.replaceChildren(action, recovery, status);
+    const areaSlot = controls.querySelector('.wt-v2ex-native-thank-area-slot');
+    if (areaSlot) areaSlot.replaceWith(area);
+    else controls.prepend(area, ' \u00a0 ');
     header.classList.add('wt-v2ex-thanks');
-    topic.thanksControls.set(header, reply.id);
     // Both native positions stay under the same trusted, per-reply header.
-    header.prepend(controls);
+    topic.thanksControls.set(header, reply.id);
     updateThanksControl(topic, reply, header);
     return header;
   }
@@ -1317,7 +1359,9 @@
         nativeAction.dataset.replyFloor = String(reply.floor || '');
         nativeAction.setAttribute('aria-label', `回复 ${reply.author || '该用户'} 第 ${reply.floor || ''} 楼`);
       }
-      if (controls.childElementCount) header.prepend(controls);
+      const controlsSlot = header.querySelector('.wt-v2ex-native-reply-slot');
+      if (controlsSlot) controlsSlot.replaceWith(controls);
+      else header.prepend(controls);
     }
     if (topic) createThanksControl(topic, reply, header, controls);
     const relation = relationshipLabel(reply);
@@ -2054,6 +2098,7 @@
       .wt-v2ex-threaded-view { margin:10px 0; }
       #Main .cell[id^="r_"].wt-v2ex-native-hidden, #Wrapper .cell[id^="r_"].wt-v2ex-native-hidden { display:none !important; }
       .wt-v2ex-threaded-reply { position:relative; }
+      .wt-v2ex-threaded-reply > table { table-layout:fixed; }
       .wt-v2ex-thanks [hidden] { display:none !important; }
       .wt-v2ex-thank-area:focus-within > a, .wt-v2ex-thanks-focus:focus-within > a { visibility:visible; }
       @media (hover:none) { .wt-v2ex-thank-area > a { visibility:visible; } }
