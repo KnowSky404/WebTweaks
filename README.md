@@ -30,7 +30,9 @@ See [`scripts/README.md`](scripts/README.md) for the short placement guide and [
 
 Before changing the repository, read [`AGENTS.md`](AGENTS.md), inspect the relevant site and script files, and keep the change focused. New scripts should be human-readable, independently installable, least-privilege, and manually tested on their target website. Update this index when adding a script.
 
-Contributions are described in [`CONTRIBUTING.md`](CONTRIBUTING.md). Do not add secrets, tracking, or unrelated toolchain infrastructure.
+Every change, including documentation and bug fixes, must be developed in a dedicated Git worktree and task branch, pushed, and submitted as a PR against `main`. Wait for Codex review of the current head, address its findings, and pass required checks before using **Rebase and merge**. After confirming the merge, delete the remote and local task branches and remove the task worktree.
+
+The full workflow and contribution requirements are described in [`CONTRIBUTING.md`](CONTRIBUTING.md). Do not add secrets, tracking, or unrelated toolchain infrastructure.
 
 ## License
 
