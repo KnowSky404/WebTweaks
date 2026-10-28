@@ -13,7 +13,7 @@ Install a compatible userscript manager, then open a script's raw `.user.js` fil
 | Website | Script | Description | Install |
 | --- | --- | --- | --- |
 | [chatgpt.com](https://chatgpt.com/) | ChatGPT Account Usage Dashboard | Private, read-only floating dashboard for the current plan, Codex limits, cycle analysis, model usage percentage, and usage analytics. | [Install raw script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/chatgpt-com/account-usage-dashboard.user.js) |
-| [V2EX](https://v2ex.com/) | V2EX Conversation Enhancer | Page-isolated threaded replies with cross-page ancestor context, client-side image previews and lightbox viewing, and scroll-to-top. | [Install raw script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/v2ex-com/conversation-enhancer.user.js) |
+| [V2EX](https://v2ex.com/) | V2EX Conversation Enhancer | Page-isolated threaded replies with cross-page ancestor context, reply thanks, client-side image previews and lightbox viewing, and scroll-to-top. | [Install raw script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/v2ex-com/conversation-enhancer.user.js) |
 | [Cross-site, opt-in](scripts/cross-site/README.md) | Browser Environment Spoofer | Default-disabled, per-origin JavaScript language, locale, DST-aware timezone, and simulated geolocation with local settings and diagnostics. | [Install raw script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/cross-site/browser-environment.user.js) |
 
 ## Repository structure

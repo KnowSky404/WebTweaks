@@ -2,9 +2,9 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.4.3
-// @description  Threaded cross-page replies, client-side image previews, and navigation improvements for V2EX.
-// @description:zh-CN 为 V2EX 提供跨页楼中楼、浏览器侧图片预览和返回顶部功能。
+// @version      1.5.0
+// @description  Threaded cross-page replies with thanks, client-side image previews, and navigation improvements for V2EX.
+// @description:zh-CN 为 V2EX 提供跨页楼中楼、回复感谢、浏览器侧图片预览和返回顶部功能。
 // @author       KnowSky404
 // @match        https://v2ex.com/*
 // @match        https://*.v2ex.com/*
@@ -12,6 +12,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @run-at       document-idle
 // @homepageURL  https://github.com/KnowSky404/WebTweaks/tree/main/scripts/v2ex-com
 // @supportURL   https://github.com/KnowSky404/WebTweaks/issues
@@ -27,6 +28,7 @@
   const SETTINGS_KEY = 'wt-v2ex-settings';
   const MAX_PAGE_REQUESTS = 3;
   const PAGE_TIMEOUT_MS = 12_000;
+  const THANK_TIMEOUT_MS = 12_000;
   const SCROLL_THRESHOLD = 600;
   const IMAGE_CONTENT_SELECTOR = '.topic_content, .reply_content';
   const IMAGE_EXTENSION_PATTERN = /\.(?:jpe?g|png|gif|webp|avif)$/i;
@@ -70,6 +72,9 @@
     navigationSync: false,
     navigationRevision: 0,
     observedTopicKey: null,
+    thanksRequest: null,
+    thanksResults: new Map(),
+    thanksBlockedTokens: new Set(),
     imageDelegationAttached: false,
     imageLightbox: null,
     imageLightboxImage: null,
@@ -151,7 +156,10 @@
     GM_registerMenuCommand('默认使用楼中楼/原始顺序', () => {
       runtime.settings.preferredView = runtime.settings.preferredView === 'threaded' ? 'original' : 'threaded';
       saveSettings();
-      if (runtime.topic) applyTopicView(runtime.topic, runtime.settings.preferredView);
+      if (runtime.topic) {
+        runtime.topic.keepThanksSourceView = false;
+        applyTopicView(runtime.topic, runtime.settings.preferredView);
+      }
     });
   }
 
@@ -367,7 +375,7 @@
   function sanitizeReplyTemplate(element, base = location.href) {
     const clone = element.cloneNode(true);
     clone.removeAttribute('id');
-    clone.querySelectorAll('script, style, iframe, form, object, embed, template, base, meta, link, input, select, textarea, button, [data-action], a.reply, .reply a, .thank, .ignore, .moderate, .small.fade').forEach((node) => node.remove());
+    clone.querySelectorAll('script, style, iframe, form, object, embed, template, base, meta, link, input, select, textarea, button, [data-action], a.reply, .reply a, .thank, .thank_area, .thanked, [id^="thank_area_"], .ignore, .moderate, .small.fade').forEach((node) => node.remove());
     clone.querySelectorAll('[id]').forEach((node) => node.removeAttribute('id'));
     clone.querySelectorAll('*').forEach((node) => {
       [...node.attributes].forEach((attribute) => {
@@ -501,6 +509,349 @@
     return controls.childElementCount ? controls : null;
   }
 
+  // Capability comes from this reply's own header, never from a reusable template.
+  function readReplyThanks(element, replyId) {
+    const inHeader = (node) => !node.closest('.reply_content')
+      && node.closest('.cell[id^="r_"]') === element;
+    const image = allMatches(element, SELECTORS.replyThanks).find(inHeader);
+    const rawCount = image?.parentElement?.textContent.trim() || '';
+    const count = /^(?:\d+|\d{1,3}(?:,\d{3})+)$/.test(rawCount) ? Number(rawCount.replaceAll(',', '')) : NaN;
+    const area = /^[1-9]\d*$/.test(replyId)
+      ? [...element.querySelectorAll('[id]')].find((node) => node.id === 'thank_area_' + replyId && inHeader(node))
+      : null;
+    const thanked = Boolean(area?.classList.contains('thanked'));
+    const action = area && [...area.querySelectorAll('a, button, [role="button"]')].find((node) => {
+      if (!inHeader(node)) return false;
+      return ['onclick', 'href'].some((name) => {
+        const match = (node.getAttribute(name) || '').match(/(?:^|[^\w$.])thankReply\s*\(\s*(['"]?)([1-9]\d*)\1\s*\)/);
+        return match?.[2] === replyId;
+      });
+    });
+    return {
+      count: Number.isSafeInteger(count) && count >= 0 ? count : null,
+      canThank: Boolean(action) && !thanked,
+      thanked,
+      nativeKnown: Boolean(area),
+      phase: 'idle',
+      message: ''
+    };
+  }
+
+  function thanksKey(topic, reply) {
+    return location.origin + '/t/' + topic.context.id + '/reply/' + reply.id;
+  }
+
+  function rememberThanks(topic, reply, state) {
+    const previous = runtime.thanksResults.get(thanksKey(topic, reply));
+    if (previous?.state === 'thanked' && state !== 'thanked') return;
+    runtime.thanksResults.set(thanksKey(topic, reply), { state, count: reply.thanks.count });
+  }
+
+  function reconcileThanks(topic, reply) {
+    const state = reply.thanks;
+    if (!state) return;
+    const result = runtime.thanksResults.get(thanksKey(topic, reply));
+    if (!result) return;
+    if (result.count !== null) state.count = Math.max(state.count ?? 0, result.count);
+    if (result.state === 'thanked') {
+      state.thanked = true;
+      state.canThank = false;
+      state.phase = 'idle';
+    } else if (!state.thanked && state.phase !== 'checking') {
+      state.phase = result.state === 'pending' && runtime.thanksRequest?.topic === topic ? 'pending' : 'unknown';
+    }
+    reply.thankCount = state.count;
+  }
+
+  function validThanksToken(value) {
+    return (typeof value === 'string' || typeof value === 'number') && /^[0-9]+$/.test(String(value));
+  }
+
+  function thanksSession() {
+    try {
+      if (typeof unsafeWindow === 'undefined' || typeof unsafeWindow.thankReply !== 'function') return null;
+      const token = unsafeWindow.once;
+      if (!validThanksToken(token) || runtime.thanksBlockedTokens.has(String(token))) return null;
+      return { page: unsafeWindow, token };
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function nativeThanksReply(topic, reply) {
+    return topic.nativeReplies.find((cell) => cell.id === 'r_' + reply.id && cell.isConnected) || null;
+  }
+
+  function thanksSourceUrl(topic, reply) {
+    const url = new URL(pageUrl(topic.context, reply.page));
+    url.hash = 'wt-v2ex-thank-' + reply.id;
+    return url.href;
+  }
+
+  function updateThanksControl(topic, reply, control) {
+    if (!['.wt-v2ex-thank-count', '.wt-v2ex-thank-action', '.wt-v2ex-thank-check', '.wt-v2ex-thank-source', '.wt-v2ex-thank-status']
+      .every((selector) => control.querySelector(selector))) return;
+    reconcileThanks(topic, reply);
+    const state = reply.thanks;
+    const uncertain = state.phase === 'unknown' || state.phase === 'checking';
+    const direct = reply.page === topic.currentPage && state.canThank && Boolean(thanksSession());
+    const count = control.querySelector('.wt-v2ex-thank-count');
+    count.hidden = state.count === null;
+    count.textContent = state.count === null ? '' : '❤️ ' + state.count;
+    count.setAttribute('aria-label', '收到 ' + (state.count ?? '未知数量的') + ' 次感谢');
+    const action = control.querySelector('.wt-v2ex-thank-action');
+    action.hidden = !direct || state.thanked || uncertain;
+    action.disabled = Boolean(runtime.thanksRequest) || state.phase === 'pending';
+    action.setAttribute('aria-label', '感谢 ' + (reply.author || '该用户') + ' 的第 ' + (reply.floor || '') + ' 楼回复，消耗 10 铜币');
+    const check = control.querySelector('.wt-v2ex-thank-check');
+    check.hidden = !uncertain || state.thanked;
+    check.disabled = state.phase === 'checking' || Boolean(runtime.thanksRequest);
+    const source = control.querySelector('.wt-v2ex-thank-source');
+    source.hidden = state.thanked || state.phase === 'pending' || (!uncertain && (!state.canThank || direct));
+    source.href = thanksSourceUrl(topic, reply);
+    source.textContent = uncertain ? '到原页核对' : '到原页感谢';
+    const status = control.querySelector('.wt-v2ex-thank-status');
+    status.textContent = state.thanked ? '已感谢'
+      : state.phase === 'pending' ? '发送中…'
+      : state.phase === 'checking' ? '正在核对…'
+      : state.phase === 'unknown' ? state.message || '结果未确认，请核对状态'
+      : state.message;
+    control.hidden = state.count === null && action.hidden && check.hidden && source.hidden && !status.textContent;
+  }
+
+  function createThanksControl(topic, reply) {
+    if (!reply.thanks) return null;
+    reconcileThanks(topic, reply);
+    if (reply.thanks.count === null && !reply.thanks.canThank && !reply.thanks.thanked
+      && reply.thanks.phase === 'idle' && !reply.thanks.message) return null;
+    const control = document.createElement('span');
+    control.className = 'wt-v2ex-thanks';
+    control.dataset.replyId = reply.id;
+    control.innerHTML = '<span class="wt-v2ex-thank-count"></span> <button type="button" class="wt-v2ex-thank-action" title="感谢回复将消耗 10 铜币">感谢</button> <button type="button" class="wt-v2ex-thank-check">核对状态</button> <a class="wt-v2ex-thank-source"></a> <span class="wt-v2ex-thank-status" role="status" aria-live="polite"></span>';
+    control.querySelectorAll('button, a').forEach((node) => { node.dataset.replyId = reply.id; });
+    topic.thanksControls.set(control, reply.id);
+    updateThanksControl(topic, reply, control);
+    return control;
+  }
+
+  function updateThanksViews(topic) {
+    if (!isCurrentTopic(topic)) return;
+    const byId = new Map(topic.allReplies.map((reply) => [reply.id, reply]));
+    topic.thanksControls?.forEach((replyId, control) => {
+      if (!topic.threadedView.contains(control) || control.closest('.reply_content')) return;
+      const reply = byId.get(replyId);
+      if (reply?.thanks) updateThanksControl(topic, reply, control);
+    });
+  }
+
+  function markNativeThanked(topic, reply) {
+    const cell = nativeThanksReply(topic, reply);
+    const area = cell && [...cell.querySelectorAll('[id]')].find((node) => node.id === 'thank_area_' + reply.id
+      && !node.closest('.reply_content') && node.closest('.cell[id^="r_"]') === cell);
+    if (area && !area.classList.contains('thanked')) {
+      area.classList.add('thanked');
+      area.textContent = '感谢已发送';
+    }
+  }
+
+  async function refreshReplyThanks(topic, reply, checking = false) {
+    if (!isCurrentTopic(topic) || !/^[1-9]\d*$/.test(reply.id)) return;
+    const state = reply.thanks;
+    if (checking) { state.phase = 'checking'; updateThanksViews(topic); }
+    const controller = new AbortController();
+    topic.thanksReads.add(controller);
+    const timer = window.setTimeout(() => controller.abort(), THANK_TIMEOUT_MS);
+    try {
+      const url = pageUrl(topic.context, reply.page);
+      const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store', signal: controller.signal });
+      const finalUrl = new URL(response.url || url);
+      if (!response.ok || finalUrl.origin !== location.origin || finalUrl.pathname !== '/t/' + topic.context.id
+        || Number(finalUrl.searchParams.get('p') || 1) !== reply.page) throw new Error('无法核对原页');
+      const parsed = new DOMParser().parseFromString(await response.text(), 'text/html');
+      if (!isCurrentTopic(topic)) return;
+      const marker = parsed.querySelector('.ps_container .page_current');
+      if ((marker && parseFloor(marker.textContent) !== reply.page) || (!marker && reply.page !== 1)) throw new Error('分页不匹配');
+      const cell = allMatches(parsed, SELECTORS.reply).find((node) => node.id === 'r_' + reply.id);
+      if (!cell) throw new Error('原页未找到该回复');
+      const snapshot = readReplyThanks(cell, reply.id);
+      if (snapshot.count !== null) state.count = Math.max(state.count ?? 0, snapshot.count);
+      if (snapshot.thanked) {
+        state.thanked = true;
+        state.canThank = false;
+        state.phase = 'idle';
+        state.message = '';
+        rememberThanks(topic, reply, 'thanked');
+        markNativeThanked(topic, reply);
+      } else if (checking) {
+        // A GET can race a delayed POST. Absence of .thanked never licenses a retry.
+        state.phase = 'unknown';
+        state.message = '原页尚未确认，请稍后核对或打开原页';
+      }
+      if (state.thanked) rememberThanks(topic, reply, 'thanked');
+      reply.thankCount = state.count;
+    } catch (error) {
+      if (checking && isCurrentTopic(topic)) {
+        state.phase = 'unknown';
+        state.message = '暂时无法核对，请稍后重试核对';
+      }
+    } finally {
+      window.clearTimeout(timer);
+      topic.thanksReads.delete(controller);
+      updateThanksViews(topic);
+    }
+  }
+
+  function synchronizeNativeThanks(topic) {
+    if (!isCurrentTopic(topic)) return;
+    topic.allReplies.forEach((reply) => {
+      if (!reply.thanks || reply.page !== topic.currentPage) return;
+      const cell = nativeThanksReply(topic, reply);
+      if (!cell) return;
+      const snapshot = readReplyThanks(cell, reply.id);
+      const becameThanked = snapshot.thanked && !reply.thanks.thanked;
+      reply.thanks.canThank = snapshot.canThank && !reply.thanks.thanked;
+      if (snapshot.count !== null) reply.thanks.count = Math.max(reply.thanks.count ?? 0, snapshot.count);
+      if (snapshot.thanked) {
+        reply.thanks.thanked = true;
+        reply.thanks.phase = 'idle';
+        rememberThanks(topic, reply, 'thanked');
+        if (becameThanked) void refreshReplyThanks(topic, reply);
+      }
+    });
+    updateThanksViews(topic);
+  }
+
+  function attachThanksObserver(topic) {
+    topic.thanksReads = new Set();
+    if (typeof MutationObserver !== 'function') return;
+    topic.thanksObserver = new MutationObserver(() => synchronizeNativeThanks(topic));
+    topic.nativeReplies.forEach((cell) => {
+      const id = cell.id.match(/^r_([1-9]\d*)$/)?.[1];
+      if (!id) return;
+      cell.querySelectorAll('[id]').forEach((area) => {
+        if (area.id === 'thank_area_' + id && !area.closest('.reply_content')
+          && area.closest('.cell[id^="r_"]') === cell) {
+          topic.thanksObserver.observe(area, { attributes: true, attributeFilter: ['class'], childList: true, subtree: true });
+        }
+      });
+    });
+  }
+
+  function disposeThanks(topic) {
+    topic.thanksObserver?.disconnect();
+    topic.thanksReads?.forEach((controller) => controller.abort());
+    if (runtime.thanksRequest?.topic === topic) runtime.thanksRequest.controller.abort();
+  }
+
+  async function sendReplyThanks(topic, reply) {
+    if (!isCurrentTopic(topic) || runtime.thanksRequest || reply.page !== topic.currentPage || !reply.thanks) return;
+    reconcileThanks(topic, reply);
+    if (reply.thanks.thanked || reply.thanks.phase !== 'idle' || !/^[1-9]\d*$/.test(reply.id)) return;
+    const cell = nativeThanksReply(topic, reply);
+    if (!cell || !readReplyThanks(cell, reply.id).canThank || !thanksSession()) return;
+    if (!window.confirm('感谢 ' + (reply.author || '该用户') + ' 的第 ' + (reply.floor || '') + ' 楼回复将消耗 10 铜币，是否继续？')) return;
+    const session = thanksSession();
+    if (!isCurrentTopic(topic) || runtime.thanksRequest || !session || !cell.isConnected || !readReplyThanks(cell, reply.id).canThank) return;
+    const state = reply.thanks;
+    const controller = new AbortController();
+    const request = { topic, replyId: reply.id, controller };
+    runtime.thanksRequest = request;
+    state.phase = 'pending';
+    state.message = '';
+    rememberThanks(topic, reply, 'pending');
+    updateThanksViews(topic);
+    const timer = window.setTimeout(() => controller.abort(), THANK_TIMEOUT_MS);
+    try {
+      // This write deliberately does not use fetchPage(), whose GET retries are unsafe here.
+      const url = new URL('/thank/reply/' + reply.id, location.origin);
+      url.searchParams.set('once', String(session.token));
+      const response = await fetch(url.href, {
+        method: 'POST', credentials: 'same-origin', redirect: 'error', signal: controller.signal,
+        headers: { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
+      });
+      if (!response.ok) throw new Error('感谢结果未确认');
+      const data = await response.json();
+      if (!data || typeof data.success !== 'boolean') throw new Error('感谢结果未确认');
+      if (isCurrentTopic(topic)) {
+        // Other native operations may have rotated once while this request was in flight.
+        try {
+          if (String(session.page.once) === String(session.token)) {
+            if (validThanksToken(data.once)) session.page.once = data.once;
+            else runtime.thanksBlockedTokens.add(String(session.token));
+          }
+        } catch (error) {
+          runtime.thanksBlockedTokens.add(String(session.token));
+        }
+      } else {
+        runtime.thanksBlockedTokens.add(String(session.token));
+      }
+      if (data.success === true) {
+        if (!state.thanked && state.count !== null) state.count += 1;
+        state.thanked = true;
+        state.canThank = false;
+        state.phase = 'idle';
+        rememberThanks(topic, reply, 'thanked');
+        if (isCurrentTopic(topic)) {
+          markNativeThanked(topic, reply);
+          try {
+            if (typeof session.page.refreshMoney === 'function') session.page.refreshMoney();
+          } catch (error) { /* Balance refresh must not undo a confirmed successful thank. */ }
+          void refreshReplyThanks(topic, reply);
+        }
+      } else {
+        state.phase = 'idle';
+        state.message = typeof data.message === 'string' ? data.message.slice(0, 200) : '感谢未发送，请检查登录状态或余额';
+        if (runtime.thanksResults.get(thanksKey(topic, reply))?.state !== 'thanked') {
+          runtime.thanksResults.delete(thanksKey(topic, reply));
+        }
+        reconcileThanks(topic, reply);
+      }
+      reply.thankCount = state.count;
+    } catch (error) {
+      state.phase = 'unknown';
+      state.message = '结果未确认，请核对状态';
+      rememberThanks(topic, reply, 'unknown');
+      reconcileThanks(topic, reply);
+      // Remember uncertainty even after navigation, without touching the new page's once.
+      runtime.thanksBlockedTokens.add(String(session.token));
+    } finally {
+      window.clearTimeout(timer);
+      if (runtime.thanksRequest === request) runtime.thanksRequest = null;
+      // Read the current view's own IDs; never apply the old topic's DOM or token.
+      if (runtime.topic) updateThanksViews(runtime.topic);
+    }
+  }
+
+  function showNativeThanks(topic, reply) {
+    topic.keepThanksSourceView = true;
+    applyTopicView(topic, 'original');
+    const cell = nativeThanksReply(topic, reply);
+    cell?.scrollIntoView({ block: 'center', behavior: 'auto' });
+    const area = cell && [...cell.querySelectorAll('[id]')].find((node) => node.id === 'thank_area_' + reply.id && !node.closest('.reply_content'));
+    area?.querySelector('a, button')?.focus({ preventScroll: true });
+  }
+
+  function activateThanks(topic, event) {
+    if (!(event.target instanceof Element) || !isCurrentTopic(topic)) return;
+    const action = event.target.closest('.wt-v2ex-thank-action, .wt-v2ex-thank-check, .wt-v2ex-thank-source');
+    if (!action || !topic.threadedView.contains(action)) return;
+    const control = action.parentElement;
+    if (control?.closest('.reply_content') || topic.thanksControls?.get(control) !== action.dataset.replyId) return;
+    const reply = topic.allReplies.find((item) => item.id === action.dataset.replyId);
+    if (!reply?.thanks) return;
+    if (action.classList.contains('wt-v2ex-thank-source')) {
+      if (reply.page === topic.currentPage && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {
+        event.preventDefault();
+        showNativeThanks(topic, reply);
+      }
+      return;
+    }
+    event.preventDefault();
+    if (action.disabled) return;
+    if (action.classList.contains('wt-v2ex-thank-check')) void refreshReplyThanks(topic, reply, true);
+    else void sendReplyThanks(topic, reply);
+  }
+
   function parseReply(element, page, index = 0, base = location.href) {
     const content = firstMatch(element, SELECTORS.replyContent);
     if (!content) return null;
@@ -508,9 +859,7 @@
     const floor = parseFloor(firstMatch(element, SELECTORS.replyFloor)?.textContent);
     const authorElement = firstMatch(element, SELECTORS.replyAuthor);
     const author = (authorElement?.textContent || '').trim();
-    const thanksImage = firstMatch(element, SELECTORS.replyThanks);
-    const thanksText = thanksImage?.parentElement?.textContent || '';
-    const thankCount = thanksText.match(/\d+/)?.[0];
+    const thanks = readReplyThanks(element, idMatch?.[1] || '');
     const prefix = parseLeadingPrefix(content);
     return {
       id: idMatch ? idMatch[1] : `fallback-${page}-${floor || 'unknown'}-${index}`,
@@ -522,7 +871,8 @@
       timeText: firstMatch(element, SELECTORS.replyTime)?.getAttribute('title') || firstMatch(element, SELECTORS.replyTime)?.textContent.trim() || '',
       contentHtml: sanitizeContent(content, base),
       contentText: (content.textContent || '').trim(),
-      thankCount: thankCount ? Number(thankCount) : null,
+      thankCount: thanks.count,
+      thanks,
       mentionedUsers: prefix.mentionedUsers,
       normalizedMentions: prefix.normalizedMentions,
       explicitReplyFloor: prefix.explicitReplyFloor,
@@ -773,6 +1123,7 @@
       const button = event.target.closest('button');
       if (!button || !panel.contains(button)) return;
       if (button.dataset.view) {
+        topic.keepThanksSourceView = false;
         runtime.settings.preferredView = button.dataset.view;
         saveSettings();
         applyTopicView(topic, button.dataset.view);
@@ -851,7 +1202,7 @@
     });
   }
 
-  function createReplyCard(reply, depth, hasVisibleChildren) {
+  function createReplyCard(reply, depth, hasVisibleChildren, topic) {
     const cell = reply.nativeTemplate?.cloneNode(true) || document.createElement('div');
     if (!cell.classList.contains('cell')) cell.classList.add('cell');
     cell.classList.add('wt-v2ex-threaded-reply', `wt-v2ex-depth-${Math.min(depth, 6)}`);
@@ -882,6 +1233,8 @@
       if (reply.unresolvedReason) badge.title = reply.unresolvedReason;
       header.append(badge);
     }
+    const thanks = topic && createThanksControl(topic, reply);
+    if (thanks) header.append(thanks);
     const controls = reply.nativeReplyControlsTemplate?.cloneNode(true);
     if (controls) {
       const nativeAction = controls.querySelector('[data-wt-v2ex-native-reply-action="true"]');
@@ -933,6 +1286,7 @@
       : null;
     if (lightboxUrl) closeImageLightbox(false);
     const scrollAnchor = captureThreadedScrollAnchor(topic);
+    topic.thanksControls = new Map();
     topic.threadedView.replaceChildren();
     const fragment = document.createDocumentFragment();
     const visibleThread = topic.visibleThread || deriveVisibleThread(topic);
@@ -946,7 +1300,7 @@
       }
       renderedReplyIds.add(reply.id);
       const children = visibleThread.childrenByParent.get(reply.id) || [];
-      const rendered = createReplyCard(reply, depth, children.length > 0);
+      const rendered = createReplyCard(reply, depth, children.length > 0, topic);
       target.append(rendered.cell);
       if (children.length && rendered.children) {
         for (let index = children.length - 1; index >= 0; index -= 1) {
@@ -964,6 +1318,11 @@
   }
 
   function applyTopicView(topic, view) {
+    if (topic.thanksObserver) synchronizeNativeThanks(topic);
+    const targetId = !topic.thanksTargetHandled && location.hash?.match(/^#wt-v2ex-thank-([1-9]\d*)$/)?.[1];
+    const targetReply = targetId && topic.allReplies.find((reply) => reply.id === targetId && reply.page === topic.currentPage);
+    if (targetReply) { topic.thanksTargetHandled = true; topic.keepThanksSourceView = true; }
+    if (topic.keepThanksSourceView) view = 'original';
     if (view === 'threaded' && (!topic.threadedView.childElementCount || topic.failed)) {
       view = 'original';
     }
@@ -977,6 +1336,11 @@
       else reply.removeAttribute('aria-hidden');
     });
     updateTopicPanel(topic);
+    if (targetReply) {
+      const cell = nativeThanksReply(topic, targetReply);
+      cell?.scrollIntoView({ block: 'center', behavior: 'auto' });
+      cell?.querySelector('[id^="thank_area_"] a')?.focus({ preventScroll: true });
+    }
   }
 
   async function loadAllTopicPages(topic, pageLoader = loadPages) {
@@ -1062,9 +1426,11 @@
     topic.nativeReplyControlsTemplate = topic.allReplies.find((reply) => reply.nativeReplyControlsTemplate)?.nativeReplyControlsTemplate || null;
     firstReply.before(threadedView);
     runtime.topic = topic;
+    attachThanksObserver(topic);
     topic.models = inferRelationships(topic.allReplies);
     topic.visibleThread = deriveVisibleThread(topic);
     renderThreadedView(topic);
+    applyTopicView(topic, 'original');
     if (topic.maxPage > 10) {
       topic.incomplete = true;
       setTopicStatus(topic, `当前显示第 ${topic.currentPage} 页；完整关系需要加载全部 ${topic.maxPage} 页`);
@@ -1095,6 +1461,7 @@
     };
     topic.threadedView.addEventListener('click', activateThreadedReply);
     topic.threadedView.addEventListener('keydown', activateThreadedReply);
+    topic.threadedView.addEventListener('click', (event) => activateThanks(topic, event));
   }
 
   function removeConversationControl() {
@@ -1130,6 +1497,7 @@
         else {
           closeImageLightbox();
           if (runtime.topic) {
+            disposeThanks(runtime.topic);
             applyTopicView(runtime.topic, 'original');
             runtime.topic.threadedView.remove();
             runtime.topic = null;
@@ -1148,6 +1516,7 @@
       }
       closeImageLightbox();
       if (runtime.topic) {
+        disposeThanks(runtime.topic);
         applyTopicView(runtime.topic, 'original');
         runtime.topic.threadedView.remove();
         runtime.topic = null;
@@ -1610,6 +1979,14 @@
       .wt-v2ex-threaded-reply .wt-v2ex-native-reply-controls { float:none; order:999; display:inline-flex; flex:0 0 auto; align-items:center; gap:5px; margin-left:auto; white-space:nowrap; }
       .wt-v2ex-threaded-reply .wt-v2ex-native-reply-action:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
       .wt-v2ex-threaded-reply .wt-v2ex-native-reply-action:hover { opacity:.72; }
+      .wt-v2ex-thanks { order:998; display:inline-flex; flex-wrap:wrap; align-items:baseline; gap:5px; margin-left:auto; max-width:100%; font-size:12px; }
+      .wt-v2ex-thanks[hidden], .wt-v2ex-thanks [hidden] { display:none !important; }
+      .wt-v2ex-thanks:not([hidden]) + .wt-v2ex-native-reply-controls { margin-left:0; }
+      .wt-v2ex-thank-action, .wt-v2ex-thank-check { padding:2px 5px; border:1px solid rgba(127,127,127,.35); border-radius:3px; background:transparent; color:inherit; font:inherit; cursor:pointer; }
+      .wt-v2ex-thank-action:disabled, .wt-v2ex-thank-check:disabled { opacity:.6; cursor:default; }
+      .wt-v2ex-thank-action:focus-visible, .wt-v2ex-thank-check:focus-visible, .wt-v2ex-thank-source:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
+      .wt-v2ex-thank-count { white-space:nowrap; }
+      .wt-v2ex-thank-status { overflow-wrap:anywhere; }
       .wt-v2ex-inline-image { display:block; max-width:100%; height:auto; margin:8px 0; cursor:zoom-in; }
       .wt-v2ex-lightbox-target { cursor:zoom-in; }
       .wt-v2ex-image-lightbox { position:fixed; z-index:2147483646; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; box-sizing:border-box; padding:24px; overflow:auto; background:rgba(0,0,0,.88); }

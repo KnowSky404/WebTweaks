@@ -12,12 +12,15 @@
     .cell { padding: 12px; border-bottom: 1px solid #ddd; }
     .fr { float: right; }
     .page_current { font-weight: 700; }
+    .thank_area { display: inline; margin-right: 8px; }
+    .small.fade { color: #777; font-size: 12px; }
+    .small.fade img { width: 12px; height: 12px; }
   </style>
 </head>
 <body>
   <section id="fixture-controls">
     <h1>V2EX 浏览器回归夹具</h1>
-    <p>覆盖分页状态、跨页祖先、旧异步加载和楼中楼/原始顺序切换。</p>
+    <p>覆盖分页隔离、跨页祖先、视图切换及感谢交互。主题、用户、令牌和请求均为本地模拟数据，不会发送真实感谢。</p>
     <button id="fixture-run" type="button">运行回归检查</button>
     <ol id="fixture-results" aria-live="polite"></ol>
   </section>
@@ -25,17 +28,61 @@
 
   <script>
     (() => {
-      const pageOne = `
-        <div class="cell ps_container"><span class="page_current">1</span> <a class="page_normal" href="/t/42?p=2">2</a><input class="page_input" max="2"></div>
-        <div id="r_p1-unrelated" class="cell"><span class="fr"><span class="no">1</span></span><strong><a class="dark" href="/member/a">A</a></strong><span class="ago" title="p1">p1</span><div class="sep5"></div><div class="reply_content">unrelated page-one reply</div></div>
-        <div id="r_p1-parent" class="cell"><span class="fr"><span class="no">2</span></span><strong><a class="dark" href="/member/alice">Alice</a></strong><span class="ago" title="p1">p1</span><div class="sep5"></div><div class="reply_content">cross-page parent</div></div>`;
-      const pageTwo = `
-        <div class="cell ps_container"><a class="page_normal" href="/t/42">1</a> <span class="page_current">2</span><input class="page_input" max="2"></div>
-        <div id="r_p2-root" class="cell"><span class="fr"><span class="no">101</span></span><strong><a class="dark" href="/member/d">D</a></strong><span class="ago" title="p2">p2</span><div class="sep5"></div><div class="reply_content">page-two root</div></div>
-        <div id="r_p2-child" class="cell"><span class="fr"><span class="no">102</span></span><strong><a class="dark" href="/member/e">E</a></strong><span class="ago" title="p2">p2</span><div class="sep5"></div><div class="reply_content"><a href="/member/alice">@Alice</a> #2 cross-page child</div></div>`;
-
-      history.replaceState({}, '', '/t/42?p=1');
-      document.querySelector('#Main').innerHTML = pageOne;
+      const pixel = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+      const definitions = [
+        { id: '101', floor: 1, page: 1, author: 'A', content: 'unrelated page-one reply', count: 1 },
+        { id: '102', floor: 2, page: 1, author: 'Alice', content: 'cross-page parent', count: 2 },
+        { id: '201', floor: 101, page: 2, author: 'D', content: 'page-two root', count: 3 },
+        // V2EX's native prefix places @ outside the member link.
+        { id: '202', floor: 102, page: 2, author: 'E', content: '@<a href="/member/alice">Alice</a> #2 cross-page child', count: 0 },
+        { id: '203', floor: 103, page: 2, author: 'F', content: 'already thanked', count: 4, thanked: true },
+        { id: '204', floor: 104, page: 2, author: 'Self', content: 'own reply without a native thanks action', count: null, canThank: false },
+        { id: '205', floor: 105, page: 2, author: 'G', content: 'confirmation cancellation', count: 0 },
+        { id: '206', floor: 106, page: 2, author: 'H', content: 'business failure', count: 1 },
+        { id: '207', floor: 107, page: 2, author: 'I', content: 'uncertain network outcome', count: 2 },
+        { id: '208', floor: 108, page: 2, author: 'J', content: 'navigation during a pending thanks', count: 0 },
+        { id: '209', floor: 109, page: 2, author: 'K', content: 'native-view synchronization', count: 1 },
+        { id: '210', floor: 110, page: 2, author: 'L', content: 'unavailable native capability', count: null, canThank: false },
+        { id: '211', floor: 111, page: 2, author: 'M', content: 'unknown outcome without confirmed acceptance', count: 0 }
+      ];
+      const state = {
+        replies: new Map(),
+        modes: new Map(),
+        calls: [],
+        confirmation: true,
+        confirmations: [],
+        moneyRefreshes: 0,
+        serverOnce: 1000,
+        maxPage: 2,
+        holdInitialPageTwo: true,
+        releaseInitialPageTwo: null,
+        pageDelay: new Map([[1, 40], [2, 450]])
+      };
+      const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+      const replyHtml = (reply) => {
+        const area = reply.canThank === false ? '' : `<span id="thank_area_${reply.id}" class="thank_area${reply.thanked ? ' thanked' : ''}">${reply.thanked ? '感谢已发送' : `<a href="#" onclick="if (confirm('发送感谢？')) { thankReply(${reply.id}); } return false;">感谢</a>`}</span>`;
+        const count = reply.count === null || reply.count === 0 ? '' : `<span class="small fade"><img src="${pixel}" alt="❤️"> ${reply.count}</span>`;
+        return `<div id="r_${reply.id}" class="cell"><span class="fr">${area}<span class="no">${reply.floor}</span></span><strong><a class="dark" href="/member/${escapeHtml(reply.author.toLowerCase())}">${escapeHtml(reply.author)}</a></strong> <span class="ago" title="fixture page ${reply.page}">fixture</span> ${count}<div class="sep5"></div><div class="reply_content">${reply.content}</div></div>`;
+      };
+      // Matches the inspected native topic HTML, including the first-page ?p=1 link.
+      const renderPage = (page) => `<div class="cell ps_container">${[1, 2].map((number) => number === page ? `<span class="page_current">${number}</span>` : `<a class="page_normal" href="?p=${number}">${number}</a>`).join(' ')}<input class="page_input" max="${state.maxPage}"></div>${[...state.replies.values()].filter((reply) => reply.page === page).map(replyHtml).join('')}`;
+      const reset = () => {
+        state.replies = new Map(definitions.map((reply) => [reply.id, { ...reply, thanked: Boolean(reply.thanked) }]));
+        state.modes.clear();
+        state.calls.length = 0;
+        state.confirmations.length = 0;
+        state.confirmation = true;
+        state.moneyRefreshes = 0;
+        state.serverOnce = 1000;
+        window.once = state.serverOnce;
+      };
+      const applyServerThanks = (reply) => {
+        if (!reply.thanked) {
+          reply.thanked = true;
+          reply.count = (reply.count || 0) + 1;
+        }
+      };
       window.GM_getValue = (_key, fallback) => fallback;
       window.GM_setValue = () => {};
       window.GM_addStyle = (css) => {
@@ -44,20 +91,75 @@
         document.head.append(style);
       };
       window.GM_registerMenuCommand = () => {};
-      window.fetch = async (url) => {
-        const page = Number(new URL(url, location.href).searchParams.get('p') || '1');
-        await new Promise((resolve) => setTimeout(resolve, page === 2 ? 450 : 40));
-        return new Response(page === 2 ? pageTwo : pageOne, { status: 200, headers: { 'content-type': 'text/html' } });
+      window.unsafeWindow = window;
+      window.confirm = (message) => {
+        state.confirmations.push(String(message));
+        return state.confirmation;
       };
-      window.__fixturePages = { pageOne, pageTwo };
+      window.refreshMoney = () => { state.moneyRefreshes += 1; };
+      window.fetch = async (input, options = {}) => {
+        const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
+        const method = String(options.method || input?.method || 'GET').toUpperCase();
+        if (url.origin !== location.origin) throw new Error(`fixture blocked external request: ${url.origin}`);
+        const call = { method, pathname: url.pathname, search: url.search, credentials: options.credentials };
+        state.calls.push(call);
+        if (method === 'POST') {
+          const id = url.pathname.match(/^\/thank\/reply\/(\d+)$/)?.[1];
+          if (!id) throw new Error(`fixture blocked unexpected POST: ${url.pathname}`);
+          call.replyId = id;
+          const reply = state.replies.get(id);
+          if (!reply || reply.canThank === false) throw new Error('fixture received a thanks request without native capability');
+          if (options.credentials !== 'same-origin') throw new Error('thanks request omitted same-origin credentials');
+          if (url.searchParams.get('once') !== String(state.serverOnce)) return new Response(JSON.stringify({ success: false, message: 'fixture stale once', once: state.serverOnce }), { headers: { 'content-type': 'application/json' } });
+          const mode = state.modes.get(id) || { type: 'success', delay: 40 };
+          await delay(mode.delay ?? 40);
+          if (mode.type === 'unknown-before') throw new TypeError('fixture network outcome unknown');
+          if (mode.type === 'failure') {
+            state.serverOnce += 1;
+            return new Response(JSON.stringify({ success: false, once: state.serverOnce, message: 'fixture: 余额不足' }), { headers: { 'content-type': 'application/json' } });
+          }
+          applyServerThanks(reply);
+          state.serverOnce += 1;
+          if (mode.type === 'unknown-after') throw new TypeError('fixture response lost after server acceptance');
+          return new Response(JSON.stringify({ success: true, once: state.serverOnce }), { headers: { 'content-type': 'application/json' } });
+        }
+        if (method !== 'GET' || url.pathname !== '/t/42') throw new Error(`fixture blocked unexpected ${method}: ${url.pathname}`);
+        const page = Number(url.searchParams.get('p') || '1');
+        if (![1, 2].includes(page)) throw new Error('fixture requested an unknown source page');
+        if (page === 2 && state.holdInitialPageTwo) {
+          state.holdInitialPageTwo = false;
+          await new Promise((resolve) => { state.releaseInitialPageTwo = resolve; });
+        }
+        await delay(state.pageDelay.get(page) || 0);
+        return new Response(`<!doctype html><html><body><main id="Main">${renderPage(page)}</main></body></html>`, { headers: { 'content-type': 'text/html' } });
+      };
+      window.thankReply = function thankReply(replyId) {
+        return window.fetch(`/thank/reply/${replyId}?once=${window.once}`, { method: 'POST', credentials: 'same-origin' }).then((response) => response.json()).then((data) => {
+          if (Number.isFinite(data.once)) window.once = data.once;
+          if (data.success === true) {
+            const area = document.querySelector(`#thank_area_${replyId}`);
+            if (area) {
+              area.classList.add('thanked');
+              area.textContent = '感谢已发送';
+            }
+            window.refreshMoney();
+          }
+        });
+      };
+      reset();
+      history.replaceState({}, '', '/t/42?p=1');
+      document.querySelector('#Main').innerHTML = renderPage(1);
+      window.__v2exFixture = { state, renderPage, reset };
     })();
   </script>
   <script src="/scripts/v2ex-com/conversation-enhancer.user.js"></script>
   <script>
     (() => {
       const results = document.querySelector('#fixture-results');
+      const runButton = document.querySelector('#fixture-run');
+      const { state, renderPage } = window.__v2exFixture;
       const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-      const waitFor = async (predicate, message, timeout = 2_500) => {
+      const waitFor = async (predicate, message, timeout = 3_500) => {
         const started = performance.now();
         while (!predicate()) {
           if (performance.now() - started > timeout) throw new Error(message);
@@ -73,61 +175,214 @@
       const check = (condition, message) => {
         if (!condition) throw new Error(message);
       };
+      const card = (id) => document.querySelector(`.wt-v2ex-threaded-view [data-wt-v2ex-reply-id="${id}"]`);
+      const action = (id) => card(id)?.querySelector(`.wt-v2ex-thank-action[data-reply-id="${id}"]`);
+      const status = (id) => card(id)?.querySelector('.wt-v2ex-thank-status')?.textContent || '';
+      const actionable = (id) => Boolean(action(id) && !action(id).hidden && !action(id).disabled && action(id).getAttribute('aria-disabled') !== 'true');
+      const checkAction = (id) => {
+        const node = card(id)?.querySelector('.wt-v2ex-thank-check');
+        return node && !node.hidden ? node : null;
+      };
+      const count = (id) => Number(card(id)?.querySelector('.wt-v2ex-thank-count')?.textContent.match(/\d+/)?.[0] ?? NaN);
+      const posts = (id) => state.calls.filter((call) => call.method === 'POST' && call.replyId === id).length;
+      const nativeThanked = (id) => document.querySelector(`#thank_area_${id}`)?.classList.contains('thanked');
+      const goToPage = async (page, domDelay = 0, fragment = '') => {
+        history.pushState({}, '', `/t/42?p=${page}${fragment ? '#' + fragment : ''}`);
+        await delay(domDelay);
+        document.querySelector('#Main').innerHTML = renderPage(page);
+        await waitFor(() => document.querySelector('.wt-v2ex-threaded-view') && card(page === 1 ? '101' : '201'), `page ${page} did not initialize`);
+      };
+      const selectView = (view) => {
+        const panel = document.querySelector('.wt-v2ex-conversation-panel');
+        if (panel?.hidden) document.querySelector('.wt-v2ex-conversation-toggle')?.click();
+        const button = document.querySelector(`[data-view="${view}"]`);
+        check(button, `view button missing: ${view}`);
+        button.click();
+      };
+      const waitForThanked = async (id) => {
+        await waitFor(() => nativeThanked(id) && !actionable(id), `reply ${id} did not synchronize its confirmed thanked state`);
+      };
 
       async function run() {
         results.replaceChildren();
-        document.querySelector('#fixture-run').disabled = true;
+        runButton.disabled = true;
         try {
-          history.pushState({}, '', '/t/42?p=2');
-          window.setTimeout(() => {
-            document.querySelector('#Main').innerHTML = window.__fixturePages.pageTwo;
-          }, 60);
-
-          await waitFor(
-            () => document.querySelector('.wt-v2ex-thread-status')?.textContent.includes('当前线程投影'),
-            'page-two threaded model did not finish'
-          );
+          await waitFor(() => card('101'), 'initial page-one projection did not initialize');
+          await waitFor(() => state.releaseInitialPageTwo, 'initial page-two request did not begin');
+          await goToPage(2, 60);
+          await waitFor(() => document.querySelector('.wt-v2ex-thread-status')?.textContent.includes('当前线程投影'), 'page-two threaded model did not finish');
+          state.releaseInitialPageTwo();
           await delay(500);
 
           check(location.search === '?p=2', `URL regressed to ${location.search || 'page 1'}`);
           check(document.querySelector('.ps_container .page_current')?.textContent.trim() === '2', 'native page marker is not page 2');
-          check(document.querySelector('#r_p2-child'), 'page-two native replies were replaced');
-          check(!document.querySelector('#r_p1-parent'), 'stale page-one native reply leaked into the active DOM');
+          check(document.querySelector('#r_202'), 'page-two native replies were replaced');
+          check(!document.querySelector('#r_102'), 'stale page-one native reply leaked into the active DOM');
           record('分页状态在延迟 DOM 切换后保持第 2 页', true);
 
-          const threadedIds = [...document.querySelectorAll('.wt-v2ex-threaded-view [data-wt-v2ex-reply-id]')]
-            .map((node) => node.dataset.wtV2exReplyId);
-          check(threadedIds.includes('p1-parent'), 'required page-one ancestor is missing');
-          check(threadedIds.includes('p2-root') && threadedIds.includes('p2-child'), 'active-page replies are missing');
-          check(!threadedIds.includes('p1-unrelated'), 'unrelated page-one reply leaked into the projection');
+          const threadedIds = [...document.querySelectorAll('.wt-v2ex-threaded-view [data-wt-v2ex-reply-id]')].map((node) => node.dataset.wtV2exReplyId);
+          check(threadedIds.includes('102'), 'required page-one ancestor is missing');
+          check(threadedIds.includes('201') && threadedIds.includes('202'), 'active-page replies are missing');
+          check(!threadedIds.includes('101'), 'unrelated page-one reply leaked into the projection');
           record('全局推断保留跨页祖先且投影不泄漏无关回复', true, threadedIds.join(', '));
 
           check(document.querySelector('.wt-v2ex-thread-status')?.textContent.includes('当前线程投影'), 'stale request changed the active status');
           check(location.search === '?p=2', 'stale request changed the active URL');
           record('旧分页异步结果未覆盖当前页状态', true);
 
-          document.querySelector('.wt-v2ex-conversation-toggle').click();
-          const original = document.querySelector('[data-view="original"]');
-          const threaded = document.querySelector('[data-view="threaded"]');
-          const expectedThreadedCount = threadedIds.length;
           for (let index = 0; index < 3; index += 1) {
-            original.click();
+            selectView('original');
             check(document.querySelector('.wt-v2ex-threaded-view').hidden, 'threaded view remained visible in original mode');
             check([...document.querySelectorAll('#Main > .cell[id^="r_"]')].every((node) => !node.classList.contains('wt-v2ex-native-hidden') && !node.hasAttribute('aria-hidden')), 'native replies were not fully restored');
-            threaded.click();
+            selectView('threaded');
             check(!document.querySelector('.wt-v2ex-threaded-view').hidden, 'threaded view did not become visible');
-            check(document.querySelectorAll('.wt-v2ex-threaded-view [data-wt-v2ex-reply-id]').length === expectedThreadedCount, 'view switching duplicated or removed threaded replies');
+            check(document.querySelectorAll('.wt-v2ex-threaded-view [data-wt-v2ex-reply-id]').length === threadedIds.length, 'view switching duplicated or removed threaded replies');
           }
           record('楼中楼与原始顺序反复切换保持节点和可访问状态', true);
+
+          check(count('201') === 3 && count('203') === 4, 'existing thanks counts are missing or wrong');
+          check(actionable('201'), 'eligible active-page reply has no usable thanks action');
+          check(!actionable('203'), 'already-thanked reply remained actionable');
+          check(!actionable('204') && !actionable('210'), 'a reply without its own native capability inherited a thanks action');
+          check(!card('201').querySelector('[onclick], [id^="thank_area_"]'), 'threaded clone retained native handlers or duplicate IDs');
+          record('感谢数、已感谢状态与每条回复自身的操作资格正确', true);
+
+          const crossPageLink = card('102')?.querySelector('.wt-v2ex-thank-source');
+          check(!actionable('102') && crossPageLink && !crossPageLink.hidden, 'cross-page ancestor should offer the source page without a direct thanks request');
+          const sourceUrl = new URL(crossPageLink.href, location.href);
+          check(sourceUrl.origin === location.origin && sourceUrl.pathname === '/t/42' && Number(sourceUrl.searchParams.get('p') || '1') === 1 && sourceUrl.hash === '#wt-v2ex-thank-102', 'cross-page thanks source link targets the wrong reply');
+          check(posts('102') === 0, 'cross-page ancestor sent a direct thanks request');
+          record('跨页祖先仅提供准确的原页感谢入口，不复制其他回复的操作身份', true);
+
+          state.confirmation = false;
+          const cancelPosts = posts('205');
+          action('205').click();
+          await delay(60);
+          check(posts('205') === cancelPosts && actionable('205') && !nativeThanked('205'), 'cancelling confirmation changed state or sent a request');
+          check(state.confirmations.at(-1)?.includes('10'), 'thanks confirmation omitted the cost');
+          state.confirmation = true;
+          record('取消感谢确认不会发请求或改变状态', true);
+
+          const moneyBefore = state.moneyRefreshes;
+          action('201').click();
+          await waitForThanked('201');
+          await waitFor(() => count('201') === 4, 'confirmed thanks count was not refreshed from the source page');
+          check(posts('201') === 1 && state.moneyRefreshes > moneyBefore, 'successful thanks request or balance refresh was duplicated/missing');
+          check(window.once === state.serverOnce, 'live once was not updated from the successful response');
+          selectView('original');
+          check(nativeThanked('201'), 'original view lost the confirmed thanks state');
+          selectView('threaded');
+          check(!actionable('201') && count('201') === 4, 'view switching reset thanks state');
+          record('成功后同步原生区、感谢数、余额和实时 once，切换视图不回退', true);
+
+          state.modes.set('202', { type: 'success', delay: 120 });
+          const repeatAction = action('202');
+          repeatAction.click();
+          repeatAction.click();
+          repeatAction.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+          await waitForThanked('202');
+          check(posts('202') === 1, 'a repeated click/keyboard activation sent duplicate thanks requests');
+          record('同一回复连击和键盘激活只产生一次感谢请求', true);
+
+          state.modes.set('206', { type: 'failure', delay: 40 });
+          action('206').click();
+          await waitFor(() => posts('206') === 1 && actionable('206') && /余额不足/.test(status('206')), 'explicit business failure did not return to a truthful retryable state');
+          check(!nativeThanked('206') && count('206') === 1, 'business failure falsely changed the thanks state or count');
+          check(window.once === state.serverOnce, 'business failure did not update once');
+          record('明确失败展示原因、保留计数且不伪装成功', true);
+
+          const savedOnce = window.once;
+          window.once = undefined;
+          const unavailablePosts = posts('205');
+          action('205')?.click();
+          await delay(60);
+          check(posts('205') === unavailablePosts && !nativeThanked('205'), 'missing live once still sent a thanks request');
+          window.once = savedOnce;
+          record('缺少实时 once 时不构造或发送感谢请求', true);
+
+          selectView('original');
+          document.querySelector('#thank_area_209 a').click();
+          await waitForThanked('209');
+          selectView('threaded');
+          check(posts('209') === 1 && !actionable('209'), 'native thanks did not synchronize to the existing threaded projection');
+          record('原始顺序中的原生感谢会同步到楼中楼', true);
+
+          state.modes.set('208', { type: 'success', delay: 350 });
+          action('208').click();
+          await waitFor(() => posts('208') === 1, 'navigation case did not begin a write');
+          await goToPage(1, 30);
+          await delay(600);
+          check(location.search === '?p=1' && document.querySelector('.ps_container .page_current')?.textContent.trim() === '1', 'late thanks completion changed the active page');
+          check(card('101') && card('102') && !card('208') && !document.querySelector('#r_208'), 'late thanks completion restored an old-page reply');
+          check(count('101') === 1 && posts('208') === 1, 'late thanks completion changed another reply or repeated the write');
+          record('感谢过程中翻页，迟到结果不污染新页或重发请求', true);
+          window.once = state.serverOnce;
+          await goToPage(2, 30);
+          await waitFor(() => card('102'), 'return navigation lost the required cross-page ancestor');
+          selectView('threaded');
+
+          state.modes.set('207', { type: 'unknown-after', delay: 40 });
+          action('207').click();
+          await waitFor(() => checkAction('207'), 'unknown network outcome did not expose a verification action');
+          check(!actionable('207'), 'unknown network outcome allowed an immediate duplicate write');
+          const unknownPosts = posts('207');
+          checkAction('207').click();
+          await waitForThanked('207');
+          await waitFor(() => count('207') === 3, 'source verification did not restore the confirmed count');
+          check(posts('207') === unknownPosts, 'checking an uncertain outcome repeated the write request');
+          record('响应丢失后通过只读核对收敛到已感谢，不重复发送', true);
+
+          window.once = state.serverOnce;
+          state.modes.set('211', { type: 'unknown-before', delay: 40 });
+          action('211').click();
+          await waitFor(() => checkAction('211'), 'unconfirmed outcome did not expose a verification action');
+          const noAcceptancePosts = posts('211');
+          const readsBeforeCheck = state.calls.filter((call) => call.method === 'GET').length;
+          checkAction('211').click();
+          await waitFor(() => state.calls.filter((call) => call.method === 'GET').length > readsBeforeCheck, 'unknown-outcome verification did not read the source page');
+          await waitFor(() => checkAction('211') && !checkAction('211').disabled, 'verification of an unconfirmed outcome did not settle');
+          check(!actionable('211') && !nativeThanked('211') && posts('211') === noAcceptancePosts, 'unconfirmed readback incorrectly enabled or repeated a thanks write');
+          check(card('211').querySelector('.wt-v2ex-thank-source') && !card('211').querySelector('.wt-v2ex-thank-source').hidden, 'unconfirmed readback omitted the source-page fallback');
+          record('核对仍未确认成功时保持结果未知并提供原页入口', true);
+
+          await goToPage(1, 30, 'wt-v2ex-thank-102');
+          check(document.querySelector('.wt-v2ex-threaded-view').hidden, 'source-page fragment did not immediately reveal the native replies');
+          check(!document.querySelector('#r_102').classList.contains('wt-v2ex-native-hidden'), 'source-page target stayed hidden');
+          check(document.activeElement?.closest('#thank_area_102'), 'source-page fragment did not focus its native thanks action');
+          await waitFor(() => document.querySelector('.wt-v2ex-thread-status')?.textContent.includes('当前线程投影'), 'source-page background loading did not finish');
+          check(document.querySelector('.wt-v2ex-threaded-view').hidden, 'background loading overrode the requested source-page view');
+          selectView('threaded');
+          check(!document.querySelector('.wt-v2ex-threaded-view').hidden, 'an explicit view selection could not leave the source-page view');
+          record('原页感谢入口立即定位原生控件，后台加载不覆盖用户视图', true);
+
+          await goToPage(2, 30);
+          await waitFor(() => document.querySelector('.wt-v2ex-thread-status')?.textContent.includes('当前线程投影'), 'page-two setup for the large-topic case did not finish');
+          state.maxPage = 11;
+          const readsBeforeLargeTopic = state.calls.filter((call) => call.method === 'GET').length;
+          await goToPage(1, 30, 'wt-v2ex-thank-102');
+          await delay(80);
+          check(document.querySelector('.wt-v2ex-threaded-view').hidden, 'large-topic source landing left both projections visible');
+          check(!document.querySelector('#r_102').hasAttribute('aria-hidden'), 'large-topic source target remained inaccessible');
+          check(document.activeElement?.closest('#thank_area_102'), 'large-topic source landing did not focus the native thanks control');
+          check(state.calls.filter((call) => call.method === 'GET').length === readsBeforeLargeTopic, 'a large topic fetched pages before explicit activation');
+          selectView('threaded');
+          check(!document.querySelector('.wt-v2ex-threaded-view').hidden, 'large-topic source landing trapped explicit threaded selection');
+          check([...document.querySelectorAll('#Main > .cell[id^="r_"]')].every((node) => node.classList.contains('wt-v2ex-native-hidden')), 'large-topic explicit threaded selection duplicated visible native replies');
+          record('超过 10 页的原页感谢落地无需加载即可定位，且保持单一可见视图', true);
+
+          check(state.calls.filter((call) => call.method === 'POST').every((call) => call.credentials === 'same-origin'), 'some write requests omitted same-origin credentials');
+          document.body.dataset.fixtureState = 'passed';
+          record('全部模拟回归通过', true, '这些检查不替代真实 V2EX 登录态与 userscript 管理器验证');
         } catch (error) {
+          document.body.dataset.fixtureState = 'failed';
           record('浏览器回归检查', false, error.message);
           console.error(error);
         } finally {
-          document.querySelector('#fixture-run').disabled = false;
+          runButton.textContent = '刷新此页面后重新运行';
         }
       }
 
-      document.querySelector('#fixture-run').addEventListener('click', () => void run());
+      runButton.addEventListener('click', () => void run());
     })();
   </script>
 </body>
