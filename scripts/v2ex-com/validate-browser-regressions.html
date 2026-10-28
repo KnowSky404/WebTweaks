@@ -10,9 +10,13 @@
     #fixture-controls { position: sticky; top: 0; z-index: 10; padding: 12px; background: white; border: 1px solid #ddd; }
     #fixture-results li[data-state="pass"] { color: #176b3a; }
     #fixture-results li[data-state="fail"] { color: #9b2c2c; }
-    .cell { padding: 12px; border-bottom: 1px solid #ddd; }
+    .cell { padding: 10px; font-size: 14px; line-height: 150%; text-align: left; border-bottom: 1px solid #ddd; }
     /* Native V2EX declarations; the surrounding fixture layout remains local. */
     .fr { float: right; text-align: right; }
+    .cell[id^="r_"] > table { table-layout: fixed; }
+    .sep3 { height: 3px; }
+    .sep5 { height: 5px; }
+    .ago { font-size: 11px; color: var(--color-fade); cursor: pointer; }
     .page_current { font-weight: 700; }
     .small { font-size: 12px; }
     .fade { color: var(--color-fade); }
@@ -33,6 +37,7 @@
     <ol id="fixture-results" aria-live="polite"></ol>
   </section>
   <main id="Main"></main>
+  <label>模拟回复编辑器 <textarea id="reply_content"></textarea></label>
 
   <script>
     (() => {
@@ -45,7 +50,7 @@
         // V2EX's native prefix places @ outside the member link.
         { id: '202', floor: 102, page: 2, author: 'E', content: '@<a href="/member/alice">Alice</a> #2 cross-page child', count: 0 },
         { id: '203', floor: 103, page: 2, author: 'F', content: 'already thanked', count: 4, thanked: true },
-        { id: '204', floor: 104, page: 2, author: 'Self', content: 'own reply without a native thanks action', count: null, canThank: false },
+        { id: '204', floor: 104, page: 2, author: 'Self', content: 'own reply without a native thanks action <span class="small fade">content metadata</span>', count: null, canThank: false },
         { id: '205', floor: 105, page: 2, author: 'G', content: 'confirmation cancellation', count: 0 },
         { id: '206', floor: 106, page: 2, author: 'H', content: 'business failure', count: 1 },
         { id: '207', floor: 107, page: 2, author: 'I', content: 'uncertain network outcome', count: 2 },
@@ -74,7 +79,9 @@
         const area = reply.canThank === false ? '' : `<span id="thank_area_${reply.id}" class="thank_area${reply.thanked ? ' thanked' : ''}">${reply.thanked ? '感谢已发送' : `<a class="thank" href="#" onclick="if (confirm('发送感谢？')) { thankReply(${reply.id}); } return false;">感谢</a>`}</span>`;
         const arrow = `<a class="reply" href="#reply"><img src="${replyAsset}" alt="Reply" width="20" align="absmiddle" border="0"></a>`;
         const count = reply.count === null || reply.count === 0 ? '' : `<span class="small fade"><img src="${heartAsset}" width="14" align="absmiddle" alt="❤️"> ${reply.count}</span>`;
-        return `<div id="r_${reply.id}" class="cell"><span class="fr">${area} ${arrow} <span class="no">${reply.floor}</span></span><strong><a class="dark" href="/member/${escapeHtml(reply.author.toLowerCase())}">${escapeHtml(reply.author)}</a></strong> <span class="ago" title="fixture page ${reply.page}">fixture</span> ${count}<div class="sep5"></div><div class="reply_content">${reply.content}</div></div>`;
+        const actions = `${area} &nbsp; ${arrow} &nbsp; &nbsp; <span class="no">${reply.floor}</span>`;
+        const controls = reply.id === '205' ? `<span class="fixture-native-wrapper">${actions}</span>` : actions;
+        return `<div id="r_${reply.id}" class="cell"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tbody><tr><td width="48" valign="top" align="center"></td><td width="10" valign="top"></td><td width="auto" valign="top" align="left"><div class="fr">${controls}</div><div class="sep3"></div><strong><a class="dark" href="/member/${escapeHtml(reply.author.toLowerCase())}">${escapeHtml(reply.author)}</a></strong> <span class="ago" title="fixture page ${reply.page}">fixture</span> &nbsp; &nbsp; ${count}<div class="sep5"></div><div class="reply_content">${reply.content}</div></td></tr></tbody></table></div>`;
       };
       // Matches the inspected native topic HTML, including the first-page ?p=1 link.
       const renderPage = (page) => `<div class="cell ps_container">${[1, 2].map((number) => number === page ? `<span class="page_current">${number}</span>` : `<a class="page_normal" href="?p=${number}">${number}</a>`).join(' ')}<input class="page_input" max="${state.maxPage}"></div>${[...state.replies.values()].filter((reply) => reply.page === page).map(replyHtml).join('')}`;
@@ -214,6 +221,28 @@
       const waitForThanked = async (id) => {
         await waitFor(() => nativeThanked(id) && !actionable(id) && status(id).trim() === '感谢已发送', `reply ${id} did not synchronize its confirmed thanked state`);
       };
+      const presentation = (root, threaded) => {
+        const group = root.querySelector('.fr');
+        const area = group.querySelector('.thank_area');
+        const action = area.querySelector('a.thank');
+        const arrow = group.querySelector('img[alt="Reply"]');
+        const floor = group.querySelector('.no');
+        const count = root.querySelector(threaded ? '.wt-v2ex-thank-count' : '.small.fade');
+        const selectors = [group, area, action, arrow, floor, count, count.querySelector('img')];
+        const properties = ['display', 'float', 'textAlign', 'fontFamily', 'fontSize', 'fontWeight', 'lineHeight', 'color', 'backgroundColor', 'borderRadius', 'padding', 'verticalAlign'];
+        const styles = selectors.map((node) => {
+          const style = getComputedStyle(node);
+          return Object.fromEntries(properties.map((property) => [property, style[property]]));
+        });
+        const rect = (node) => node.getBoundingClientRect();
+        return {
+          styles,
+          tableLayout: getComputedStyle(root.querySelector('table')).tableLayout,
+          sizes: [area, action, arrow, floor, count].map((node) => [rect(node).width, rect(node).height]),
+          gaps: [rect(arrow).left - rect(area).right, rect(floor).left - rect(arrow).right, rect(count).left - rect(root.querySelector('.ago')).right],
+          assets: [arrow, count.querySelector('img')].map((node) => ['src', 'width', 'height', 'align', 'border', 'style'].map((attribute) => node.getAttribute(attribute)))
+        };
+      };
 
       async function run() {
         results.replaceChildren();
@@ -251,6 +280,29 @@
             check(document.querySelectorAll('.wt-v2ex-threaded-view [data-wt-v2ex-reply-id]').length === threadedIds.length, 'view switching duplicated or removed threaded replies');
           }
           record('楼中楼与原始顺序反复切换保持节点和可访问状态', true);
+
+          selectView('original');
+          const nativePresentation = presentation(document.querySelector('#r_201'), false);
+          selectView('threaded');
+          const threadedPresentation = presentation(card('201'), true);
+          check(nativePresentation.tableLayout === 'fixed' && threadedPresentation.tableLayout === 'fixed', 'threaded clone lost the native ID-dependent table layout');
+          check(JSON.stringify(nativePresentation.styles) === JSON.stringify(threadedPresentation.styles), 'thanks/count/reply/floor computed styles differ from the native view');
+          check(JSON.stringify(nativePresentation.assets) === JSON.stringify(threadedPresentation.assets), 'native control image attributes were changed');
+          for (const key of ['sizes', 'gaps']) {
+            const expected = nativePresentation[key].flat();
+            const actual = threadedPresentation[key].flat();
+            check(expected.every((value, index) => Math.abs(value - actual[index]) < 0.1), `native control ${key} changed: ${JSON.stringify(expected)} -> ${JSON.stringify(actual)}`);
+          }
+          check(card('205').querySelector('.fixture-native-wrapper .wt-v2ex-thank-area'), 'native action wrapper/order was discarded');
+          check(card('204').querySelector('.reply_content .small.fade')?.textContent === 'content metadata', 'header cleanup removed similarly styled reply content');
+          check(card('202').closest('.wt-v2ex-thread-children')?.parentElement === card('102'), 'native presentation restoration flattened the thread');
+          record('感谢、计数、回复箭头和楼层的原生样式、尺寸及间距一致，楼中楼保留', true);
+
+          const editor = document.querySelector('#reply_content');
+          card('201').querySelector('.wt-v2ex-native-reply-action').click();
+          check(editor.value === '@D #101 ' && document.activeElement === editor, 'preserved reply arrow did not insert and focus the expected reply prefix');
+          editor.value = '';
+          record('保留的原生回复箭头仍插入准确的用户及楼层前缀', true);
 
           check(count('201') === 3 && count('203') === 4, 'existing thanks counts are missing or wrong');
           check(actionable('201'), 'eligible active-page reply has no usable thanks action');
