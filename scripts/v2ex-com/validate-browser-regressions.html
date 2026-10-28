@@ -5,22 +5,30 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>V2EX Conversation Enhancer browser regressions</title>
   <style>
+    :root { --color-fade: #ccc; }
     body { max-width: 880px; margin: 24px auto; padding: 0 16px; font: 15px/1.5 system-ui, sans-serif; }
     #fixture-controls { position: sticky; top: 0; z-index: 10; padding: 12px; background: white; border: 1px solid #ddd; }
     #fixture-results li[data-state="pass"] { color: #176b3a; }
     #fixture-results li[data-state="fail"] { color: #9b2c2c; }
     .cell { padding: 12px; border-bottom: 1px solid #ddd; }
-    .fr { float: right; }
+    /* Native V2EX declarations; the surrounding fixture layout remains local. */
+    .fr { float: right; text-align: right; }
     .page_current { font-weight: 700; }
-    .thank_area { display: inline; margin-right: 8px; }
-    .small.fade { color: #777; font-size: 12px; }
-    .small.fade img { width: 12px; height: 12px; }
+    .small { font-size: 12px; }
+    .fade { color: var(--color-fade); }
+    a.thank { display: inline-block; line-height: 12px; border-radius: 5px; }
+    a.thank:hover { background: #f5f5f5; text-decoration: none; }
+    .thank_area { display: inline-block; line-height: 100%; vertical-align: middle; }
+    .thank_area > a { visibility: hidden; }
+    .thank_area:hover > a { visibility: visible; }
+    .thanked { display: inline-block; background: #f9f9f9; color: #e0e0e0; border-radius: 3px; }
+    .no { font-size: 9px; line-height: 9px; font-weight: 500; border-radius: 10px; display: inline-block; background: #f0f0f0; color: #ccc; padding: 2px 5px; cursor: pointer; }
   </style>
 </head>
 <body>
   <section id="fixture-controls">
     <h1>V2EX 浏览器回归夹具</h1>
-    <p>覆盖分页隔离、跨页祖先、视图切换及感谢交互。主题、用户、令牌和请求均为本地模拟数据，不会发送真实感谢。</p>
+    <p>覆盖分页隔离、跨页祖先、视图切换及感谢交互。采用已核实的原生样式与心形图片结构；登录态感谢和回复控件仍为合成模板。主题、用户、令牌和请求均为本地模拟数据，不会发送真实感谢。</p>
     <button id="fixture-run" type="button">运行回归检查</button>
     <ol id="fixture-results" aria-live="polite"></ol>
   </section>
@@ -28,7 +36,8 @@
 
   <script>
     (() => {
-      const pixel = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+      const heartAsset = 'https://www.v2ex.com/static/img/heart_20250818.png?v=c3415183a0b3e9ab1576251be69d7d6d';
+      const replyAsset = 'https://www.v2ex.com/static/img/reply.png?fixture';
       const definitions = [
         { id: '101', floor: 1, page: 1, author: 'A', content: 'unrelated page-one reply', count: 1 },
         { id: '102', floor: 2, page: 1, author: 'Alice', content: 'cross-page parent', count: 2 },
@@ -61,9 +70,11 @@
       const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
       const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
       const replyHtml = (reply) => {
-        const area = reply.canThank === false ? '' : `<span id="thank_area_${reply.id}" class="thank_area${reply.thanked ? ' thanked' : ''}">${reply.thanked ? '感谢已发送' : `<a href="#" onclick="if (confirm('发送感谢？')) { thankReply(${reply.id}); } return false;">感谢</a>`}</span>`;
-        const count = reply.count === null || reply.count === 0 ? '' : `<span class="small fade"><img src="${pixel}" alt="❤️"> ${reply.count}</span>`;
-        return `<div id="r_${reply.id}" class="cell"><span class="fr">${area}<span class="no">${reply.floor}</span></span><strong><a class="dark" href="/member/${escapeHtml(reply.author.toLowerCase())}">${escapeHtml(reply.author)}</a></strong> <span class="ago" title="fixture page ${reply.page}">fixture</span> ${count}<div class="sep5"></div><div class="reply_content">${reply.content}</div></div>`;
+        // Public HTML confirms the count markup. Authenticated actions are synthetic.
+        const area = reply.canThank === false ? '' : `<span id="thank_area_${reply.id}" class="thank_area${reply.thanked ? ' thanked' : ''}">${reply.thanked ? '感谢已发送' : `<a class="thank" href="#" onclick="if (confirm('发送感谢？')) { thankReply(${reply.id}); } return false;">感谢</a>`}</span>`;
+        const arrow = `<a class="reply" href="#reply"><img src="${replyAsset}" alt="Reply" width="20" align="absmiddle" border="0"></a>`;
+        const count = reply.count === null || reply.count === 0 ? '' : `<span class="small fade"><img src="${heartAsset}" width="14" align="absmiddle" alt="❤️"> ${reply.count}</span>`;
+        return `<div id="r_${reply.id}" class="cell"><span class="fr">${area} ${arrow} <span class="no">${reply.floor}</span></span><strong><a class="dark" href="/member/${escapeHtml(reply.author.toLowerCase())}">${escapeHtml(reply.author)}</a></strong> <span class="ago" title="fixture page ${reply.page}">fixture</span> ${count}<div class="sep5"></div><div class="reply_content">${reply.content}</div></div>`;
       };
       // Matches the inspected native topic HTML, including the first-page ?p=1 link.
       const renderPage = (page) => `<div class="cell ps_container">${[1, 2].map((number) => number === page ? `<span class="page_current">${number}</span>` : `<a class="page_normal" href="?p=${number}">${number}</a>`).join(' ')}<input class="page_input" max="${state.maxPage}"></div>${[...state.replies.values()].filter((reply) => reply.page === page).map(replyHtml).join('')}`;
@@ -178,7 +189,8 @@
       const card = (id) => document.querySelector(`.wt-v2ex-threaded-view [data-wt-v2ex-reply-id="${id}"]`);
       const action = (id) => card(id)?.querySelector(`.wt-v2ex-thank-action[data-reply-id="${id}"]`);
       const status = (id) => card(id)?.querySelector('.wt-v2ex-thank-status')?.textContent || '';
-      const actionable = (id) => Boolean(action(id) && !action(id).hidden && !action(id).disabled && action(id).getAttribute('aria-disabled') !== 'true');
+      const disabled = (node) => !node || node.disabled || node.getAttribute('aria-disabled') === 'true';
+      const actionable = (id) => Boolean(action(id) && !action(id).hidden && !disabled(action(id)));
       const checkAction = (id) => {
         const node = card(id)?.querySelector('.wt-v2ex-thank-check');
         return node && !node.hidden ? node : null;
@@ -200,7 +212,7 @@
         button.click();
       };
       const waitForThanked = async (id) => {
-        await waitFor(() => nativeThanked(id) && !actionable(id), `reply ${id} did not synchronize its confirmed thanked state`);
+        await waitFor(() => nativeThanked(id) && !actionable(id) && status(id).trim() === '感谢已发送', `reply ${id} did not synchronize its confirmed thanked state`);
       };
 
       async function run() {
@@ -243,6 +255,7 @@
           check(count('201') === 3 && count('203') === 4, 'existing thanks counts are missing or wrong');
           check(actionable('201'), 'eligible active-page reply has no usable thanks action');
           check(!actionable('203'), 'already-thanked reply remained actionable');
+          check(status('203').trim() === '感谢已发送', 'already-thanked reply lost the native success text');
           check(!actionable('204') && !actionable('210'), 'a reply without its own native capability inherited a thanks action');
           check(!card('201').querySelector('[onclick], [id^="thank_area_"]'), 'threaded clone retained native handlers or duplicate IDs');
           record('感谢数、已感谢状态与每条回复自身的操作资格正确', true);
@@ -340,7 +353,7 @@
           const readsBeforeCheck = state.calls.filter((call) => call.method === 'GET').length;
           checkAction('211').click();
           await waitFor(() => state.calls.filter((call) => call.method === 'GET').length > readsBeforeCheck, 'unknown-outcome verification did not read the source page');
-          await waitFor(() => checkAction('211') && !checkAction('211').disabled, 'verification of an unconfirmed outcome did not settle');
+          await waitFor(() => checkAction('211') && !disabled(checkAction('211')), 'verification of an unconfirmed outcome did not settle');
           check(!actionable('211') && !nativeThanked('211') && posts('211') === noAcceptancePosts, 'unconfirmed readback incorrectly enabled or repeated a thanks write');
           check(card('211').querySelector('.wt-v2ex-thank-source') && !card('211').querySelector('.wt-v2ex-thank-source').hidden, 'unconfirmed readback omitted the source-page fallback');
           record('核对仍未确认成功时保持结果未知并提供原页入口', true);

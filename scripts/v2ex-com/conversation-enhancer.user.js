@@ -2,7 +2,7 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.5.0
+// @version      1.5.1
 // @description  Threaded cross-page replies with thanks, client-side image previews, and navigation improvements for V2EX.
 // @description:zh-CN 为 V2EX 提供跨页楼中楼、回复感谢、浏览器侧图片预览和返回顶部功能。
 // @author       KnowSky404
@@ -480,8 +480,8 @@
     const action = nativeReplyAction(group);
     const floor = group.querySelector('.no');
     if (!action && !floor) return null;
-    const controls = document.createElement('div');
-    controls.className = 'fr wt-v2ex-native-reply-controls';
+    const controls = sanitizeNativeControlNode(group.cloneNode(false), base);
+    controls.classList.add('wt-v2ex-native-reply-controls');
     if (action) {
       const actionClone = sanitizeNativeControlNode(action, base, true);
       const hasReplyImage = actionClone.matches('img') || actionClone.querySelector('img');
@@ -495,31 +495,28 @@
           if (interactive.matches('a') && !interactive.getAttribute('href')) interactive.setAttribute('href', '#');
           if (interactive.matches('[role="button"]') && !interactive.hasAttribute('tabindex')) interactive.setAttribute('tabindex', '0');
         } else {
-          const button = document.createElement('button');
-          button.type = 'button';
-          button.className = 'wt-v2ex-native-reply-action';
-          button.dataset.wtV2exNativeReplyAction = 'true';
-          button.append(actionClone);
-          controls.append(button);
+          const link = document.createElement('a');
+          link.href = '#';
+          link.setAttribute('role', 'button');
+          link.className = 'wt-v2ex-native-reply-action';
+          link.dataset.wtV2exNativeReplyAction = 'true';
+          link.append(actionClone);
+          controls.append(link);
         }
         if (interactive) controls.append(actionClone);
       }
     }
-    if (floor) controls.append(sanitizeNativeControlNode(floor, base));
+    if (floor) controls.append(' \u00a0 \u00a0 ', sanitizeNativeControlNode(floor, base));
     return controls.childElementCount ? controls : null;
   }
 
-  // Capability comes from this reply's own header, never from a reusable template.
-  function readReplyThanks(element, replyId) {
+  function nativeReplyThanksNodes(element, replyId) {
     const inHeader = (node) => !node.closest('.reply_content')
       && node.closest('.cell[id^="r_"]') === element;
     const image = allMatches(element, SELECTORS.replyThanks).find(inHeader);
-    const rawCount = image?.parentElement?.textContent.trim() || '';
-    const count = /^(?:\d+|\d{1,3}(?:,\d{3})+)$/.test(rawCount) ? Number(rawCount.replaceAll(',', '')) : NaN;
     const area = /^[1-9]\d*$/.test(replyId)
       ? [...element.querySelectorAll('[id]')].find((node) => node.id === 'thank_area_' + replyId && inHeader(node))
       : null;
-    const thanked = Boolean(area?.classList.contains('thanked'));
     const action = area && [...area.querySelectorAll('a, button, [role="button"]')].find((node) => {
       if (!inHeader(node)) return false;
       return ['onclick', 'href'].some((name) => {
@@ -527,6 +524,15 @@
         return match?.[2] === replyId;
       });
     });
+    return { image, area, action };
+  }
+
+  // Capability comes from this reply's own header, never from a reusable template.
+  function readReplyThanks(element, replyId) {
+    const { image, area, action } = nativeReplyThanksNodes(element, replyId);
+    const rawCount = image?.parentElement?.textContent.trim() || '';
+    const count = /^(?:\d+|\d{1,3}(?:,\d{3})+)$/.test(rawCount) ? Number(rawCount.replaceAll(',', '')) : NaN;
+    const thanked = Boolean(area?.classList.contains('thanked'));
     return {
       count: Number.isSafeInteger(count) && count >= 0 ? count : null,
       canThank: Boolean(action) && !thanked,
@@ -537,6 +543,15 @@
     };
   }
 
+  function extractNativeThanksPresentation(element, replyId, base = location.href) {
+    const { image, area, action } = nativeReplyThanksNodes(element, replyId);
+    return {
+      count: image ? sanitizeNativeControlNode(image.parentElement, base, true) : null,
+      area: area ? sanitizeNativeControlNode(area.cloneNode(false), base, true) : null,
+      action: action ? sanitizeNativeControlNode(action, base, true) : null
+    };
+  }
+
   function thanksKey(topic, reply) {
     return location.origin + '/t/' + topic.context.id + '/reply/' + reply.id;
   }
@@ -544,7 +559,10 @@
   function rememberThanks(topic, reply, state) {
     const previous = runtime.thanksResults.get(thanksKey(topic, reply));
     if (previous?.state === 'thanked' && state !== 'thanked') return;
-    runtime.thanksResults.set(thanksKey(topic, reply), { state, count: reply.thanks.count });
+    runtime.thanksResults.set(thanksKey(topic, reply), {
+      state, count: reply.thanks.count,
+      countTemplate: reply.nativeThanksPresentation?.count || previous?.countTemplate || null
+    });
   }
 
   function reconcileThanks(topic, reply) {
@@ -552,6 +570,9 @@
     if (!state) return;
     const result = runtime.thanksResults.get(thanksKey(topic, reply));
     if (!result) return;
+    if (reply.nativeThanksPresentation && !reply.nativeThanksPresentation.count && result.countTemplate) {
+      reply.nativeThanksPresentation.count = result.countTemplate;
+    }
     if (result.count !== null) state.count = Math.max(state.count ?? 0, result.count);
     if (result.state === 'thanked') {
       state.thanked = true;
@@ -589,49 +610,88 @@
   }
 
   function updateThanksControl(topic, reply, control) {
-    if (!['.wt-v2ex-thank-count', '.wt-v2ex-thank-action', '.wt-v2ex-thank-check', '.wt-v2ex-thank-source', '.wt-v2ex-thank-status']
+    if (!['.wt-v2ex-thank-count', '.wt-v2ex-thank-count-value', '.wt-v2ex-thank-area', '.wt-v2ex-thank-action', '.wt-v2ex-thank-check', '.wt-v2ex-thank-source', '.wt-v2ex-thank-status']
       .every((selector) => control.querySelector(selector))) return;
     reconcileThanks(topic, reply);
     const state = reply.thanks;
     const uncertain = state.phase === 'unknown' || state.phase === 'checking';
     const direct = reply.page === topic.currentPage && state.canThank && Boolean(thanksSession());
     const count = control.querySelector('.wt-v2ex-thank-count');
+    const image = reply.nativeThanksPresentation?.count?.querySelector('img');
+    if (!count.querySelector('img') && image) count.prepend(image.cloneNode(true), ' ');
     count.hidden = state.count === null;
-    count.textContent = state.count === null ? '' : '❤️ ' + state.count;
+    count.querySelector('.wt-v2ex-thank-count-value').textContent = state.count === null ? '' : String(state.count);
     count.setAttribute('aria-label', '收到 ' + (state.count ?? '未知数量的') + ' 次感谢');
     const action = control.querySelector('.wt-v2ex-thank-action');
     action.hidden = !direct || state.thanked || uncertain;
     action.disabled = Boolean(runtime.thanksRequest) || state.phase === 'pending';
+    action.setAttribute('aria-disabled', String(action.disabled));
     action.setAttribute('aria-label', '感谢 ' + (reply.author || '该用户') + ' 的第 ' + (reply.floor || '') + ' 楼回复，消耗 10 铜币');
     const check = control.querySelector('.wt-v2ex-thank-check');
     check.hidden = !uncertain || state.thanked;
     check.disabled = state.phase === 'checking' || Boolean(runtime.thanksRequest);
+    check.setAttribute('aria-disabled', String(check.disabled));
     const source = control.querySelector('.wt-v2ex-thank-source');
     source.hidden = state.thanked || state.phase === 'pending' || (!uncertain && (!state.canThank || direct));
     source.href = thanksSourceUrl(topic, reply);
     source.textContent = uncertain ? '到原页核对' : '到原页感谢';
     const status = control.querySelector('.wt-v2ex-thank-status');
-    status.textContent = state.thanked ? '已感谢'
+    status.textContent = state.thanked ? '感谢已发送'
       : state.phase === 'pending' ? '发送中…'
       : state.phase === 'checking' ? '正在核对…'
       : state.phase === 'unknown' ? state.message || '结果未确认，请核对状态'
       : state.message;
-    control.hidden = state.count === null && action.hidden && check.hidden && source.hidden && !status.textContent;
+    status.hidden = !status.textContent;
+    const area = control.querySelector('.wt-v2ex-thank-area');
+    area.classList.toggle('thanked', state.thanked);
+    area.hidden = action.hidden && check.hidden && source.hidden && status.hidden;
+    area.tabIndex = area.hidden || state.thanked ? -1 : 0;
   }
 
-  function createThanksControl(topic, reply) {
+  function createThanksControl(topic, reply, header, controls) {
     if (!reply.thanks) return null;
     reconcileThanks(topic, reply);
     if (reply.thanks.count === null && !reply.thanks.canThank && !reply.thanks.thanked
       && reply.thanks.phase === 'idle' && !reply.thanks.message) return null;
-    const control = document.createElement('span');
-    control.className = 'wt-v2ex-thanks';
-    control.dataset.replyId = reply.id;
-    control.innerHTML = '<span class="wt-v2ex-thank-count"></span> <button type="button" class="wt-v2ex-thank-action" title="感谢回复将消耗 10 铜币">感谢</button> <button type="button" class="wt-v2ex-thank-check">核对状态</button> <a class="wt-v2ex-thank-source"></a> <span class="wt-v2ex-thank-status" role="status" aria-live="polite"></span>';
-    control.querySelectorAll('button, a').forEach((node) => { node.dataset.replyId = reply.id; });
-    topic.thanksControls.set(control, reply.id);
-    updateThanksControl(topic, reply, control);
-    return control;
+    const presentation = reply.nativeThanksPresentation;
+    const count = presentation?.count?.cloneNode(true) || document.createElement('span');
+    count.classList.add('small', 'fade', 'wt-v2ex-thank-count');
+    const image = count.querySelector('img');
+    const value = document.createElement('span');
+    value.className = 'wt-v2ex-thank-count-value';
+    count.replaceChildren(...(image ? [image, ' '] : []), value);
+    const time = header.querySelector('.ago');
+    if (time) time.after(' \u00a0 ', count);
+    else header.append(' \u00a0 ', count);
+
+    const area = presentation?.area?.cloneNode(true) || document.createElement('span');
+    area.classList.add('thank_area', 'wt-v2ex-thank-area');
+    const action = presentation?.action?.cloneNode(true) || document.createElement('a');
+    action.classList.add('wt-v2ex-thank-action');
+    if (!presentation?.action) { action.classList.add('thank'); action.textContent = '感谢'; }
+    if (action.matches('a')) action.setAttribute('href', '#');
+    if (action.matches('button')) action.setAttribute('type', 'button');
+    action.setAttribute('role', 'button');
+    const check = document.createElement('a');
+    check.className = 'thank wt-v2ex-thank-check';
+    check.href = '#';
+    check.setAttribute('role', 'button');
+    check.textContent = '核对状态';
+    const source = document.createElement('a');
+    source.className = 'thank wt-v2ex-thank-source';
+    const status = document.createElement('span');
+    status.className = 'wt-v2ex-thank-status';
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    [action, check, source].forEach((node) => { node.dataset.replyId = reply.id; });
+    area.replaceChildren(action, ' ', check, ' ', source, ' ', status);
+    controls.prepend(area, ' \u00a0 ');
+    header.classList.add('wt-v2ex-thanks');
+    topic.thanksControls.set(header, reply.id);
+    // Both native positions stay under the same trusted, per-reply header.
+    header.prepend(controls);
+    updateThanksControl(topic, reply, header);
+    return header;
   }
 
   function updateThanksViews(topic) {
@@ -675,6 +735,9 @@
       if (!cell) throw new Error('原页未找到该回复');
       const snapshot = readReplyThanks(cell, reply.id);
       if (snapshot.count !== null) state.count = Math.max(state.count ?? 0, snapshot.count);
+      if (snapshot.count !== null && reply.nativeThanksPresentation && !reply.nativeThanksPresentation.count) {
+        reply.nativeThanksPresentation.count = extractNativeThanksPresentation(cell, reply.id, url).count;
+      }
       if (snapshot.thanked) {
         state.thanked = true;
         state.canThank = false;
@@ -822,23 +885,37 @@
     }
   }
 
+  function focusNativeThanks(area) {
+    if (!area) return;
+    area.classList.add('wt-v2ex-thanks-focus');
+    if (!area.hasAttribute('tabindex')) area.tabIndex = -1;
+    // Native links are hidden until the area is hovered; focus reveals them too.
+    area.focus({ preventScroll: true });
+    area.querySelector('a, button')?.focus({ preventScroll: true });
+  }
+
   function showNativeThanks(topic, reply) {
     topic.keepThanksSourceView = true;
     applyTopicView(topic, 'original');
     const cell = nativeThanksReply(topic, reply);
     cell?.scrollIntoView({ block: 'center', behavior: 'auto' });
     const area = cell && [...cell.querySelectorAll('[id]')].find((node) => node.id === 'thank_area_' + reply.id && !node.closest('.reply_content'));
-    area?.querySelector('a, button')?.focus({ preventScroll: true });
+    focusNativeThanks(area);
   }
 
   function activateThanks(topic, event) {
     if (!(event.target instanceof Element) || !isCurrentTopic(topic)) return;
     const action = event.target.closest('.wt-v2ex-thank-action, .wt-v2ex-thank-check, .wt-v2ex-thank-source');
     if (!action || !topic.threadedView.contains(action)) return;
-    const control = action.parentElement;
+    const control = action.closest('.wt-v2ex-thanks');
     if (control?.closest('.reply_content') || topic.thanksControls?.get(control) !== action.dataset.replyId) return;
     const reply = topic.allReplies.find((item) => item.id === action.dataset.replyId);
     if (!reply?.thanks) return;
+    if (event.type === 'keydown') {
+      if (event.key !== ' ' || !action.matches('a[role="button"]')) return;
+      event.preventDefault();
+      if (event.repeat) return;
+    }
     if (action.classList.contains('wt-v2ex-thank-source')) {
       if (reply.page === topic.currentPage && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {
         event.preventDefault();
@@ -847,7 +924,7 @@
       return;
     }
     event.preventDefault();
-    if (action.disabled) return;
+    if (action.disabled || action.getAttribute('aria-disabled') === 'true') return;
     if (action.classList.contains('wt-v2ex-thank-check')) void refreshReplyThanks(topic, reply, true);
     else void sendReplyThanks(topic, reply);
   }
@@ -883,6 +960,7 @@
       unresolvedReason: '',
       children: [],
       nativeTemplate: sanitizeReplyTemplate(element, base),
+      nativeThanksPresentation: extractNativeThanksPresentation(element, idMatch?.[1] || '', base),
       nativeReplyControlsTemplate: extractNativeReplyControls(element, base)
     };
   }
@@ -1225,17 +1303,8 @@
       contentCell.insertBefore(header, separator || content || contentCell.firstChild);
     }
     removeClonedNativeHeaderControls(header);
-    const relation = relationshipLabel(reply);
-    if (relation) {
-      const badge = document.createElement('span');
-      badge.className = `wt-v2ex-relation wt-v2ex-relation-${reply.relationshipConfidence}`;
-      badge.textContent = relation;
-      if (reply.unresolvedReason) badge.title = reply.unresolvedReason;
-      header.append(badge);
-    }
-    const thanks = topic && createThanksControl(topic, reply);
-    if (thanks) header.append(thanks);
-    const controls = reply.nativeReplyControlsTemplate?.cloneNode(true);
+    const controls = reply.nativeReplyControlsTemplate?.cloneNode(true) || document.createElement('div');
+    controls.classList.add('fr', 'wt-v2ex-native-reply-controls');
     if (controls) {
       const nativeAction = controls.querySelector('[data-wt-v2ex-native-reply-action="true"]');
       const nativeFloor = controls.querySelector('.no');
@@ -1248,7 +1317,16 @@
         nativeAction.dataset.replyFloor = String(reply.floor || '');
         nativeAction.setAttribute('aria-label', `回复 ${reply.author || '该用户'} 第 ${reply.floor || ''} 楼`);
       }
-      if (controls.childElementCount) header.append(controls);
+      if (controls.childElementCount) header.prepend(controls);
+    }
+    if (topic) createThanksControl(topic, reply, header, controls);
+    const relation = relationshipLabel(reply);
+    if (relation) {
+      const badge = document.createElement('span');
+      badge.className = `wt-v2ex-relation wt-v2ex-relation-${reply.relationshipConfidence}`;
+      badge.textContent = relation;
+      if (reply.unresolvedReason) badge.title = reply.unresolvedReason;
+      header.append(badge);
     }
     if (hasVisibleChildren) {
       const children = document.createElement('div');
@@ -1339,7 +1417,7 @@
     if (targetReply) {
       const cell = nativeThanksReply(topic, targetReply);
       cell?.scrollIntoView({ block: 'center', behavior: 'auto' });
-      cell?.querySelector('[id^="thank_area_"] a')?.focus({ preventScroll: true });
+      focusNativeThanks(cell?.querySelector('[id^="thank_area_"]'));
     }
   }
 
@@ -1462,6 +1540,7 @@
     topic.threadedView.addEventListener('click', activateThreadedReply);
     topic.threadedView.addEventListener('keydown', activateThreadedReply);
     topic.threadedView.addEventListener('click', (event) => activateThanks(topic, event));
+    topic.threadedView.addEventListener('keydown', (event) => activateThanks(topic, event));
   }
 
   function removeConversationControl() {
@@ -1975,17 +2054,9 @@
       .wt-v2ex-threaded-view { margin:10px 0; }
       #Main .cell[id^="r_"].wt-v2ex-native-hidden, #Wrapper .cell[id^="r_"].wt-v2ex-native-hidden { display:none !important; }
       .wt-v2ex-threaded-reply { position:relative; }
-      .wt-v2ex-threaded-reply .wt-v2ex-reply-header { display:flex; flex-wrap:wrap; align-items:baseline; gap:0 7px; margin-bottom:5px; }
-      .wt-v2ex-threaded-reply .wt-v2ex-native-reply-controls { float:none; order:999; display:inline-flex; flex:0 0 auto; align-items:center; gap:5px; margin-left:auto; white-space:nowrap; }
-      .wt-v2ex-threaded-reply .wt-v2ex-native-reply-action:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
-      .wt-v2ex-threaded-reply .wt-v2ex-native-reply-action:hover { opacity:.72; }
-      .wt-v2ex-thanks { order:998; display:inline-flex; flex-wrap:wrap; align-items:baseline; gap:5px; margin-left:auto; max-width:100%; font-size:12px; }
-      .wt-v2ex-thanks[hidden], .wt-v2ex-thanks [hidden] { display:none !important; }
-      .wt-v2ex-thanks:not([hidden]) + .wt-v2ex-native-reply-controls { margin-left:0; }
-      .wt-v2ex-thank-action, .wt-v2ex-thank-check { padding:2px 5px; border:1px solid rgba(127,127,127,.35); border-radius:3px; background:transparent; color:inherit; font:inherit; cursor:pointer; }
-      .wt-v2ex-thank-action:disabled, .wt-v2ex-thank-check:disabled { opacity:.6; cursor:default; }
-      .wt-v2ex-thank-action:focus-visible, .wt-v2ex-thank-check:focus-visible, .wt-v2ex-thank-source:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
-      .wt-v2ex-thank-count { white-space:nowrap; }
+      .wt-v2ex-thanks [hidden] { display:none !important; }
+      .wt-v2ex-thank-area:focus-within > a, .wt-v2ex-thanks-focus:focus-within > a { visibility:visible; }
+      @media (hover:none) { .wt-v2ex-thank-area > a { visibility:visible; } }
       .wt-v2ex-thank-status { overflow-wrap:anywhere; }
       .wt-v2ex-inline-image { display:block; max-width:100%; height:auto; margin:8px 0; cursor:zoom-in; }
       .wt-v2ex-lightbox-target { cursor:zoom-in; }
