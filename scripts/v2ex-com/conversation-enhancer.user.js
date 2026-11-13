@@ -1059,6 +1059,7 @@
       id: idMatch ? idMatch[1] : `fallback-${page}-${floor || 'unknown'}-${index}`,
       floor,
       page,
+      ignored: element.hidden || element.style?.display === 'none' || element.classList.contains('wt-v2ex-native-ignored'),
       author,
       normalizedAuthor: normalizeName(author),
       avatarUrl: safeUrl(firstMatch(element, SELECTORS.replyAvatar)?.getAttribute('src'), 'image', base),
@@ -1396,6 +1397,9 @@
 
   function createReplyCard(reply, depth, hasVisibleChildren, topic) {
     const cell = reply.nativeTemplate?.cloneNode(true) || document.createElement('div');
+    cell.removeAttribute('style');
+    cell.removeAttribute('hidden');
+    cell.classList.remove('wt-v2ex-native-hidden', 'wt-v2ex-native-ignored');
     if (!cell.classList.contains('cell')) cell.classList.add('cell');
     cell.classList.add('wt-v2ex-threaded-reply', `wt-v2ex-depth-${Math.min(depth, 6)}`);
     cell.removeAttribute('id');
@@ -1442,7 +1446,7 @@
         else topic.ignoreControls.set(action, reply.id);
       });
       if (reply.thanks) updateThanksControl(topic, reply, header);
-      if (runtime.ignoredReplies.has(topic.context.id + ':' + reply.id)) {
+      if (reply.ignored || runtime.ignoredReplies.has(topic.context.id + ':' + reply.id)) {
         cell.classList.add('wt-v2ex-ignored-reply');
         cell.removeAttribute('aria-label');
       }

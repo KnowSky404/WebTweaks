@@ -50,7 +50,7 @@ A separate temporary observer can initialize an empty `#topic-replies` when the 
 Every parsed reply retains:
 
 ```text
-id, floor, page, author, normalizedAuthor, avatarUrl, timeText,
+id, floor, page, ignored, author, normalizedAuthor, avatarUrl, timeText,
 contentHtml, contentText, thankCount, thanks, mentionedUsers,
 normalizedMentions, explicitReplyFloor,
 hasMultipleStructuralMentions, hasStructuralMention,
@@ -113,7 +113,7 @@ Thanks presentation is separate from request state. The count reuses the reply's
 
 `nativeIgnoreControl` recognizes only a literal `ignoreReply` call whose real numeric reply ID matches the source cell, outside `.reply_content`. `prepareIgnoreControl` marks the sanitized clone; native handler strings and tokens are never retained on rendered controls. A hide link inside `thank_area` keeps its native location next to the separately replaced thanks action. Unsupported actions are removed. `topic.ignoreControls` registers real rendered nodes, preventing a reply-content class from impersonating an action.
 
-Activation is limited to connected active-page native replies, rechecks identity/token after explicit confirmation, and calls the existing page's `ignoreReply` function once. `runtime.ignoredReplies` is a document-lifetime set keyed by topic/reply, preventing duplicate native calls and preserving display state across redraws/navigation. The cloned own table is suppressed while its children container stays visible. Original mode retains native handlers; explicit native inline-hidden state is imported on view switching. No cross-page write or borrowed permission is introduced.
+Activation is limited to connected active-page native replies, rechecks identity/token after explicit confirmation, and calls the existing page's `ignoreReply` function once. `runtime.ignoredReplies` is a document-lifetime set keyed by topic/reply, preventing duplicate native calls and preserving display state across redraws/navigation. Parsing records explicit native hidden state, including fetched ancestors. Rebuilt clone roots discard inline style, `hidden`, and native-only hiding classes before applying own-content hiding; the cloned own table is suppressed while its children container stays visible. Original mode retains native handlers; explicit native inline-hidden state is imported on view switching. No cross-page write or borrowed permission is introduced.
 
 The native helper posts to `/ignore/reply/<reply-id>?once=<token>` and immediately hides the native cell, without a completion result. This integration preserves that optimistic behavior and does not retry or claim confirmed server persistence. A result-aware adapter is deliberately deferred until reconciliation is required. The existing `unsafeWindow` grant is reused only for this additional fixed native call; no permission or dependency is added.
 
