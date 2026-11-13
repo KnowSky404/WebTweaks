@@ -86,7 +86,10 @@ class NativeNode {
 
 function nativeReply(id, options = {}) {
   const cell = new NativeNode('div', { id: 'r_' + id, class: 'cell' });
-  const header = new NativeNode('span', { class: 'fr' });
+  const header = new NativeNode('div', { class: options.legacy ? 'fr' : 'flex-one-row' });
+  const info = new NativeNode('div', { class: 'flex-one-row gap10' });
+  const actions = new NativeNode('div', { class: 'flex-one-row gap10' });
+  if (!options.legacy) header.append(info, actions);
   const content = new NativeNode('div', { class: 'reply_content' }, 'fixture reply');
   cell.append(header, content);
   if (options.canThank !== false || options.thanked || options.inContent) {
@@ -96,12 +99,12 @@ function nativeReply(id, options = {}) {
     });
     if (options.thanked) area.textContent = '感谢已发送';
     else area.append(new NativeNode('a', { href: '#', onclick: `if (confirm('fixture')) { thankReply(${options.actionId || id}); } return false;` }, '感谢'));
-    (options.inContent ? content : header).append(area);
+    (options.inContent ? content : options.legacy ? header : actions).append(area);
   }
   if (options.count !== null && options.count !== undefined) {
     const count = new NativeNode('span', { class: 'small fade' }, String(options.count));
     count.append(new NativeNode('img', { alt: '❤️' }));
-    (options.countInContent ? content : header).append(count);
+    (options.countInContent ? content : options.legacy ? header : info).append(count);
   }
   return cell;
 }
@@ -203,6 +206,8 @@ check('parsing scopes counts and capability to each native reply header', () => 
   assert.equal(api.readReplyThanks(nativeReply('201', { count: 'unknown' }), '201').count, null);
   assert.equal(api.readReplyThanks(nativeReply('201', { count: 9, countInContent: true }), '201').count, null);
   assert.equal(api.readReplyThanks(nativeReply('201', { count: 3 }), '201').canThank, true);
+  assert.equal(api.readReplyThanks(nativeReply('201', { count: 3, legacy: true }), '201').canThank, true);
+  assert.equal(api.readReplyThanks(nativeReply('201', { count: 3, legacy: true }), '201').count, 3);
   assert.equal(api.readReplyThanks(nativeReply('201', { actionId: '202' }), '201').canThank, false);
   assert.equal(api.readReplyThanks(nativeReply('201', { inContent: true }), '201').canThank, false);
   assert.equal(api.readReplyThanks(nativeReply('201', { canThank: false }), '201').canThank, false);

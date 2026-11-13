@@ -2,7 +2,7 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.5.2
+// @version      1.6.0
 // @description  Threaded cross-page replies with thanks, client-side image previews, and navigation improvements for V2EX.
 // @description:zh-CN 为 V2EX 提供跨页楼中楼、回复感谢、浏览器侧图片预览和返回顶部功能。
 // @author       KnowSky404
@@ -11,7 +11,6 @@
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
 // @run-at       document-idle
 // @homepageURL  https://github.com/KnowSky404/WebTweaks/tree/main/scripts/v2ex-com
@@ -41,7 +40,7 @@
     'imageLightboxEnabled'
   ]);
 
-  // Verified against public V2EX HTML on 2026-08-18. Fallbacks are intentionally narrow.
+  // Flex headers verified against public V2EX HTML on 2026-11-13; retain legacy headers.
   const SELECTORS = Object.freeze({
     reply: ['#Main .cell[id^="r_"]', '#Wrapper .cell[id^="r_"]', '.cell[id^="r_"]'],
     replyContent: ['.reply_content'],
@@ -50,7 +49,6 @@
     replyFloor: ['.no'],
     replyTime: ['.ago'],
     replyThanks: ['.small.fade img[alt="❤️"]'],
-    nativeReplyFloor: ['.fr .no', '.no'],
     pagination: ['.ps_container a[href*="?p="]', '.ps_container a[href*="&p="]'],
     pageInput: ['.ps_container input.page_input'],
     editor: ['#reply_content', '#topic_content', 'textarea[name="content"]'],
@@ -60,13 +58,13 @@
   const runtime = {
     settings: loadSettings(),
     topic: null,
+    waitingReplyObserver: null,
     controlDock: null,
-    conversationToggle: null,
-    conversationPanel: null,
+    settingsToggle: null,
+    settingsPanel: null,
     panelDismissalAttached: false,
     scrollButton: null,
     scrollFrame: 0,
-    nativeReplyListenerAttached: false,
     navigationAttached: false,
     navigationSchedule: 0,
     navigationSync: false,
@@ -127,40 +125,22 @@
     safeSet(SETTINGS_KEY, { ...runtime.settings, version: SETTINGS_VERSION });
   }
 
-  function registerMenuCommands() {
-    if (typeof GM_registerMenuCommand !== 'function') return;
-    GM_registerMenuCommand('开启/关闭评论图片自动展开', () => {
-      runtime.settings.imagePreviewEnabled = !runtime.settings.imagePreviewEnabled;
-      saveSettings();
-      if (runtime.settings.imagePreviewEnabled) scanImageContent(document);
+  function setFeatureSetting(key, enabled) {
+    runtime.settings[key] = enabled;
+    saveSettings();
+    if (key === 'imagePreviewEnabled') {
+      if (enabled) scanImageContent(document);
       else {
         if (runtime.imageLightboxOpener?.classList.contains('wt-v2ex-inline-image')) closeImageLightbox();
         resetImagePreviews(document);
       }
-    });
-    GM_registerMenuCommand('开启/关闭图片点击放大', () => {
-      runtime.settings.imageLightboxEnabled = !runtime.settings.imageLightboxEnabled;
-      saveSettings();
-      if (runtime.settings.imageLightboxEnabled) scanImageContent(document);
-      else {
-        closeImageLightbox();
-        resetLightboxTargets(document);
-      }
-    });
-    GM_registerMenuCommand('开启/关闭返回顶部', () => {
-      runtime.settings.scrollTopEnabled = !runtime.settings.scrollTopEnabled;
-      saveSettings();
-      if (runtime.settings.scrollTopEnabled) initializeScrollToTop();
+    } else if (key === 'imageLightboxEnabled') {
+      if (enabled) scanImageContent(document);
+      else { closeImageLightbox(); resetLightboxTargets(document); }
+    } else if (key === 'scrollTopEnabled') {
+      if (enabled) initializeScrollToTop();
       updateScrollButton();
-    });
-    GM_registerMenuCommand('默认使用楼中楼/原始顺序', () => {
-      runtime.settings.preferredView = runtime.settings.preferredView === 'threaded' ? 'original' : 'threaded';
-      saveSettings();
-      if (runtime.topic) {
-        runtime.topic.keepThanksSourceView = false;
-        applyTopicView(runtime.topic, runtime.settings.preferredView);
-      }
-    });
+    }
   }
 
   function firstMatch(root, selectors) {
@@ -462,9 +442,21 @@
     return [...group.querySelectorAll('a, button, [role="button"]')].find(hasNativeReplyHandler) || null;
   }
 
+  function nativeReplyHeader(root) {
+    const content = firstMatch(root, SELECTORS.replyContent);
+    const container = content?.closest('td') || content?.parentElement;
+    if (!container) return null;
+    return [...container.children].find((node) => node.matches('.flex-one-row')
+      && node.querySelector('strong a[href^="/member/"]') && node.querySelector('.ago')) || container;
+  }
+
   function nativeReplyGroup(root) {
-    const groups = [...root.querySelectorAll('.fr')];
-    return groups.find((group) => nativeReplyAction(group)) || groups.find((group) => group.querySelector('.no')) || null;
+    const header = nativeReplyHeader(root);
+    if (!header) return null;
+    const groups = [...header.querySelectorAll('.flex-one-row, .fr')]
+      .filter((node) => !node.closest('.reply_content') && !node.querySelector('strong'));
+    return groups.find((group) => nativeReplyAction(group))
+      || groups.find((group) => group.querySelector('.no')) || null;
   }
 
   function sanitizeNativeControlNode(node, base, restrictImages = false) {
@@ -504,31 +496,14 @@
     controls.classList.add('wt-v2ex-native-reply-controls');
     if (action) {
       const actionClone = sanitizeNativeControlNode(action, base, true);
-      const hasReplyImage = actionClone.matches('img') || actionClone.querySelector('img');
-      if (hasReplyImage) {
-        const interactive = actionClone.matches('a, button, [role="button"]')
-          ? actionClone
-          : actionClone.querySelector('a, button, [role="button"]');
-        if (interactive) {
-          interactive.classList.add('wt-v2ex-native-reply-action');
-          interactive.dataset.wtV2exNativeReplyAction = 'true';
-          if (interactive.matches('a') && !interactive.getAttribute('href')) interactive.setAttribute('href', '#');
-          if (interactive.matches('[role="button"]') && !interactive.hasAttribute('tabindex')) interactive.setAttribute('tabindex', '0');
-        } else {
-          const link = document.createElement('a');
-          link.href = '#';
-          link.setAttribute('role', 'button');
-          link.className = 'wt-v2ex-native-reply-action';
-          link.dataset.wtV2exNativeReplyAction = 'true';
-          link.append(actionClone);
-          action.replaceWith(link);
-          action = link;
-        }
-        if (interactive) {
-          action.replaceWith(actionClone);
-          action = actionClone;
-        }
-      } else action = null;
+      actionClone.classList.add('wt-v2ex-native-reply-action');
+      actionClone.dataset.wtV2exNativeReplyAction = 'true';
+      if (actionClone.matches('a')) actionClone.setAttribute('href', '#');
+      if (actionClone.matches('button')) actionClone.setAttribute('type', 'button');
+      actionClone.setAttribute('role', 'button');
+      if (!actionClone.hasAttribute('tabindex')) actionClone.setAttribute('tabindex', '0');
+      action.replaceWith(actionClone);
+      action = actionClone;
     }
     // Retain source spacing/wrappers only around the recognized controls.
     const retained = [action, floor, thanksSlot].filter(Boolean);
@@ -575,7 +550,7 @@
     const { image, area, action } = nativeReplyThanksNodes(element, replyId);
     return {
       count: image ? sanitizeNativeControlNode(image.parentElement, base, true) : null,
-      area: area ? sanitizeNativeControlNode(area.cloneNode(false), base, true) : null,
+      area: area ? sanitizeNativeControlNode(area, base, true) : null,
       action: action ? sanitizeNativeControlNode(action, base, true) : null
     };
   }
@@ -638,17 +613,25 @@
   }
 
   function updateThanksControl(topic, reply, control) {
-    if (!['.wt-v2ex-thank-count', '.wt-v2ex-thank-count-value', '.wt-v2ex-thank-area', '.wt-v2ex-thank-action', '.wt-v2ex-thank-check', '.wt-v2ex-thank-source', '.wt-v2ex-thank-status']
+    if (!['.wt-v2ex-thank-count', '.wt-v2ex-thank-area', '.wt-v2ex-thank-action', '.wt-v2ex-thank-check', '.wt-v2ex-thank-source', '.wt-v2ex-thank-status']
       .every((selector) => control.querySelector(selector))) return;
     reconcileThanks(topic, reply);
     const state = reply.thanks;
     const uncertain = state.phase === 'unknown' || state.phase === 'checking';
-    const direct = reply.page === topic.currentPage && state.canThank && Boolean(thanksSession());
+    const direct = reply.page === topic.currentPage && state.canThank && Boolean(reply.nativeThanksPresentation?.action) && Boolean(thanksSession());
     const count = control.querySelector('.wt-v2ex-thank-count');
-    const image = reply.nativeThanksPresentation?.count?.querySelector('img');
-    if (!count.querySelector('img') && image) count.prepend(image.cloneNode(true), ' ');
-    count.hidden = state.count === null;
-    count.querySelector('.wt-v2ex-thank-count-value').textContent = state.count === null ? '' : String(state.count);
+    const template = reply.nativeThanksPresentation?.count;
+    if (!count.querySelector('img') && template) count.replaceChildren(...template.cloneNode(true).childNodes);
+    count.hidden = state.count === null || !count.querySelector('img');
+    if (!count.hidden && Number(count.textContent.trim().replaceAll(',', '')) !== state.count) {
+      const walker = document.createTreeWalker(count, NodeFilter.SHOW_TEXT);
+      for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+        if (/^\s*[\d,]+\s*$/.test(text.data)) {
+          text.data = text.data.replace(/[\d,]+/, String(state.count));
+          break;
+        }
+      }
+    }
     count.setAttribute('aria-label', '收到 ' + (state.count ?? '未知数量的') + ' 次感谢');
     const action = control.querySelector('.wt-v2ex-thank-action');
     action.hidden = !direct || state.thanked || uncertain;
@@ -666,7 +649,7 @@
     const recovery = control.querySelector('.wt-v2ex-thank-recovery');
     if (recovery) recovery.hidden = check.hidden && source.hidden;
     const status = control.querySelector('.wt-v2ex-thank-status');
-    status.textContent = state.thanked ? '感谢已发送'
+    status.textContent = state.thanked ? ''
       : state.phase === 'pending' ? '发送中…'
       : state.phase === 'checking' ? '正在核对…'
       : state.phase === 'unknown' ? state.message || '结果未确认，请核对状态'
@@ -677,7 +660,9 @@
     status.hidden = !status.textContent;
     const area = control.querySelector('.wt-v2ex-thank-area');
     area.classList.toggle('thanked', state.thanked);
-    area.hidden = action.hidden && check.hidden && source.hidden && status.hidden;
+    const completed = area.querySelector('.wt-v2ex-thank-completed');
+    completed.hidden = !state.thanked;
+    area.hidden = action.hidden && !state.thanked;
     area.tabIndex = area.hidden || state.thanked ? -1 : 0;
   }
 
@@ -688,34 +673,36 @@
       && reply.thanks.phase === 'idle' && !reply.thanks.message) return null;
     const presentation = reply.nativeThanksPresentation;
     const count = presentation?.count?.cloneNode(true) || document.createElement('span');
-    count.classList.add('small', 'fade', 'wt-v2ex-thank-count');
-    const image = count.querySelector('img');
-    const value = document.createElement('span');
-    value.className = 'wt-v2ex-thank-count-value';
-    count.replaceChildren(...(image ? [image, ' '] : []), value);
+    count.classList.add('wt-v2ex-thank-count');
     const countSlot = header.querySelector('.wt-v2ex-native-thank-count-slot');
     if (countSlot) countSlot.replaceWith(count);
     else {
       const time = header.querySelector('.ago');
-      if (time) time.after(' \u00a0 ', count);
-      else header.append(' \u00a0 ', count);
+      if (time) time.after(count);
+      else header.append(count);
     }
 
     const area = presentation?.area?.cloneNode(true) || document.createElement('span');
-    area.classList.add('thank_area', 'wt-v2ex-thank-area');
-    const action = presentation?.action?.cloneNode(true) || document.createElement('a');
+    area.classList.add('wt-v2ex-thank-area');
+    const completed = document.createElement('span');
+    completed.className = 'wt-v2ex-thank-completed';
+    if (reply.thanks.thanked && presentation?.area) completed.append(...area.childNodes);
+    else completed.textContent = '感谢已发送'; // Native thankReply success text, verified in V2EX's JS.
+    const action = presentation?.action?.cloneNode(true) || document.createElement('span');
     action.classList.add('wt-v2ex-thank-action');
-    if (!presentation?.action) { action.classList.add('thank'); action.textContent = '感谢'; }
     if (action.matches('a')) action.setAttribute('href', '#');
     if (action.matches('button')) action.setAttribute('type', 'button');
-    action.setAttribute('role', 'button');
+    if (presentation?.action) {
+      action.setAttribute('role', 'button');
+      if (!action.hasAttribute('tabindex')) action.setAttribute('tabindex', '0');
+    }
     const check = document.createElement('a');
-    check.className = 'thank wt-v2ex-thank-check';
+    check.className = 'wt-v2ex-thank-check';
     check.href = '#';
     check.setAttribute('role', 'button');
     check.textContent = '核对状态';
     const source = document.createElement('a');
-    source.className = 'thank wt-v2ex-thank-source';
+    source.className = 'wt-v2ex-thank-source';
     const status = document.createElement('span');
     status.className = 'wt-v2ex-thank-status';
     status.setAttribute('role', 'status');
@@ -725,10 +712,11 @@
     const recovery = document.createElement('span');
     recovery.className = 'wt-v2ex-thank-recovery';
     recovery.append(check, ' ', source);
-    area.replaceChildren(action, recovery, status);
-    const areaSlot = controls.querySelector('.wt-v2ex-native-thank-area-slot');
+    area.replaceChildren(action, completed);
+    const areaSlot = controls?.querySelector('.wt-v2ex-native-thank-area-slot');
     if (areaSlot) areaSlot.replaceWith(area);
-    else controls.prepend(area, ' \u00a0 ');
+    else header.append(area);
+    header.append(recovery, status);
     header.classList.add('wt-v2ex-thanks');
     // Both native positions stay under the same trusted, per-reply header.
     topic.thanksControls.set(header, reply.id);
@@ -827,7 +815,8 @@
   }
 
   function attachThanksObserver(topic) {
-    topic.thanksReads = new Set();
+    topic.thanksReads ||= new Set();
+    topic.thanksObserver?.disconnect();
     if (typeof MutationObserver !== 'function') return;
     topic.thanksObserver = new MutationObserver(() => synchronizeNativeThanks(topic));
     topic.nativeReplies.forEach((cell) => {
@@ -842,7 +831,44 @@
     });
   }
 
+  function attachReplyObserver(topic) {
+    const root = topic.nativeReplies[0]?.closest('#topic-replies') || topic.nativeReplies[0]?.parentElement;
+    if (!root || typeof MutationObserver !== 'function') return;
+    topic.replyObserver = new MutationObserver((records) => {
+      if (!isCurrentTopic(topic)) return;
+      const changed = records.some((record) => {
+        if (record.target.closest?.('.wt-v2ex-threaded-view')) return false;
+        return [...record.addedNodes, ...record.removedNodes].some((node) => node.nodeType === 1
+          && (node.matches('.cell[id^="r_"], .wt-v2ex-threaded-view') || node.querySelector('.cell[id^="r_"]')))
+          || record.target.closest?.('.cell[id^="r_"]');
+      });
+      if (!changed) return;
+      if (!topic.threadedView.isConnected || topic.nativeReplies.some((cell) => !cell.isConnected)) {
+        scheduleTopicSynchronization();
+        return;
+      }
+      const cells = allMatches(root, SELECTORS.reply).filter((cell) => !cell.closest('.wt-v2ex-threaded-view'));
+      const known = new Set(topic.nativeReplies.map((cell) => cell.id));
+      const added = cells.filter((cell) => !known.has(cell.id))
+        .map((cell, index) => ({ cell, reply: parseReply(cell, topic.currentPage, index) }))
+        .filter(({ reply }) => reply);
+      if (!added.length) return;
+      const models = new Map(topic.allReplies.map((reply) => [reply.id, reply]));
+      added.forEach(({ cell, reply }) => { topic.nativeReplies.push(cell); models.set(reply.id, reply); });
+      topic.allReplies = [...models.values()];
+      attachThanksObserver(topic);
+      topic.models = inferRelationships(topic.allReplies);
+      topic.visibleThread = deriveVisibleThread(topic);
+      renderThreadedView(topic);
+      applyTopicView(topic, topic.view);
+      setTopicStatus(topic, `已加载 ${topic.models.length} 条关系数据；当前线程投影包含 ${topic.visibleThread.visibleReplies.length} 条回复（含必要跨页上下文）`);
+      scanImageContent(root);
+    });
+    topic.replyObserver.observe(root, { childList: true, subtree: true });
+  }
+
   function disposeThanks(topic) {
+    topic.replyObserver?.disconnect();
     topic.thanksObserver?.disconnect();
     topic.thanksReads?.forEach((controller) => controller.abort());
     if (runtime.thanksRequest?.topic === topic) runtime.thanksRequest.controller.abort();
@@ -975,7 +1001,9 @@
     const content = firstMatch(element, SELECTORS.replyContent);
     if (!content) return null;
     const idMatch = String(element.id || '').match(/^r_(.+)$/);
-    const floor = parseFloor(firstMatch(element, SELECTORS.replyFloor)?.textContent);
+    const header = nativeReplyHeader(element);
+    const floorNode = header && [...header.querySelectorAll('.no')].find((node) => !node.closest('.reply_content'));
+    const floor = parseFloor(floorNode?.textContent);
     const authorElement = firstMatch(element, SELECTORS.replyAuthor);
     const author = (authorElement?.textContent || '').trim();
     const thanks = readReplyThanks(element, idMatch?.[1] || '');
@@ -1202,79 +1230,97 @@
     return dock;
   }
 
-  function setConversationPanelOpen(topic, open) {
-    const panel = topic.panel || runtime.conversationPanel;
-    const toggle = runtime.conversationToggle;
+  function setSettingsPanelOpen(open, restoreFocus = false) {
+    const panel = runtime.settingsPanel;
+    const toggle = runtime.settingsToggle;
     if (!panel || !toggle) return;
     panel.hidden = !open;
     toggle.setAttribute('aria-expanded', String(open));
-    toggle.setAttribute('aria-label', open ? '关闭会话视图控制面板' : '打开会话视图控制面板');
+    toggle.setAttribute('aria-label', open ? '关闭 WebTweaks 设置' : '打开 WebTweaks 设置');
+    if (open) [...panel.querySelectorAll('input:not([disabled])')]
+      .find((input) => !input.closest('[hidden]'))?.focus({ preventScroll: true });
+    else if (restoreFocus) toggle.focus({ preventScroll: true });
   }
 
-  function createConversationControl(topic) {
+  function ensureSettingsControl() {
+    if (runtime.settingsToggle?.isConnected) return;
     const dock = ensureControlDock();
-    if (runtime.conversationToggle?.isConnected) {
-      topic.panel = runtime.conversationPanel;
-      updateTopicPanel(topic);
-      return;
-    }
     const toggle = document.createElement('button');
     toggle.type = 'button';
-    toggle.className = 'wt-v2ex-conversation-toggle';
-    toggle.textContent = '会话';
-    toggle.setAttribute('aria-label', '打开会话视图控制面板');
+    toggle.className = 'wt-v2ex-settings-toggle';
+    toggle.textContent = '设置';
+    toggle.setAttribute('aria-label', '打开 WebTweaks 设置');
     toggle.setAttribute('aria-expanded', 'false');
-    toggle.setAttribute('aria-controls', 'wt-v2ex-conversation-panel');
+    toggle.setAttribute('aria-controls', 'wt-v2ex-settings-panel');
     const panel = document.createElement('div');
-    panel.id = 'wt-v2ex-conversation-panel';
-    panel.className = 'wt-v2ex-conversation-panel';
+    panel.id = 'wt-v2ex-settings-panel';
+    panel.className = 'wt-v2ex-settings-panel';
     panel.setAttribute('role', 'region');
-    panel.setAttribute('aria-label', '会话视图');
+    panel.setAttribute('aria-label', 'WebTweaks 设置');
     panel.hidden = true;
     panel.innerHTML = `
-      <div class="wt-v2ex-conversation-panel-title">会话视图</div>
-      <div class="wt-v2ex-conversation-panel-group" role="group" aria-label="视图模式">
-        <button type="button" class="wt-v2ex-panel-action" data-view="threaded" aria-pressed="false">楼中楼</button>
-        <button type="button" class="wt-v2ex-panel-action" data-view="original" aria-pressed="false">原始顺序</button>
-      </div>
-      <button type="button" class="wt-v2ex-panel-action wt-v2ex-load-pages" hidden>加载全部分页</button>
-      <div class="wt-v2ex-thread-status" role="status" aria-live="polite">准备构建楼中楼</div>`;
-    panel.addEventListener('click', (event) => {
-      const button = event.target.closest('button');
-      if (!button || !panel.contains(button)) return;
-      if (button.dataset.view) {
+      <fieldset class="wt-v2ex-settings-topic" hidden>
+        <legend>会话视图</legend>
+        <div class="wt-v2ex-settings-panel-group">
+          <label><input type="radio" name="wt-v2ex-view" data-view="threaded"> 楼中楼</label>
+          <label><input type="radio" name="wt-v2ex-view" data-view="original"> 原始顺序</label>
+        </div>
+        <button type="button" class="wt-v2ex-panel-action wt-v2ex-load-pages" hidden>加载全部分页</button>
+        <div class="wt-v2ex-thread-status" role="status" aria-live="polite"></div>
+      </fieldset>
+      <fieldset><legend>图片增强</legend>
+        <label><input type="checkbox" role="switch" data-setting="imagePreviewEnabled"> 评论图片自动展开</label>
+        <label><input type="checkbox" role="switch" data-setting="imageLightboxEnabled"> 图片点击放大</label>
+      </fieldset>
+      <fieldset><legend>页面工具</legend>
+        <label><input type="checkbox" role="switch" data-setting="scrollTopEnabled"> 返回顶部</label>
+      </fieldset>`;
+    panel.querySelectorAll('[data-setting]').forEach((input) => {
+      input.checked = runtime.settings[input.dataset.setting];
+    });
+    panel.addEventListener('change', (event) => {
+      const input = event.target;
+      if (input.matches('[data-setting]')) setFeatureSetting(input.dataset.setting, input.checked);
+      else if (input.matches('[data-view]')) {
+        const topic = runtime.topic;
+        if (!isCurrentTopic(topic)) return;
         topic.keepThanksSourceView = false;
-        runtime.settings.preferredView = button.dataset.view;
+        runtime.settings.preferredView = input.dataset.view;
         saveSettings();
-        applyTopicView(topic, button.dataset.view);
-      } else if (button.classList.contains('wt-v2ex-load-pages')) {
-        void loadAllTopicPages(topic).catch((error) => {
-          if (!isCurrentTopic(topic)) return;
-          topic.loading = false;
-          topic.failed = true;
-          setTopicStatus(topic, '分页解析失败，已保留原始顺序');
-          applyTopicView(topic, 'original');
-          logError(error);
-        });
+        applyTopicView(topic, input.dataset.view);
       }
     });
-    toggle.addEventListener('click', () => setConversationPanelOpen(topic, panel.hidden));
+    panel.addEventListener('click', (event) => {
+      const topic = runtime.topic;
+      if (!event.target.closest('.wt-v2ex-load-pages') || !isCurrentTopic(topic)) return;
+      void loadAllTopicPages(topic).catch((error) => {
+        if (!isCurrentTopic(topic)) return;
+        topic.loading = false;
+        topic.failed = true;
+        setTopicStatus(topic, '分页解析失败，已保留原始顺序');
+        applyTopicView(topic, 'original');
+        logError(error);
+      });
+    });
+    toggle.addEventListener('click', () => setSettingsPanelOpen(panel.hidden));
     dock.prepend(panel, toggle);
-    runtime.conversationToggle = toggle;
-    runtime.conversationPanel = panel;
-    topic.panel = panel;
+    runtime.settingsToggle = toggle;
+    runtime.settingsPanel = panel;
     if (!runtime.panelDismissalAttached) {
       document.addEventListener('pointerdown', (event) => {
-        if (!runtime.conversationPanel || runtime.conversationPanel.hidden || !runtime.controlDock?.contains(event.target)) {
-          if (runtime.topic) setConversationPanelOpen(runtime.topic, false);
-        }
+        if (!runtime.controlDock?.contains(event.target)) setSettingsPanelOpen(false);
       }, true);
       document.addEventListener('keydown', (event) => {
-        if (event.key === 'Escape' && runtime.topic) setConversationPanelOpen(runtime.topic, false);
+        if (event.key === 'Escape' && !runtime.settingsPanel?.hidden) {
+          event.preventDefault();
+          setSettingsPanelOpen(false, true);
+        }
+      });
+      document.addEventListener('focusin', (event) => {
+        if (!runtime.controlDock?.contains(event.target)) setSettingsPanelOpen(false);
       });
       runtime.panelDismissalAttached = true;
     }
-    updateTopicPanel(topic);
   }
 
   function setTopicStatus(topic, message) {
@@ -1286,8 +1332,9 @@
   function updateTopicPanel(topic) {
     const panel = topic.panel;
     if (!panel) return;
-    panel.querySelectorAll('[data-view]').forEach((button) => {
-      button.setAttribute('aria-pressed', String(button.dataset.view === topic.view));
+    panel.querySelector('.wt-v2ex-settings-topic').hidden = false;
+    panel.querySelectorAll('[data-view]').forEach((input) => {
+      input.checked = input.dataset.view === topic.view;
     });
     const loadButton = panel.querySelector('.wt-v2ex-load-pages');
     if (loadButton) {
@@ -1303,23 +1350,6 @@
     if (reply.relationshipConfidence === 'inferred') return '推断回复';
     if (reply.relationshipConfidence === 'unresolved') return '关系未确定';
     return '';
-  }
-
-  function removeClonedNativeHeaderControls(header) {
-    const groups = [...header.querySelectorAll('.fr')];
-    let removedControlGroup = false;
-    groups.forEach((group) => {
-      if (nativeReplyAction(group) || group.querySelector('.no')) {
-        group.remove();
-        removedControlGroup = true;
-      }
-    });
-    allMatches(header, SELECTORS.nativeReplyAction).forEach((action) => action.remove());
-    if (removedControlGroup) allMatches(header, SELECTORS.nativeReplyFloor).forEach((floor) => floor.remove());
-    else firstMatch(header, SELECTORS.nativeReplyFloor)?.remove();
-    [...header.querySelectorAll('.reply, .fr')].reverse().forEach((wrapper) => {
-      if (!wrapper.children.length && !wrapper.textContent.trim()) wrapper.remove();
-    });
   }
 
   function createReplyCard(reply, depth, hasVisibleChildren, topic) {
@@ -1344,9 +1374,7 @@
     } else {
       contentCell.insertBefore(header, separator || content || contentCell.firstChild);
     }
-    removeClonedNativeHeaderControls(header);
-    const controls = reply.nativeReplyControlsTemplate?.cloneNode(true) || document.createElement('div');
-    controls.classList.add('fr', 'wt-v2ex-native-reply-controls');
+    const controls = reply.nativeReplyControlsTemplate?.cloneNode(true);
     if (controls) {
       const nativeAction = controls.querySelector('[data-wt-v2ex-native-reply-action="true"]');
       const nativeFloor = controls.querySelector('.no');
@@ -1354,7 +1382,8 @@
         if (reply.floor) nativeFloor.textContent = String(reply.floor);
         else nativeFloor.remove();
       }
-      if (nativeAction) {
+      if (nativeAction && !reply.floor) nativeAction.remove();
+      else if (nativeAction) {
         nativeAction.dataset.replyUser = reply.author;
         nativeAction.dataset.replyFloor = String(reply.floor || '');
         nativeAction.setAttribute('aria-label', `回复 ${reply.author || '该用户'} 第 ${reply.floor || ''} 楼`);
@@ -1518,7 +1547,21 @@
     if (!context) return;
     if (runtime.topic?.key === context.key) return;
     const nativeReplies = allMatches(document, SELECTORS.reply);
-    if (!nativeReplies.length) return;
+    if (!nativeReplies.length) {
+      const list = document.querySelector('#topic-replies');
+      if (list && !runtime.waitingReplyObserver && typeof MutationObserver === 'function') {
+        runtime.waitingReplyObserver = new MutationObserver(() => {
+          if (topicContext()?.key !== context.key || !allMatches(list, SELECTORS.reply).length) return;
+          runtime.waitingReplyObserver.disconnect();
+          runtime.waitingReplyObserver = null;
+          scheduleTopicSynchronization();
+        });
+        runtime.waitingReplyObserver.observe(list, { childList: true, subtree: true });
+      }
+      return;
+    }
+    runtime.waitingReplyObserver?.disconnect();
+    runtime.waitingReplyObserver = null;
     const firstReply = nativeReplies[0];
     const threadedView = document.createElement('section');
     threadedView.className = 'wt-v2ex-threaded-view';
@@ -1530,13 +1573,12 @@
       currentPage: context.page,
       navigationRevision: runtime.navigationRevision,
       nativeReplies,
-      panel: null,
+      panel: runtime.settingsPanel,
       threadedView,
       pages: discoveredPages.pages,
       maxPage: discoveredPages.maxPage,
       loadedPages: new Set([context.page]),
       allReplies: parseReplies(document, context.page, location.href),
-      nativeReplyControlsTemplate: null,
       models: [],
       view: 'original',
       loading: false,
@@ -1545,10 +1587,10 @@
       duplicateIds: 0,
       statusMessage: '准备构建楼中楼'
     };
-    topic.nativeReplyControlsTemplate = topic.allReplies.find((reply) => reply.nativeReplyControlsTemplate)?.nativeReplyControlsTemplate || null;
     firstReply.before(threadedView);
     runtime.topic = topic;
     attachThanksObserver(topic);
+    attachReplyObserver(topic);
     topic.models = inferRelationships(topic.allReplies);
     topic.visibleThread = deriveVisibleThread(topic);
     renderThreadedView(topic);
@@ -1587,16 +1629,11 @@
     topic.threadedView.addEventListener('keydown', (event) => activateThanks(topic, event));
   }
 
-  function removeConversationControl() {
-    if (runtime.conversationPanel) runtime.conversationPanel.hidden = true;
-    if (runtime.conversationToggle) {
-      runtime.conversationToggle.setAttribute('aria-expanded', 'false');
-      runtime.conversationToggle.setAttribute('aria-label', '打开会话视图控制面板');
-    }
-    runtime.conversationPanel?.remove();
-    runtime.conversationToggle?.remove();
-    runtime.conversationPanel = null;
-    runtime.conversationToggle = null;
+  function resetSettingsTopic() {
+    const focused = runtime.settingsPanel?.contains(document.activeElement);
+    setSettingsPanelOpen(false, focused);
+    const section = runtime.settingsPanel?.querySelector('.wt-v2ex-settings-topic');
+    if (section) section.hidden = true;
   }
 
   async function synchronizeTopicPage() {
@@ -1606,7 +1643,8 @@
     }
     const context = topicContext();
     const synchronizationRevision = runtime.navigationRevision;
-    if (topicStateMatchesLocation(context)) {
+    if (topicStateMatchesLocation(context) && (!runtime.topic || (runtime.topic.threadedView.isConnected
+      && runtime.topic.nativeReplies.every((cell) => cell.isConnected)))) {
       scanImageContent(document);
       return;
     }
@@ -1625,7 +1663,7 @@
             runtime.topic.threadedView.remove();
             runtime.topic = null;
           }
-          removeConversationControl();
+          resetSettingsTopic();
           scanImageContent(document);
         }
         return;
@@ -1644,10 +1682,10 @@
         runtime.topic.threadedView.remove();
         runtime.topic = null;
       }
-      removeConversationControl();
+      resetSettingsTopic();
       if (context) {
         await initializeTopic();
-        if (runtime.topic) createConversationControl(runtime.topic);
+        if (runtime.topic) { runtime.topic.panel = runtime.settingsPanel; updateTopicPanel(runtime.topic); }
       }
       scanImageContent(document);
     } finally {
@@ -1667,6 +1705,8 @@
   function handleTopicNavigation() {
     const nextTopicKey = topicContext()?.key || null;
     if (nextTopicKey !== runtime.observedTopicKey) {
+      runtime.waitingReplyObserver?.disconnect();
+      runtime.waitingReplyObserver = null;
       runtime.observedTopicKey = nextTopicKey;
       runtime.navigationRevision += 1;
     }
@@ -1734,27 +1774,6 @@
       return;
     }
     insertAtSelection(editor, `@${username} #${floor} `);
-  }
-
-  function enhanceNativeReplyAction(event) {
-    if (!(event.target instanceof Element)) return;
-    const action = event.target.closest(SELECTORS.nativeReplyAction.join(','));
-    if (!action) return;
-    const reply = action.closest('.cell[id^="r_"]');
-    if (!reply) return;
-    const author = firstMatch(reply, SELECTORS.replyAuthor)?.textContent.trim();
-    const floor = parseFloor(firstMatch(reply, SELECTORS.replyFloor)?.textContent);
-    if (!author || !floor) return;
-    window.setTimeout(() => {
-      const editor = findEditor();
-      if (editor) insertReplyPrefix(editor, author, floor);
-    }, 0);
-  }
-
-  function attachNativeReplyEnhancer() {
-    if (runtime.nativeReplyListenerAttached) return;
-    runtime.nativeReplyListenerAttached = true;
-    document.addEventListener('click', enhanceNativeReplyAction, true);
   }
 
   function imageContentContainers(root = document) {
@@ -2085,13 +2104,19 @@
   function addStyles() {
     const css = `
       .wt-v2ex-control-dock { position:fixed; z-index:1000; right:max(16px, env(safe-area-inset-right)); bottom:max(16px, env(safe-area-inset-bottom)); display:flex; flex-direction:column; align-items:flex-end; gap:8px; }
-      .wt-v2ex-conversation-toggle, .wt-v2ex-scroll-top { border:1px solid rgba(127,127,127,.4); background:var(--v2ex-background-color,#fff); color:inherit; box-shadow:0 3px 12px rgba(0,0,0,.16); cursor:pointer; }
-      .wt-v2ex-conversation-toggle { min-width:42px; min-height:34px; border-radius:17px; padding:5px 10px; }
+      .wt-v2ex-settings-toggle, .wt-v2ex-scroll-top { border:1px solid rgba(127,127,127,.4); background:var(--v2ex-background-color,#fff); color:inherit; box-shadow:0 3px 12px rgba(0,0,0,.16); cursor:pointer; }
+      .wt-v2ex-settings-toggle { min-width:42px; min-height:34px; border-radius:17px; padding:5px 10px; }
       .wt-v2ex-scroll-top { width:42px; height:42px; border-radius:50%; font-size:20px; line-height:1; }
-      .wt-v2ex-conversation-panel { position:absolute; right:0; bottom:calc(100% + 8px); width:min(320px, calc(100vw - 24px)); max-height:min(70vh, 560px); overflow:auto; display:grid; gap:9px; padding:12px; border:1px solid rgba(127,127,127,.28); border-radius:7px; background:var(--v2ex-background-color,#fff); color:var(--v2ex-text-color,#333); box-shadow:0 5px 20px rgba(0,0,0,.2); }
-      .wt-v2ex-conversation-panel[hidden] { display:none !important; }
-      .wt-v2ex-conversation-panel-title { font-weight:600; }
-      .wt-v2ex-conversation-panel-group { display:flex; flex-wrap:wrap; gap:6px; }
+      .wt-v2ex-settings-panel { position:absolute; right:0; bottom:calc(100% + 8px); box-sizing:border-box; width:min(320px, calc(100vw - 24px)); max-height:min(70vh, 560px); overflow:auto; display:grid; gap:9px; padding:12px; border:1px solid rgba(127,127,127,.28); border-radius:7px; background:var(--v2ex-background-color,#fff); color:var(--v2ex-text-color,#333); box-shadow:0 5px 20px rgba(0,0,0,.2); }
+      .wt-v2ex-settings-panel [hidden], .wt-v2ex-settings-panel[hidden] { display:none !important; }
+      .wt-v2ex-settings-panel fieldset { min-width:0; margin:0; padding:8px; border:1px solid rgba(127,127,127,.25); border-radius:4px; }
+      .wt-v2ex-settings-panel legend { font-weight:600; }
+      .wt-v2ex-settings-panel label { display:flex; align-items:center; gap:6px; min-height:36px; cursor:pointer; }
+      .wt-v2ex-settings-panel input { accent-color:#1677ff; }
+      .wt-v2ex-reply-header > .flex-one-row { flex-wrap:wrap; gap:6px; }
+      .wt-v2ex-reply-header > .flex-one-row > .flex-one-row { flex-wrap:wrap; min-width:0; }
+      .wt-v2ex-reply-header strong { overflow-wrap:anywhere; }
+      .wt-v2ex-settings-panel-group { display:flex; flex-wrap:wrap; gap:6px; }
       .wt-v2ex-panel-action { border:1px solid rgba(127,127,127,.35); border-radius:4px; padding:5px 8px; background:transparent; color:inherit; cursor:pointer; font:inherit; }
       .wt-v2ex-panel-action:hover, .wt-v2ex-panel-action[aria-pressed="true"] { background:rgba(127,127,127,.12); }
       .wt-v2ex-thread-status { color:#666; font-size:12px; }
@@ -2123,10 +2148,10 @@
       .wt-v2ex-child-depth-5 { margin-left:20px; }
       .wt-v2ex-child-depth-6 { margin-left:24px; }
       .wt-v2ex-child-depth-6 .wt-v2ex-child-depth-6 { margin-left:0; padding-left:0; border-left:0; }
-      .wt-v2ex-panel-action:focus-visible, .wt-v2ex-conversation-toggle:focus-visible, .wt-v2ex-scroll-top:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
-      @media (max-width:600px) { .wt-v2ex-control-dock { right:max(10px, env(safe-area-inset-right)); bottom:max(10px, env(safe-area-inset-bottom)); } .wt-v2ex-conversation-panel { max-height:60vh; } .wt-v2ex-threaded-view { width:calc(100vw - 40px); max-width:calc(100vw - 40px); overflow-x:hidden; } .wt-v2ex-threaded-reply { box-sizing:border-box; max-width:100%; min-width:0; overflow:hidden; } .wt-v2ex-threaded-reply table { width:100%; max-width:100%; table-layout:fixed; } .wt-v2ex-threaded-reply .wt-v2ex-reply-header { min-width:0; } .wt-v2ex-threaded-reply .wt-v2ex-native-reply-controls { max-width:100%; } }
-      @media (prefers-color-scheme:dark) { .wt-v2ex-conversation-panel, .wt-v2ex-conversation-toggle, .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); } .wt-v2ex-thread-status { color:#aaa; } }
-      html.night .wt-v2ex-conversation-panel, html.night .wt-v2ex-conversation-toggle, html.night .wt-v2ex-scroll-top, body.night .wt-v2ex-conversation-panel, body.night .wt-v2ex-conversation-toggle, body.night .wt-v2ex-scroll-top, [data-theme="dark"] .wt-v2ex-conversation-panel, [data-theme="dark"] .wt-v2ex-conversation-toggle, [data-theme="dark"] .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); }
+      .wt-v2ex-panel-action:focus-visible, .wt-v2ex-settings-toggle:focus-visible, .wt-v2ex-scroll-top:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
+      @media (max-width:600px) { .wt-v2ex-control-dock { right:max(10px, env(safe-area-inset-right)); bottom:max(10px, env(safe-area-inset-bottom)); } .wt-v2ex-settings-panel { max-height:60vh; } .wt-v2ex-threaded-view { width:calc(100vw - 40px); max-width:calc(100vw - 40px); overflow-x:hidden; } .wt-v2ex-threaded-reply { box-sizing:border-box; max-width:100%; min-width:0; overflow:hidden; } .wt-v2ex-threaded-reply table { width:100%; max-width:100%; table-layout:fixed; } .wt-v2ex-threaded-reply .wt-v2ex-reply-header { min-width:0; } .wt-v2ex-threaded-reply .wt-v2ex-native-reply-controls { max-width:100%; } }
+      @media (prefers-color-scheme:dark) { .wt-v2ex-settings-panel, .wt-v2ex-settings-toggle, .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); } .wt-v2ex-thread-status { color:#aaa; } }
+      html.night .wt-v2ex-settings-panel, html.night .wt-v2ex-settings-toggle, html.night .wt-v2ex-scroll-top, body.night .wt-v2ex-settings-panel, body.night .wt-v2ex-settings-toggle, body.night .wt-v2ex-scroll-top, [data-theme="dark"] .wt-v2ex-settings-panel, [data-theme="dark"] .wt-v2ex-settings-toggle, [data-theme="dark"] .wt-v2ex-scroll-top { background:#202124; color:#e7e7e7; border-color:rgba(255,255,255,.2); }
       @media (prefers-reduced-motion:reduce) { .wt-v2ex-scroll-top { scroll-behavior:auto; } }
     `;
     if (typeof GM_addStyle === 'function') GM_addStyle(css);
@@ -2142,18 +2167,18 @@
   async function initialize() {
     if (!claimInitialization()) return;
     addStyles();
-    registerMenuCommands();
+    ensureSettingsControl();
     initializeImageEnhancement();
-    attachNativeReplyEnhancer();
     observeNavigation();
     try {
       await initializeTopic();
-      if (runtime.topic) createConversationControl(runtime.topic);
+      if (runtime.topic) { runtime.topic.panel = runtime.settingsPanel; updateTopicPanel(runtime.topic); }
     } catch (error) {
       if (runtime.topic) {
         runtime.topic.failed = true;
         applyTopicView(runtime.topic, 'original');
-        createConversationControl(runtime.topic);
+        runtime.topic.panel = runtime.settingsPanel;
+        updateTopicPanel(runtime.topic);
       }
       logError(error);
     }
