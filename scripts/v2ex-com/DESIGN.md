@@ -109,6 +109,18 @@ The rendered `wt-v2ex-native-reply-controls` retains its native Flex or legacy `
 
 Thanks presentation is separate from request state. The count reuses the reply's own `.small.fade` node, including its Flex classes, native heart image and text nodes; numeric updates preserve that structure. The original thanks action and completed markup retain their own classes and native slot. A confirmed new success uses the `感谢已发送` caption verified in the current public bundle. No fallback `感谢` link is generated when a native action is missing. Recovery links and status live separately from the native action group. Controls register in `topic.thanksControls`; event delegation verifies that registry and rejects controls inside reply content. Native IDs/handlers are never copied, and action eligibility is rechecked against the current live source before spending coins.
 
+## Native reply hiding
+
+`nativeIgnoreControl` recognizes only a literal `ignoreReply` call whose real numeric reply ID matches the source cell, outside `.reply_content`. `prepareIgnoreControl` marks the sanitized clone; native handler strings and tokens are never retained on rendered controls. A hide link inside `thank_area` keeps its native location next to the separately replaced thanks action. Unsupported actions are removed. `topic.ignoreControls` registers real rendered nodes, preventing a reply-content class from impersonating an action.
+
+Activation is limited to connected active-page native replies, rechecks identity/token after explicit confirmation, and calls the existing page's `ignoreReply` function once. `runtime.ignoredReplies` is a document-lifetime set keyed by topic/reply, preventing duplicate native calls and preserving display state across redraws/navigation. The cloned own table is suppressed while its children container stays visible. Original mode retains native handlers; explicit native inline-hidden state is imported on view switching. No cross-page write or borrowed permission is introduced.
+
+The native helper posts to `/ignore/reply/<reply-id>?once=<token>` and immediately hides the native cell, without a completion result. This integration preserves that optimistic behavior and does not retry or claim confirmed server persistence. A result-aware adapter is deliberately deferred until reconciliation is required. The existing `unsafeWindow` grant is reused only for this additional fixed native call; no permission or dependency is added.
+
+## Always-visible scroll-to-top
+
+`updateScrollButton` depends only on `scrollTopEnabled`. The button stays visible even at scroll position zero, and disabling the setting hides only that button. The old threshold, scroll-frame state, and scroll listener are removed; click behavior and reduced-motion support are unchanged.
+
 ## Reply thanks adapter
 
 ### Capability and source-page boundary
@@ -173,6 +185,6 @@ Lightbox target preparation adds only missing keyboard/accessibility attributes 
 
 ## Initialization invariants
 
-Initialization is guarded by `document.documentElement.dataset.wtV2exInitialized`. There is one dock, one settings panel/toggle on all matched pages, one threaded container per active topic, one clone reply-action delegation set, one image-delegation set, and one scroll listener. Repeated initialization cannot create another dock, custom reply view, image listener set, or lightbox. On soft navigation, an open lightbox restores scrolling before the old topic/threaded container is cleaned up, then known image content is scanned for the new page.
+Initialization is guarded by `document.documentElement.dataset.wtV2exInitialized`. There is one dock, one settings panel/toggle on all matched pages, one threaded container per active topic, one clone reply-action delegation set, one image-delegation set, and one scroll button without a scroll listener. Repeated initialization cannot create another dock, custom reply view, image listener set, or lightbox. On soft navigation, an open lightbox restores scrolling before the old topic/threaded container is cleaned up, then known image content is scanned for the new page.
 
 Authenticated editor and native reply-action behavior could not be browser-tested in the unauthenticated execution environment. The current public HTML confirmed the Flex reply header, badges, heart count, and `.no` floor structure; authenticated controls in fixtures are synthetic; the authenticated arrow selector set remains defensive and must be rechecked after a V2EX markup change. The script retains defensive selectors, does not claim a native arrow when no reliable template exists, and leaves unmatched native behavior untouched.

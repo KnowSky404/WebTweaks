@@ -2,9 +2,9 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.6.0
-// @description  Threaded cross-page replies with thanks, client-side image previews, and navigation improvements for V2EX.
-// @description:zh-CN 为 V2EX 提供跨页楼中楼、回复感谢、浏览器侧图片预览和返回顶部功能。
+// @version      1.7.0
+// @description  Threaded cross-page replies with native thanks/hiding, image previews, unified settings, and always-visible scroll-to-top for V2EX.
+// @description:zh-CN 为 V2EX 提供跨页楼中楼、原生感谢与隐藏、图片预览、统一设置和常显返回顶部。
 // @author       KnowSky404
 // @match        https://v2ex.com/*
 // @match        https://*.v2ex.com/*
@@ -28,7 +28,6 @@
   const MAX_PAGE_REQUESTS = 3;
   const PAGE_TIMEOUT_MS = 12_000;
   const THANK_TIMEOUT_MS = 12_000;
-  const SCROLL_THRESHOLD = 600;
   const IMAGE_CONTENT_SELECTOR = '.topic_content, .reply_content';
   const IMAGE_EXTENSION_PATTERN = /\.(?:jpe?g|png|gif|webp|avif)$/i;
   const IMAGE_URL_TOKEN_PATTERN = /https?:\/\/[^\s<>"']+/gi;
@@ -64,7 +63,6 @@
     settingsPanel: null,
     panelDismissalAttached: false,
     scrollButton: null,
-    scrollFrame: 0,
     navigationAttached: false,
     navigationSchedule: 0,
     navigationSync: false,
@@ -72,6 +70,7 @@
     observedTopicKey: null,
     thanksRequest: null,
     thanksResults: new Map(),
+    ignoredReplies: new Set(),
     thanksBlockedTokens: new Set(),
     imageDelegationAttached: false,
     imageLightbox: null,
@@ -480,6 +479,31 @@
     return clone;
   }
 
+  function nativeIgnoreControl(root, replyId) {
+    if (!root || !/^[1-9]\d*$/.test(replyId)) return null;
+    for (const action of root.querySelectorAll('a, button, [role="button"]')) {
+      if (action.closest('.reply_content')) continue;
+      for (const name of ['onclick', 'href']) {
+        const match = (action.getAttribute(name) || '').match(/(?:^|[^\w$.])ignoreReply\s*\(\s*(['"]?)([1-9]\d*)\1\s*,\s*(?:'([\w-]+)'|"([\w-]+)"|(\d+))\s*\)/);
+        if (match?.[2] === replyId) return { action, token: match[3] || match[4] || match[5] };
+      }
+    }
+    return null;
+  }
+
+  function ignoreSession() {
+    try { return typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.ignoreReply === 'function' ? unsafeWindow : null; }
+    catch (error) { return null; }
+  }
+
+  function prepareIgnoreControl(action) {
+    action.classList.add('wt-v2ex-ignore-action');
+    action.setAttribute('role', 'button');
+    action.setAttribute('tabindex', '0');
+    if (action.matches('a')) action.setAttribute('href', '#');
+    if (action.matches('button')) action.setAttribute('type', 'button');
+  }
+
   function extractNativeReplyControls(element, base = location.href) {
     const group = nativeReplyGroup(element);
     if (!group) return null;
@@ -488,6 +512,8 @@
     const floor = controls.querySelector('.no');
     const replyId = String(element.id || '').match(/^r_([1-9]\d*)$/)?.[1];
     const area = replyId ? controls.querySelector('[id="thank_area_' + replyId + '"]') : null;
+    const ignore = nativeIgnoreControl(controls, replyId)?.action;
+    if (ignore && !area?.contains(ignore)) prepareIgnoreControl(ignore);
     const thanksSlot = area ? document.createElement('span') : null;
     if (thanksSlot) {
       thanksSlot.className = 'wt-v2ex-native-thank-area-slot';
@@ -506,7 +532,7 @@
       action = actionClone;
     }
     // Retain source spacing/wrappers only around the recognized controls.
-    const retained = [action, floor, thanksSlot].filter(Boolean);
+    const retained = [action, floor, thanksSlot, ignore && controls.contains(ignore) ? ignore : null].filter(Boolean);
     [...controls.querySelectorAll('*')].reverse().forEach((node) => {
       if (!retained.some((control) => control === node || control.contains(node) || node.contains(control))) node.remove();
     });
@@ -548,9 +574,18 @@
 
   function extractNativeThanksPresentation(element, replyId, base = location.href) {
     const { image, area, action } = nativeReplyThanksNodes(element, replyId);
+    const areaClone = area?.cloneNode(true);
+    const ignore = nativeIgnoreControl(areaClone, replyId)?.action;
+    if (ignore) prepareIgnoreControl(ignore);
+    const thank = action && [...areaClone.querySelectorAll('a, button, [role="button"]')].find((node) =>
+      node.getAttribute('onclick') === action.getAttribute('onclick') && node.getAttribute('href') === action.getAttribute('href'));
+    thank?.classList.add('wt-v2ex-native-thanks-slot');
+    areaClone?.querySelectorAll('a, button, [role="button"]').forEach((node) => {
+      if (node !== ignore && node !== thank) node.remove();
+    });
     return {
       count: image ? sanitizeNativeControlNode(image.parentElement, base, true) : null,
-      area: area ? sanitizeNativeControlNode(area, base, true) : null,
+      area: areaClone ? sanitizeNativeControlNode(areaClone, base, true) : null,
       action: action ? sanitizeNativeControlNode(action, base, true) : null
     };
   }
@@ -667,7 +702,7 @@
     area.classList.toggle('thanked', state.thanked);
     const completed = area.querySelector('.wt-v2ex-thank-completed');
     completed.hidden = !state.thanked;
-    area.hidden = action.hidden && !state.thanked;
+    area.hidden = action.hidden && !state.thanked && !area.querySelector('.wt-v2ex-ignore-action:not([hidden])');
     area.tabIndex = area.hidden || state.thanked ? -1 : 0;
   }
 
@@ -675,7 +710,8 @@
     if (!reply.thanks) return null;
     reconcileThanks(topic, reply);
     if (reply.thanks.count === null && !reply.thanks.canThank && !reply.thanks.thanked
-      && reply.thanks.phase === 'idle' && !reply.thanks.message) return null;
+      && reply.thanks.phase === 'idle' && !reply.thanks.message
+      && !reply.nativeThanksPresentation?.area?.querySelector('.wt-v2ex-ignore-action')) return null;
     const presentation = reply.nativeThanksPresentation;
     const count = presentation?.count?.cloneNode(true) || document.createElement('span');
     count.classList.add('wt-v2ex-thank-count');
@@ -717,7 +753,10 @@
     const recovery = document.createElement('span');
     recovery.className = 'wt-v2ex-thank-recovery';
     recovery.append(check, ' ', source);
-    area.replaceChildren(action, completed);
+    const thankSlot = area.querySelector('.wt-v2ex-native-thanks-slot');
+    if (presentation?.area?.classList.contains('thanked')) area.replaceChildren(action, completed);
+    else if (thankSlot) thankSlot.replaceWith(action, completed);
+    else area.append(action, completed);
     const areaSlot = controls?.querySelector('.wt-v2ex-native-thank-area-slot');
     if (areaSlot) areaSlot.replaceWith(area);
     else header.append(area);
@@ -816,6 +855,7 @@
         if (becameThanked) void refreshReplyThanks(topic, reply);
       }
     });
+    updateIgnoreControls(topic);
     updateThanksViews(topic);
   }
 
@@ -964,7 +1004,9 @@
     if (!area.hasAttribute('tabindex')) area.tabIndex = -1;
     // Native links are hidden until the area is hovered; focus reveals them too.
     area.focus({ preventScroll: true });
-    area.querySelector('a, button')?.focus({ preventScroll: true });
+    const cell = area.closest('.cell[id^="r_"]');
+    const replyId = cell?.id.match(/^r_([1-9]\d*)$/)?.[1];
+    if (cell && replyId) nativeReplyThanksNodes(cell, replyId).action?.focus({ preventScroll: true });
   }
 
   function showNativeThanks(topic, reply) {
@@ -1392,7 +1434,19 @@
       if (controlsSlot) controlsSlot.replaceWith(controls);
       else header.prepend(controls);
     }
-    if (topic) createThanksControl(topic, reply, header, controls);
+    if (topic) {
+      createThanksControl(topic, reply, header, controls);
+      header.querySelectorAll('.wt-v2ex-ignore-action').forEach((action) => {
+        const native = nativeThanksReply(topic, reply);
+        if (reply.page !== topic.currentPage || !nativeIgnoreControl(native, reply.id) || !ignoreSession()) action.remove();
+        else topic.ignoreControls.set(action, reply.id);
+      });
+      if (reply.thanks) updateThanksControl(topic, reply, header);
+      if (runtime.ignoredReplies.has(topic.context.id + ':' + reply.id)) {
+        cell.classList.add('wt-v2ex-ignored-reply');
+        cell.removeAttribute('aria-label');
+      }
+    }
     const relation = relationshipLabel(reply);
     if (relation) {
       const badge = document.createElement('span');
@@ -1439,6 +1493,7 @@
     const scrollAnchor = captureThreadedScrollAnchor(topic);
     topic.thanksControls = new Map();
     topic.threadedView.replaceChildren();
+    topic.ignoreControls = new Map();
     const fragment = document.createDocumentFragment();
     const visibleThread = topic.visibleThread || deriveVisibleThread(topic);
     const stack = [...visibleThread.roots].reverse().map((reply) => ({ reply, target: fragment, depth: 0 }));
@@ -1468,6 +1523,42 @@
     }
   }
 
+  function updateIgnoreControls(topic) {
+    topic.ignoreControls?.forEach((replyId, action) => {
+      const cell = topic.nativeReplies.find((node) => node.id === 'r_' + replyId && node.isConnected);
+      action.hidden = !nativeIgnoreControl(cell, replyId) || !ignoreSession();
+    });
+  }
+
+  function activateIgnore(topic, event) {
+    if (!isCurrentTopic(topic) || !(event.target instanceof Element)) return;
+    const action = event.target.closest('.wt-v2ex-ignore-action');
+    const replyId = topic.ignoreControls?.get(action);
+    if (!replyId || !topic.threadedView.contains(action) || action.hidden) return;
+    if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    const key = topic.context.id + ':' + replyId;
+    if (runtime.ignoredReplies.has(key)) return;
+    const cell = topic.nativeReplies.find((node) => node.id === 'r_' + replyId && node.isConnected);
+    const native = nativeIgnoreControl(cell, replyId);
+    const page = ignoreSession();
+    if (!native || !page) return;
+    if (!window.confirm('确定隐藏这条回复吗？')) return;
+    const current = nativeIgnoreControl(cell, replyId);
+    if (!isCurrentTopic(topic) || !cell.isConnected || !current || current.action !== native.action
+      || current.token !== native.token || runtime.ignoredReplies.has(key)) return;
+    const restoreFocus = action.contains(document.activeElement);
+    runtime.ignoredReplies.add(key);
+    // shortcut: native ignoreReply exposes no result; add a result-aware adapter if server reconciliation is needed.
+    try { page.ignoreReply(replyId, current.token); }
+    catch (error) { logError(new Error('原生隐藏操作结果未确认')); }
+    const card = action.closest('.wt-v2ex-threaded-reply');
+    card.classList.add('wt-v2ex-ignored-reply');
+    card.removeAttribute('aria-label');
+    cell.classList.add('wt-v2ex-native-ignored');
+    if (restoreFocus) runtime.settingsToggle?.focus({ preventScroll: true });
+  }
+
   function applyTopicView(topic, view) {
     if (topic.thanksObserver) synchronizeNativeThanks(topic);
     const targetId = !topic.thanksTargetHandled && location.hash?.match(/^#wt-v2ex-thank-([1-9]\d*)$/)?.[1];
@@ -1480,7 +1571,15 @@
     topic.view = view;
     topic.threadedView.hidden = view !== 'threaded';
     topic.threadedView.setAttribute('aria-hidden', String(view !== 'threaded'));
+    const clonesById = new Map([...topic.threadedView.querySelectorAll('[data-wt-v2ex-reply-id]')]
+      .map((node) => [node.dataset.wtV2exReplyId, node]));
     topic.nativeReplies.forEach((reply) => {
+      const key = topic.context.id + ':' + reply.id.slice(2);
+      if (reply.style?.display === 'none' || reply.hidden) runtime.ignoredReplies.add(key);
+      const ignored = runtime.ignoredReplies.has(key);
+      reply.classList.toggle('wt-v2ex-native-ignored', ignored);
+      const clone = clonesById.get(reply.id.slice(2));
+      if (ignored && clone) { clone.classList.add('wt-v2ex-ignored-reply'); clone.removeAttribute('aria-label'); }
       const hidden = view === 'threaded';
       reply.classList.toggle('wt-v2ex-native-hidden', hidden);
       if (hidden) reply.setAttribute('aria-hidden', 'true');
@@ -1627,6 +1726,8 @@
     topic.threadedView.addEventListener('keydown', activateThreadedReply);
     topic.threadedView.addEventListener('click', (event) => activateThanks(topic, event));
     topic.threadedView.addEventListener('keydown', (event) => activateThanks(topic, event));
+    topic.threadedView.addEventListener('click', (event) => activateIgnore(topic, event));
+    topic.threadedView.addEventListener('keydown', (event) => activateIgnore(topic, event));
   }
 
   function resetSettingsTopic() {
@@ -2073,7 +2174,7 @@
 
   function updateScrollButton() {
     if (!runtime.scrollButton) return;
-    runtime.scrollButton.hidden = !runtime.settings.scrollTopEnabled || window.scrollY < SCROLL_THRESHOLD;
+    runtime.scrollButton.hidden = !runtime.settings.scrollTopEnabled;
   }
 
   function initializeScrollToTop() {
@@ -2091,13 +2192,6 @@
     });
     dock.append(button);
     runtime.scrollButton = button;
-    window.addEventListener('scroll', () => {
-      if (runtime.scrollFrame) return;
-      runtime.scrollFrame = requestAnimationFrame(() => {
-        runtime.scrollFrame = 0;
-        updateScrollButton();
-      });
-    }, { passive: true });
     updateScrollButton();
   }
 
@@ -2124,6 +2218,10 @@
       #Main .cell[id^="r_"].wt-v2ex-native-hidden, #Wrapper .cell[id^="r_"].wt-v2ex-native-hidden { display:none !important; }
       .wt-v2ex-threaded-reply { position:relative; }
       .wt-v2ex-threaded-reply > table { table-layout:fixed; }
+      .wt-v2ex-native-ignored { display:none !important; }
+      .wt-v2ex-ignored-reply { padding:0; border:0; }
+      .wt-v2ex-ignored-reply > :not(.wt-v2ex-thread-children) { display:none; }
+      .wt-v2ex-ignore-action:focus-visible { outline:2px solid #1677ff; outline-offset:2px; }
       .wt-v2ex-thanks [hidden] { display:none !important; }
       .wt-v2ex-thank-area:focus-within > a, .wt-v2ex-thanks-focus:focus-within > a { visibility:visible; }
       @media (hover:none) { .wt-v2ex-thank-area > a { visibility:visible; } }

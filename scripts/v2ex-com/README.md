@@ -38,7 +38,7 @@ New native replies are merged by ID and projected into the existing hierarchy. A
 
 ### Reply thanks
 
-Version 1.6.0 preserves V2EX's native presentation and spacing: each reply's sanitized `.small.fade` count and original heart `img` retain their source position, and the action/completed state use `thank_area`, `a.thank`, and `thanked` with the page's own styling. Hidden recovery controls add no extra whitespace to the normal thanks action. The cloned outer reply table also retains V2EX's fixed layout, whose native selector requires an `r_` ID that clones intentionally omit. Completion displays **感谢已发送**. No emoji replacement or custom button decoration is added; Flex headers wrap only when needed within indented/narrow replies; keyboard and touch support only adapt visibility and activation. An unreadable count remains unknown rather than becoming zero. A positive total count does not mean that the current user has already thanked the reply.
+Version 1.7.0 preserves V2EX's native presentation and spacing: each reply's sanitized `.small.fade` count and original heart `img` retain their source position, and the action/completed state use `thank_area`, `a.thank`, and `thanked` with the page's own styling. Hidden recovery controls add no extra whitespace to the normal thanks action. The cloned outer reply table also retains V2EX's fixed layout, whose native selector requires an `r_` ID that clones intentionally omit. Completion displays **感谢已发送**. No emoji replacement or custom button decoration is added; Flex headers wrap only when needed within indented/narrow replies; keyboard and touch support only adapt visibility and activation. An unreadable count remains unknown rather than becoming zero. A positive total count does not mean that the current user has already thanked the reply.
 
 Direct thanks is limited to replies on the active native page. The script requires a matching native `thank_area_<reply-id>` control, the page's native thanks capability, and a valid current request token. It asks for confirmation before sending: [V2EX charges 10 copper coins for thanking a reply](https://www.v2ex.com/help/currency). Cancelling sends nothing. A confirmed action makes one same-origin request for that real reply ID; the script does not use floor numbers as request IDs or automatically retry a write.
 
@@ -47,6 +47,12 @@ Successful responses update the threaded model and corresponding native thanks a
 Cross-page ancestors retain their own count and already-thanked state. When the ancestor's source markup exposes a valid thanks action, **到原页感谢** opens its actual source page, selects the native view, and locates/focuses the target reply's control, including topics over 10 pages. Background page loading preserves that choice until the user explicitly switches views. This version does not send thanks for cross-page ancestors in place. Anonymous pages, the user's own replies, and unmatched markup do not acquire a fabricated action. If the active page's bridge or token is unavailable, use the native view instead.
 
 Thanks state survives threaded redraws and is synchronized when switching views. Only one enhanced thanks write runs at a time. Confirmed and uncertain results are remembered for the specific topic/reply during this document's lifetime, including soft navigation back to that reply; a late failure cannot undo confirmed thanks, and old responses do not overwrite the new page's token or unrelated native controls. This does not prevent an independent native-page action from running concurrently. Controls remain available to keyboard and touch users without requiring hover.
+
+### Hide replies
+
+Version 1.7.0 restores V2EX's native **隐藏** control when the active-page reply itself exposes a recognized `ignoreReply(replyId, token)` action. Both standalone controls and hide links sharing a native thanks area are supported. Clones keep the original caption/classes while stripping inline handlers and tokens. Activation asks for confirmation, then rechecks the live reply ID, token, action identity, page lifecycle, and native page capability before calling V2EX's own helper once. Cancelled, stale, duplicate, unrecognized, or unavailable actions send nothing. Cross-page ancestors and replies without their own capability do not gain a hide action.
+
+Hiding suppresses the selected reply's own header/content in both views and retains its child discussion. Hidden state survives redraws and soft navigation for this document. Original-view hiding remains native and is reflected when switching views. V2EX's helper hides optimistically and exposes no server result; WebTweaks does not claim server confirmation or retry automatically. Account persistence after reload depends on V2EX accepting its native request.
 
 ### Reply prefixes
 
@@ -66,7 +72,7 @@ Images are loaded directly from the original image host. WebTweaks does not trac
 
 ### Scroll to top
 
-The shared lower-right dock contains `设置` and the independent `↑` button. Scroll-to-top appears after approximately 600 pixels, uses a passive, animation-frame-throttled listener, and respects reduced motion. The **页面工具 → 返回顶部** switch applies immediately. Disabling it leaves settings accessible on topic and non-topic pages.
+The shared lower-right dock contains `设置` and the independent `↑` button. When enabled, scroll-to-top stays visible at every scroll position, including the page top, and respects reduced motion. It needs no scroll listener or visibility threshold. The **页面工具 → 返回顶部** switch applies immediately. Disabling it leaves settings accessible on topic and non-topic pages.
 
 ## Settings and permissions
 
@@ -77,7 +83,7 @@ The following versioned settings are stored through the userscript manager only:
 - automatic comment image preview enabled state;
 - image lightbox enabled state.
 
-The panel reuses the existing `wt-v2ex-settings` GM storage and version-3 keys without resetting preferences. Feature menu commands and the unused `GM_registerMenuCommand` grant have been removed. The panel's open/closed state is not persisted. The metadata grants are `GM_addStyle`, the manager value APIs, and `unsafeWindow`. The last permission is used narrowly to check the page's native thanks capability, read/update its live `once` request token, and refresh the native balance after success. The token is used only for the current V2EX origin and is never persisted or logged. The script has no `@require`, telemetry, remote configuration, or cross-origin request permission. Updating to version 1.5.0 may require accepting this added page-context permission in the userscript manager.
+The panel reuses the existing `wt-v2ex-settings` GM storage and version-3 keys without resetting preferences. Feature menu commands and the unused `GM_registerMenuCommand` grant have been removed. The panel's open/closed state is not persisted. The metadata grants are `GM_addStyle`, the manager value APIs, and `unsafeWindow`. The last permission is used narrowly for the native thanks bridge/token/balance and to invoke `ignoreReply` with the current reply’s own live token. Ignore tokens are neither copied into rendered clones nor persisted. The token is used only for the current V2EX origin and is never persisted or logged. The script has no `@require`, telemetry, remote configuration, or cross-origin request permission. Updating to version 1.5.0 may require accepting this added page-context permission in the userscript manager.
 
 ## Maintainer validation
 
@@ -114,3 +120,5 @@ Fixture results are separate from authenticated V2EX verification. Real signed-i
 回复或主题正文中的 HTTP(S) 图片链接会在浏览器侧自动展开，支持 JPG、JPEG、PNG、GIF、WebP 和 AVIF；原始链接与 V2EX 服务端内容不会被修改。点击正文图片可打开全屏预览，Escape、关闭按钮或点击遮罩空白处可以关闭，按住 Ctrl/Cmd/Shift/Alt 点击时保留浏览器原行为。图片直接由原始图片站点加载，WebTweaks 不跟踪查看记录。
 
 所有匹配页面右下角统一使用“设置”入口，面板默认关闭；Escape、点击外部或主题导航均可关闭，Escape 会把焦点还给设置按钮。主题页的“会话视图”提供互斥的“楼中楼 / 原始顺序”、分页加载状态与手动加载按钮；非主题页隐藏不可用的会话操作。“图片增强”包含“评论图片自动展开 / 图片点击放大”，“页面工具”包含“返回顶部”，均即时生效并沿用原有 GM 偏好。关闭返回顶部仍可打开设置，不再提供重复的脚本菜单开关。异步提交后新增或整体刷新回复列表时，会按当前分页更新线程，不接管提交或生成虚构回复。
+
+1.7.0 恢复回复旁边原生的“隐藏”：只对当前页具有自身原生入口的回复开放，确认后调用网站原生功能；取消不发送，隐藏父回复时保留其下的讨论。隐藏状态在本次文档的重绘和软导航中保留，但原生接口不返回服务端结果，刷新后是否持久生效取决于网站请求是否成功。返回顶部开启后始终展示，位于页首也不再自动隐藏；仍可在设置中关闭。
