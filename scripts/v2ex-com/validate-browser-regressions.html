@@ -637,6 +637,18 @@
           ownHide.setAttribute('onclick', ownHandler);
           selectView('original'); ownHide.click(); selectView('threaded');
           check(getComputedStyle(card('215').querySelector('table')).display === 'none', 'native original-view hiding did not synchronize');
+          state.replies.get('102').ignored = true;
+          const previousHiddenParent = card('201');
+          const hiddenReplacement = document.createElement('div');
+          hiddenReplacement.innerHTML = renderPage(2);
+          hiddenReplacement.querySelector('#r_201').hidden = true;
+          hiddenReplacement.querySelector('#r_201').classList.add('wt-v2ex-native-ignored', 'wt-v2ex-native-hidden');
+          document.querySelector('#topic-replies').replaceChildren(...hiddenReplacement.querySelector('#topic-replies').childNodes);
+          await waitFor(() => card('201') && card('201') !== previousHiddenParent && card('212') && !document.querySelector('.wt-v2ex-threaded-view').hidden, 'hidden parent list rebuild did not finish');
+          check(!card('201').hasAttribute('hidden') && !card('201').hasAttribute('style') && !card('201').classList.contains('wt-v2ex-native-ignored') && !card('201').classList.contains('wt-v2ex-native-hidden'), 'rebuilt clone kept native whole-card hiding state');
+          check(getComputedStyle(card('201')).display !== 'none' && getComputedStyle(card('201').querySelector('table')).display === 'none' && card('212').getBoundingClientRect().height > 0, 'rebuilding a hidden parent hid its child discussion');
+          await waitFor(() => card('102') && card('202'), 'hidden ancestor was not loaded');
+          check(getComputedStyle(card('102').querySelector('table')).display === 'none' && card('202').getBoundingClientRect().height > 0, 'parsed hidden ancestor revived its own content or hid active-page children');
           record('原生隐藏支持 Flex/旧布局/仅隐藏区域，确认取消、实时身份、防重复及子讨论保留正确', true);
 
           const scrollSetting = document.querySelector('[data-setting="scrollTopEnabled"]');
