@@ -207,6 +207,11 @@ class FakeElement {
     return this.querySelectorAll(selector)[0] || null;
   }
 
+  closest(selector) {
+    for (let node = this; node; node = node.parentElement) if (node.matches(selector)) return node;
+    return null;
+  }
+
   contains(candidate) {
     return candidate === this || this.children.some((child) => child.contains(candidate));
   }
@@ -241,6 +246,7 @@ class FakeNativeReply extends FakeElement {
     this.time = new FakeElement('span');
     this.time.classList.add('ago');
     this.time.textContent = 'now';
+    this.append(this.floor, this.author, this.time, this.content);
   }
 
   querySelectorAll(selector) {
@@ -287,6 +293,8 @@ class FakeDocument {
   createElement(tagName) {
     return new FakeElement(tagName);
   }
+
+  createTreeWalker() { return { nextNode() { return null; } }; }
 
   createDocumentFragment() {
     return new FakeDocumentFragment();
@@ -366,6 +374,7 @@ const sandbox = {
   Element: FakeElement,
   Document: FakeDocument,
   HTMLImageElement: FakeImageElement,
+  NodeFilter: { SHOW_TEXT: 4 },
   Event: FakeEvent
 };
 sandbox.globalThis = sandbox;

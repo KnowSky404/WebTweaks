@@ -12,6 +12,10 @@
     #fixture-results li[data-state="fail"] { color: #9b2c2c; }
     .cell { padding: 10px; font-size: 14px; line-height: 150%; text-align: left; border-bottom: 1px solid #ddd; }
     /* Native V2EX declarations; the surrounding fixture layout remains local. */
+    .flex-one-row { display:flex; justify-content:space-between; align-items:center; }
+    .gap10 { gap:10px; }
+    .gap5 { gap:5px; }
+    .badges { display:flex; gap:4px; }
     .fr { float: right; text-align: right; }
     .cell[id^="r_"] > table { table-layout: fixed; }
     .sep3 { height: 3px; }
@@ -77,14 +81,20 @@
       const replyHtml = (reply) => {
         // Public HTML confirms the count markup. Authenticated actions are synthetic.
         const area = reply.canThank === false ? '' : `<span id="thank_area_${reply.id}" class="thank_area${reply.thanked ? ' thanked' : ''}">${reply.thanked ? '感谢已发送' : `<a class="thank" href="#" onclick="if (confirm('发送感谢？')) { thankReply(${reply.id}); } return false;">感谢</a>`}</span>`;
-        const arrow = `<a class="reply" href="#reply"><img src="${replyAsset}" alt="Reply" width="20" align="absmiddle" border="0"></a>`;
-        const count = reply.count === null || reply.count === 0 ? '' : `<span class="small fade"><img src="${heartAsset}" width="14" align="absmiddle" alt="❤️"> ${reply.count}</span>`;
+        const arrow = reply.id === '210' ? '' : reply.id === '211' ? '<a class="reply" href="#reply">原生回复</a>' : `<a class="reply" href="#reply"><img src="${replyAsset}" alt="Reply" width="20" align="absmiddle" border="0"></a>`;
+        const count = reply.count === null || reply.count === 0 ? '' : `<span class="small fade flex-one-row gap5"><img src="${heartAsset}" width="14" align="absmiddle" alt="❤️"> ${reply.count}</span>`;
         const actions = `${area} &nbsp; ${arrow} &nbsp; &nbsp; <span class="no">${reply.floor}</span>`;
         const controls = reply.id === '205' ? `<span class="fixture-native-wrapper">${actions}</span>` : actions;
-        return `<div id="r_${reply.id}" class="cell"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tbody><tr><td width="48" valign="top" align="center"></td><td width="10" valign="top"></td><td width="auto" valign="top" align="left"><div class="fr">${controls}</div><div class="sep3"></div><strong><a class="dark" href="/member/${escapeHtml(reply.author.toLowerCase())}">${escapeHtml(reply.author)}</a></strong> <span class="ago" title="fixture page ${reply.page}">fixture</span> &nbsp; &nbsp; ${count}<div class="sep5"></div><div class="reply_content">${reply.content}</div></td></tr></tbody></table></div>`;
+        const author = `<strong><a class="dark" href="/member/${escapeHtml(reply.author.toLowerCase())}">${escapeHtml(reply.author)}</a></strong>`;
+        const time = `<span class="ago" title="fixture page ${reply.page}">fixture</span>`;
+        // Flex scaffold copied from public HTML on 2026-11-13; authenticated actions remain synthetic.
+        const header = reply.id === '205'
+          ? `<div class="fr">${controls}</div><div class="sep3"></div>${author} ${time} &nbsp; &nbsp; ${count}`
+          : `<div class="flex-one-row"><div class="flex-one-row gap10">${author}<div class="badges"><span class="badge">PRO</span></div>${time}${count}</div><div class="flex-one-row gap10">${reply.id === '206' ? `<span class="fixture-flex-wrapper">${area}${arrow}</span>` : area + arrow}<span class="no">${reply.floor}</span></div></div>`;
+        return `<div id="r_${reply.id}" class="cell"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tbody><tr><td width="48" valign="top" align="center"><img class="avatar" alt="fixture avatar" width="48" height="48"></td><td width="10" valign="top"></td><td width="auto" valign="top" align="left">${header}<div class="sep5"></div><div class="reply_content">${reply.content}</div></td></tr></tbody></table></div>`;
       };
       // Matches the inspected native topic HTML, including the first-page ?p=1 link.
-      const renderPage = (page) => `<div class="cell ps_container">${[1, 2].map((number) => number === page ? `<span class="page_current">${number}</span>` : `<a class="page_normal" href="?p=${number}">${number}</a>`).join(' ')}<input class="page_input" max="${state.maxPage}"></div>${[...state.replies.values()].filter((reply) => reply.page === page).map(replyHtml).join('')}`;
+      const renderPage = (page) => `<div id="topic-replies"><div class="box"><div class="cell ps_container">${[1, 2].map((number) => number === page ? `<span class="page_current">${number}</span>` : `<a class="page_normal" href="?p=${number}">${number}</a>`).join(' ')}<input class="page_input" max="${state.maxPage}"></div>${[...state.replies.values()].filter((reply) => reply.page === page).map(replyHtml).join('')}</div></div>`;
       const reset = () => {
         state.replies = new Map(definitions.map((reply) => [reply.id, { ...reply, thanked: Boolean(reply.thanked) }]));
         state.modes.clear();
@@ -101,8 +111,8 @@
           reply.count = (reply.count || 0) + 1;
         }
       };
-      window.GM_getValue = (_key, fallback) => fallback;
-      window.GM_setValue = () => {};
+      window.GM_getValue = (key, fallback) => JSON.parse(localStorage.getItem(key) || 'null') || fallback;
+      window.GM_setValue = (key, value) => localStorage.setItem(key, JSON.stringify(value));
       window.GM_addStyle = (css) => {
         const style = document.createElement('style');
         style.textContent = css;
@@ -195,7 +205,10 @@
       };
       const card = (id) => document.querySelector(`.wt-v2ex-threaded-view [data-wt-v2ex-reply-id="${id}"]`);
       const action = (id) => card(id)?.querySelector(`.wt-v2ex-thank-action[data-reply-id="${id}"]`);
-      const status = (id) => card(id)?.querySelector('.wt-v2ex-thank-status')?.textContent || '';
+      const status = (id) => {
+        const completed = card(id)?.querySelector('.wt-v2ex-thank-completed');
+        return completed && !completed.hidden ? completed.textContent : card(id)?.querySelector('.wt-v2ex-thank-status')?.textContent || '';
+      };
       const disabled = (node) => !node || node.disabled || node.getAttribute('aria-disabled') === 'true';
       const actionable = (id) => Boolean(action(id) && !action(id).hidden && !disabled(action(id)));
       const checkAction = (id) => {
@@ -212,8 +225,8 @@
         await waitFor(() => document.querySelector('.wt-v2ex-threaded-view') && card(page === 1 ? '101' : '201'), `page ${page} did not initialize`);
       };
       const selectView = (view) => {
-        const panel = document.querySelector('.wt-v2ex-conversation-panel');
-        if (panel?.hidden) document.querySelector('.wt-v2ex-conversation-toggle')?.click();
+        const panel = document.querySelector('.wt-v2ex-settings-panel');
+        if (panel?.hidden) document.querySelector('.wt-v2ex-settings-toggle')?.click();
         const button = document.querySelector(`[data-view="${view}"]`);
         check(button, `view button missing: ${view}`);
         button.click();
@@ -222,14 +235,14 @@
         await waitFor(() => nativeThanked(id) && !actionable(id) && status(id).trim() === '感谢已发送', `reply ${id} did not synchronize its confirmed thanked state`);
       };
       const presentation = (root, threaded) => {
-        const group = root.querySelector('.fr');
+        const group = root.querySelector(threaded ? '.wt-v2ex-native-reply-controls' : 'td[width="auto"] > .flex-one-row > .flex-one-row:last-child, .fr');
         const area = group.querySelector('.thank_area');
         const action = area.querySelector('a.thank');
         const arrow = group.querySelector('img[alt="Reply"]');
         const floor = group.querySelector('.no');
         const count = root.querySelector(threaded ? '.wt-v2ex-thank-count' : '.small.fade');
         const selectors = [group, area, action, arrow, floor, count, count.querySelector('img')];
-        const properties = ['display', 'float', 'textAlign', 'fontFamily', 'fontSize', 'fontWeight', 'lineHeight', 'color', 'backgroundColor', 'borderRadius', 'padding', 'verticalAlign'];
+        const properties = ['display', 'gap', 'alignItems', 'justifyContent', 'float', 'textAlign', 'fontFamily', 'fontSize', 'fontWeight', 'lineHeight', 'color', 'backgroundColor', 'borderRadius', 'padding', 'verticalAlign'];
         const styles = selectors.map((node) => {
           const style = getComputedStyle(node);
           return Object.fromEntries(properties.map((property) => [property, style[property]]));
@@ -274,7 +287,7 @@
           for (let index = 0; index < 3; index += 1) {
             selectView('original');
             check(document.querySelector('.wt-v2ex-threaded-view').hidden, 'threaded view remained visible in original mode');
-            check([...document.querySelectorAll('#Main > .cell[id^="r_"]')].every((node) => !node.classList.contains('wt-v2ex-native-hidden') && !node.hasAttribute('aria-hidden')), 'native replies were not fully restored');
+            check([...document.querySelectorAll('#Main .cell[id^="r_"]')].every((node) => !node.classList.contains('wt-v2ex-native-hidden') && !node.hasAttribute('aria-hidden')), 'native replies were not fully restored');
             selectView('threaded');
             check(!document.querySelector('.wt-v2ex-threaded-view').hidden, 'threaded view did not become visible');
             check(document.querySelectorAll('.wt-v2ex-threaded-view [data-wt-v2ex-reply-id]').length === threadedIds.length, 'view switching duplicated or removed threaded replies');
@@ -289,10 +302,19 @@
           check(JSON.stringify(nativePresentation.styles) === JSON.stringify(threadedPresentation.styles), 'thanks/count/reply/floor computed styles differ from the native view');
           check(JSON.stringify(nativePresentation.assets) === JSON.stringify(threadedPresentation.assets), 'native control image attributes were changed');
           for (const key of ['sizes', 'gaps']) {
-            const expected = nativePresentation[key].flat();
-            const actual = threadedPresentation[key].flat();
+            // At 320px the native action text compresses onto two lines; clones wrap the header instead.
+            const compared = key === 'sizes' && innerWidth < 360 ? (items) => items.slice(2).flat() : (items) => items.flat();
+            const expected = compared(nativePresentation[key]);
+            const actual = compared(threadedPresentation[key]);
             check(expected.every((value, index) => Math.abs(value - actual[index]) < 0.1), `native control ${key} changed: ${JSON.stringify(expected)} -> ${JSON.stringify(actual)}`);
           }
+          check(!card('201').querySelector('.fr'), 'Flex reply gained a fabricated legacy toolbar');
+          check(card('201').querySelector('.badges .badge')?.textContent === 'PRO', 'membership badge lost');
+          check(card('210').querySelectorAll('.no').length === 1 && !card('210').querySelector('.wt-v2ex-native-reply-action'), 'unrecognized action fabricated or floor lost');
+          check(card('102').querySelector('.no')?.textContent === '2', 'ancestor floor lost');
+          const floorRect = card('201').querySelector('.no').getBoundingClientRect();
+          const cardRect = card('201').getBoundingClientRect();
+          check(floorRect.left >= cardRect.left && floorRect.right <= cardRect.right, 'native floor clipped on narrow layout');
           check(card('205').querySelector('.fixture-native-wrapper .wt-v2ex-thank-area'), 'native action wrapper/order was discarded');
           check(card('204').querySelector('.reply_content .small.fade')?.textContent === 'content metadata', 'header cleanup removed similarly styled reply content');
           check(card('202').closest('.wt-v2ex-thread-children')?.parentElement === card('102'), 'native presentation restoration flattened the thread');
@@ -301,6 +323,14 @@
           const editor = document.querySelector('#reply_content');
           card('201').querySelector('.wt-v2ex-native-reply-action').click();
           check(editor.value === '@D #101 ' && document.activeElement === editor, 'preserved reply arrow did not insert and focus the expected reply prefix');
+          editor.value = 'before after';
+          editor.setSelectionRange(7, 7);
+          let inputs = 0;
+          editor.addEventListener('input', () => { inputs += 1; }, { once: true });
+          card('211').querySelector('.wt-v2ex-native-reply-action').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+          check(editor.value === 'before @M #111 after' && inputs === 1 && editor.selectionStart === 15, 'native text action lost selection or duplicated input');
+          check(card('211').querySelector('.wt-v2ex-native-reply-action').textContent === '原生回复', 'native text action was replaced');
+          check(card('206').querySelector('.fixture-flex-wrapper .wt-v2ex-thank-action'), 'nested Flex action wrapper lost');
           editor.value = '';
           record('保留的原生回复箭头仍插入准确的用户及楼层前缀', true);
 
@@ -432,8 +462,99 @@
           check(state.calls.filter((call) => call.method === 'GET').length === readsBeforeLargeTopic, 'a large topic fetched pages before explicit activation');
           selectView('threaded');
           check(!document.querySelector('.wt-v2ex-threaded-view').hidden, 'large-topic source landing trapped explicit threaded selection');
-          check([...document.querySelectorAll('#Main > .cell[id^="r_"]')].every((node) => node.classList.contains('wt-v2ex-native-hidden')), 'large-topic explicit threaded selection duplicated visible native replies');
+          check([...document.querySelectorAll('#Main .cell[id^="r_"]')].every((node) => node.classList.contains('wt-v2ex-native-hidden')), 'large-topic explicit threaded selection duplicated visible native replies');
           record('超过 10 页的原页感谢落地无需加载即可定位，且保持单一可见视图', true);
+
+          state.maxPage = 2;
+          await goToPage(2, 30);
+          await waitFor(() => card('102'), 'async test ancestor did not load');
+          selectView('threaded');
+          const panel = document.querySelector('.wt-v2ex-settings-panel');
+          const toggle = document.querySelector('.wt-v2ex-settings-toggle');
+          check(document.querySelectorAll('.wt-v2ex-settings-toggle').length === 1, 'settings entry duplicated');
+          check(!document.querySelector('.wt-v2ex-conversation-toggle'), 'old conversation shortcut survived');
+          check(panel.hidden === false && toggle.getAttribute('aria-expanded') === 'true', 'settings did not open');
+          const feature = (key) => panel.querySelector(`[data-setting="${key}"]`);
+          const setFeature = (key, enabled) => { const input = feature(key); if (input.checked !== enabled) input.click(); };
+          check(feature('scrollTopEnabled').checked === JSON.parse(localStorage.getItem('wt-v2ex-settings')).scrollTopEnabled, 'stored preference was not reflected');
+          const content = document.querySelector('#r_201 .reply_content');
+          content.insertAdjacentHTML('beforeend', '<a id="fixture-image-link" href="https://images.example/fixture.png">fixture image</a><img id="fixture-existing-image" src="https://images.example/existing.png" alt="existing">');
+          setFeature('imagePreviewEnabled', false);
+          setFeature('imagePreviewEnabled', true);
+          check(content.querySelectorAll('.wt-v2ex-inline-image').length === 1, 'preview did not enable immediately');
+          setFeature('imagePreviewEnabled', false);
+          check(!document.querySelector('.wt-v2ex-inline-image') && document.querySelector('#fixture-image-link'), 'preview disabling damaged the link or left images');
+          setFeature('imagePreviewEnabled', true);
+          setFeature('imageLightboxEnabled', false);
+          check(!content.querySelector('.wt-v2ex-lightbox-target'), 'lightbox disabling left owned attributes');
+          setFeature('imageLightboxEnabled', true);
+          const image = content.querySelector('#fixture-existing-image');
+          check(image.classList.contains('wt-v2ex-lightbox-target') && image.tabIndex === 0, 'lightbox did not enable immediately');
+          image.click();
+          check(!document.querySelector('.wt-v2ex-image-lightbox').hidden, 'lightbox did not open');
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          check(document.querySelector('.wt-v2ex-image-lightbox').hidden, 'lightbox did not close');
+          toggle.click();
+          if (panel.hidden) toggle.click();
+          setFeature('scrollTopEnabled', false);
+          check(toggle.isConnected && document.querySelector('.wt-v2ex-scroll-top')?.hidden !== false, 'scroll toggle removed settings access');
+          panel.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          check(panel.hidden && document.activeElement === toggle, 'Escape did not close and restore focus');
+          toggle.click();
+          check(panel.contains(document.activeElement), 'opening did not focus panel controls');
+          document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+          check(panel.hidden, 'outside pointer did not dismiss settings');
+          toggle.click();
+          const readsBeforeSwitch = state.calls.filter((call) => call.method === 'GET').length;
+          selectView('original'); selectView('threaded');
+          check(state.calls.filter((call) => call.method === 'GET').length === readsBeforeSwitch, 'view switching refetched pages');
+          record('单一设置入口、偏好存储、即时图片/顶部开关、Escape/外点关闭和焦点正确', true);
+
+          const appended = { id: '212', floor: 112, page: 2, author: 'NewReply', content: '@<a href="/member/d">D</a> #101 new reply', count: null, canThank: false };
+          state.replies.set(appended.id, appended);
+          const holder = document.createElement('div');
+          holder.innerHTML = renderPage(2);
+          const newCell = holder.querySelector('#r_212');
+          document.querySelector('#topic-replies .box').append(newCell);
+          await waitFor(() => card('212'), 'appended native reply not projected');
+          check(card('212').querySelector('.no').textContent === '112', 'new floor changed');
+          check(card('212').closest('.wt-v2ex-thread-children')?.parentElement === card('201'), 'new relationship was not inferred');
+          newCell.append(document.createElement('span'));
+          await delay(50);
+          check(document.querySelectorAll('[data-wt-v2ex-reply-id="212"]').length === 1, 'repeated mutation duplicated reply');
+          const beforeFailure = document.querySelectorAll('[data-wt-v2ex-reply-id]').length;
+          document.querySelector('#reply_content').dispatchEvent(new Event('input', { bubbles: true }));
+          await delay(50);
+          check(document.querySelectorAll('[data-wt-v2ex-reply-id]').length === beforeFailure, 'failed/no-op submission invented a reply');
+          selectView('original');
+          check(!newCell.classList.contains('wt-v2ex-native-hidden'), 'appended reply not restored in original mode');
+          selectView('threaded');
+          const replacement = { id: '213', floor: 113, page: 2, author: 'Replaced', content: 'native replaceChildren reply', count: null, canThank: false };
+          state.replies.set(replacement.id, replacement);
+          const replacementHolder = document.createElement('div');
+          replacementHolder.innerHTML = renderPage(2);
+          document.querySelector('#topic-replies').replaceChildren(...replacementHolder.querySelector('#topic-replies').childNodes);
+          history.replaceState(history.state, '', '/t/42?p=2#r_213');
+          await waitFor(() => card('213') && !document.querySelector('.wt-v2ex-threaded-view').hidden, 'same-page native list replacement not rebuilt');
+          check(card('213').querySelector('.no').textContent === '113' && card('102'), 'replacement lost floors or ancestry');
+          check(document.querySelectorAll('.wt-v2ex-settings-panel').length === 1 && document.querySelectorAll('.wt-v2ex-threaded-view').length === 1, 'replacement duplicated UI');
+          record('异步追加与原生 replaceChildren 刷新均更新线程，保持楼层、祖先且无重复/虚构回复', true);
+
+          toggle.click();
+          history.pushState({}, '', '/go/programmer');
+          document.querySelector('#Main').replaceChildren();
+          await waitFor(() => !document.querySelector('.wt-v2ex-threaded-view') && panel.hidden && panel.querySelector('.wt-v2ex-settings-topic').hidden, 'non-topic navigation did not dispose the topic');
+          check(toggle.isConnected && panel.hidden && panel.querySelector('.wt-v2ex-settings-topic').hidden, 'non-topic page lost settings or retained unusable topic controls');
+          toggle.click();
+          check(panel.contains(document.activeElement), 'non-topic panel focused a hidden conversation control');
+          feature('imagePreviewEnabled').click();
+          check(JSON.parse(localStorage.getItem('wt-v2ex-settings')).imagePreviewEnabled === feature('imagePreviewEnabled').checked, 'non-topic settings did not persist');
+          await goToPage(1, 30);
+          selectView('original');
+          check(document.querySelector('.wt-v2ex-threaded-view').hidden, 'settings used an obsolete topic handler after navigation');
+          selectView('threaded');
+          check(document.querySelectorAll('.wt-v2ex-settings-toggle').length === 1, 'navigation duplicated settings entry');
+          record('非主题页仅显示可用设置，重复导航后使用当前主题且不重复挂载', true);
 
           check(state.calls.filter((call) => call.method === 'POST').every((call) => call.credentials === 'same-origin'), 'some write requests omitted same-origin credentials');
           document.body.dataset.fixtureState = 'passed';
