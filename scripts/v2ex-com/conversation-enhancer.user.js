@@ -619,9 +619,14 @@
     const state = reply.thanks;
     const uncertain = state.phase === 'unknown' || state.phase === 'checking';
     const direct = reply.page === topic.currentPage && state.canThank && Boolean(reply.nativeThanksPresentation?.action) && Boolean(thanksSession());
-    const count = control.querySelector('.wt-v2ex-thank-count');
+    let count = control.querySelector('.wt-v2ex-thank-count');
     const template = reply.nativeThanksPresentation?.count;
-    if (!count.querySelector('img') && template) count.replaceChildren(...template.cloneNode(true).childNodes);
+    if (!count.querySelector('img') && template) {
+      const replacement = template.cloneNode(true);
+      replacement.classList.add('wt-v2ex-thank-count');
+      count.replaceWith(replacement);
+      count = replacement;
+    }
     count.hidden = state.count === null || !count.querySelector('img');
     if (!count.hidden && Number(count.textContent.trim().replaceAll(',', '')) !== state.count) {
       const walker = document.createTreeWalker(count, NodeFilter.SHOW_TEXT);
@@ -678,7 +683,7 @@
     if (countSlot) countSlot.replaceWith(count);
     else {
       const time = header.querySelector('.ago');
-      if (time) time.after(count);
+      if (time?.closest('.flex-one-row')) time.after(count);
       else header.append(count);
     }
 
@@ -1201,11 +1206,6 @@
           const parsed = new DOMParser().parseFromString(html, 'text/html');
           const replies = parseReplies(parsed, page, pageUrl(topic.context, page));
           if (!replies.length) throw new Error('分页中未找到可解析的回复');
-          replies.forEach((reply) => {
-            if (!reply.nativeReplyControlsTemplate && topic.nativeReplyControlsTemplate) {
-              reply.nativeReplyControlsTemplate = topic.nativeReplyControlsTemplate.cloneNode(true);
-            }
-          });
           results[index] = { page, replies };
         } catch (error) {
           results[index] = { page, error };
