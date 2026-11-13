@@ -497,6 +497,7 @@ const allReplies = [
 
 const models = inferRelationships(allReplies);
 const topic = {
+  context: { id: '42' },
   models,
   currentPage: 1,
   visibleThread: null,

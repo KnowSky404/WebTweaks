@@ -49,17 +49,17 @@
       const replyAsset = 'https://www.v2ex.com/static/img/reply.png?fixture';
       const definitions = [
         { id: '101', floor: 1, page: 1, author: 'A', content: 'unrelated page-one reply', count: 1 },
-        { id: '102', floor: 2, page: 1, author: 'Alice', content: 'cross-page parent', count: 2 },
-        { id: '201', floor: 101, page: 2, author: 'D', content: 'page-two root', count: 3 },
+        { id: '102', floor: 2, page: 1, author: 'Alice', content: 'cross-page parent', count: 2, canHide: true },
+        { id: '201', floor: 101, page: 2, author: 'D', content: 'page-two root', count: 3, canHide: true },
         // V2EX's native prefix places @ outside the member link.
         { id: '202', floor: 102, page: 2, author: 'E', content: '@<a href="/member/alice">Alice</a> #2 cross-page child', count: 0 },
         { id: '203', floor: 103, page: 2, author: 'F', content: 'already thanked', count: 4, thanked: true },
         { id: '204', floor: 104, page: 2, author: 'Self', content: 'own reply without a native thanks action <span class="small fade">content metadata</span>', count: null, canThank: false },
-        { id: '205', floor: 105, page: 2, author: 'G', content: 'confirmation cancellation', count: 0 },
+        { id: '205', floor: 105, page: 2, author: 'G', content: 'confirmation cancellation', count: 0, canHide: true, ignoreInside: true },
         { id: '206', floor: 106, page: 2, author: 'H', content: 'business failure', count: 1 },
         { id: '207', floor: 107, page: 2, author: 'I', content: 'uncertain network outcome', count: 2 },
         { id: '208', floor: 108, page: 2, author: 'J', content: 'navigation during a pending thanks', count: 0 },
-        { id: '209', floor: 109, page: 2, author: 'K', content: 'native-view synchronization', count: 1 },
+        { id: '209', floor: 109, page: 2, author: 'K', content: 'native-view synchronization', count: 1, canHide: true, ignoreInside: true },
         { id: '210', floor: 110, page: 2, author: 'L', content: 'unavailable native capability', count: null, canThank: false },
         { id: '211', floor: 111, page: 2, author: 'M', content: 'unknown outcome without confirmed acceptance', count: 0 }
       ];
@@ -67,6 +67,7 @@
         replies: new Map(),
         modes: new Map(),
         calls: [],
+        ignoreCalls: [],
         confirmation: true,
         confirmations: [],
         moneyRefreshes: 0,
@@ -80,18 +81,20 @@
       const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
       const replyHtml = (reply) => {
         // Public HTML confirms the count markup. Authenticated actions are synthetic.
-        const area = reply.canThank === false ? '' : `<span id="thank_area_${reply.id}" class="thank_area${reply.thanked ? ' thanked' : ''}">${reply.thanked ? '感谢已发送' : `<a class="thank" href="#" onclick="if (confirm('发送感谢？')) { thankReply(${reply.id}); } return false;">感谢</a>`}</span>`;
+        const ignore = reply.canHide ? `<a class="thank ignore" href="#;" onclick="if (confirm('确定隐藏这条回复吗？')) { ignoreReply(${reply.id}, 'fixture-${reply.id}'); } return false;">隐藏</a>` : '';
+        const area = reply.canThank === false && !reply.ignoreInside ? '' : `<span id="thank_area_${reply.id}" class="thank_area${reply.thanked ? ' thanked' : ''}">${reply.thanked ? '感谢已发送' : (reply.ignoreInside ? ignore + ' &nbsp; ' : '') + (reply.canThank === false ? '' : `<a class="thank" href="#" onclick="if (confirm('发送感谢？')) { thankReply(${reply.id}); } return false;">感谢</a>`)}</span>`;
+        const hide = reply.ignoreInside ? '' : ignore;
         const arrow = reply.id === '210' ? '' : reply.id === '211' ? '<a class="reply" href="#reply">原生回复</a>' : `<a class="reply" href="#reply"><img src="${replyAsset}" alt="Reply" width="20" align="absmiddle" border="0"></a>`;
         const count = reply.count === null || reply.count === 0 ? '' : `<span class="small fade flex-one-row gap5"><img src="${heartAsset}" width="14" align="absmiddle" alt="❤️"> ${reply.count}</span>`;
-        const actions = `${area} &nbsp; ${arrow} &nbsp; &nbsp; <span class="no">${reply.floor}</span>`;
+        const actions = `${hide}${area} &nbsp; ${arrow} &nbsp; &nbsp; <span class="no">${reply.floor}</span>`;
         const controls = reply.id === '205' ? `<span class="fixture-native-wrapper">${actions}</span>` : actions;
         const author = `<strong><a class="dark" href="/member/${escapeHtml(reply.author.toLowerCase())}">${escapeHtml(reply.author)}</a></strong>`;
         const time = `<span class="ago" title="fixture page ${reply.page}">fixture</span>`;
         // Flex scaffold copied from public HTML on 2026-11-13; authenticated actions remain synthetic.
         const header = reply.id === '205'
           ? `<div class="fr">${controls}</div><div class="sep3"></div>${author} ${time} &nbsp; &nbsp; ${count}`
-          : `<div class="flex-one-row"><div class="flex-one-row gap10">${author}<div class="badges"><span class="badge">PRO</span></div>${time}${count}</div><div class="flex-one-row gap10">${reply.id === '206' ? `<span class="fixture-flex-wrapper">${area}${arrow}</span>` : area + arrow}<span class="no">${reply.floor}</span></div></div>`;
-        return `<div id="r_${reply.id}" class="cell"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tbody><tr><td width="48" valign="top" align="center"><img class="avatar" alt="fixture avatar" width="48" height="48"></td><td width="10" valign="top"></td><td width="auto" valign="top" align="left">${header}<div class="sep5"></div><div class="reply_content">${reply.content}</div></td></tr></tbody></table></div>`;
+          : `<div class="flex-one-row"><div class="flex-one-row gap10">${author}<div class="badges"><span class="badge">PRO</span></div>${time}${count}</div><div class="flex-one-row gap10">${reply.id === '206' ? `<span class="fixture-flex-wrapper">${hide}${area}${arrow}</span>` : hide + area + arrow}<span class="no">${reply.floor}</span></div></div>`;
+        return `<div id="r_${reply.id}" class="cell"${reply.ignored ? ' style="display:none"' : ''}><table cellpadding="0" cellspacing="0" border="0" width="100%"><tbody><tr><td width="48" valign="top" align="center"><img class="avatar" alt="fixture avatar" width="48" height="48"></td><td width="10" valign="top"></td><td width="auto" valign="top" align="left">${header}<div class="sep5"></div><div class="reply_content">${reply.content}</div></td></tr></tbody></table></div>`;
       };
       // Matches the inspected native topic HTML, including the first-page ?p=1 link.
       const renderPage = (page) => `<div id="topic-replies"><div class="box"><div class="cell ps_container">${[1, 2].map((number) => number === page ? `<span class="page_current">${number}</span>` : `<a class="page_normal" href="?p=${number}">${number}</a>`).join(' ')}<input class="page_input" max="${state.maxPage}"></div>${[...state.replies.values()].filter((reply) => reply.page === page).map(replyHtml).join('')}</div></div>`;
@@ -99,6 +102,7 @@
         state.replies = new Map(definitions.map((reply) => [reply.id, { ...reply, thanked: Boolean(reply.thanked) }]));
         state.modes.clear();
         state.calls.length = 0;
+        state.ignoreCalls.length = 0;
         state.confirmations.length = 0;
         state.confirmation = true;
         state.moneyRefreshes = 0;
@@ -123,6 +127,15 @@
       window.confirm = (message) => {
         state.confirmations.push(String(message));
         return state.confirmation;
+      };
+      window.ignoreReply = (replyId, token) => {
+        const id = String(replyId);
+        state.ignoreCalls.push({ id, token });
+        const reply = state.replies.get(id);
+        if (!reply?.canHide) throw new Error('mock ignore without native eligibility');
+        reply.ignored = true;
+        const cell = document.getElementById('r_' + id);
+        if (cell) cell.style.display = 'none';
       };
       window.refreshMoney = () => { state.moneyRefreshes += 1; };
       window.fetch = async (input, options = {}) => {
@@ -408,9 +421,10 @@
           record('缺少实时 once 时不构造或发送感谢请求', true);
 
           selectView('original');
-          document.querySelector('#thank_area_209 a').click();
+          document.querySelector('#thank_area_209 a:not(.ignore)').click();
           await waitForThanked('209');
           selectView('threaded');
+          check(card('209').querySelector('.wt-v2ex-ignore-action')?.hidden !== false, 'native thanks left a stale shared hide action');
           check(posts('209') === 1 && !actionable('209'), 'native thanks did not synchronize to the existing threaded projection');
           record('原始顺序中的原生感谢会同步到楼中楼', true);
 
@@ -567,6 +581,83 @@
           selectView('threaded');
           check(document.querySelectorAll('.wt-v2ex-settings-toggle').length === 1, 'navigation duplicated settings entry');
           record('非主题页仅显示可用设置，重复导航后使用当前主题且不重复挂载', true);
+
+          await goToPage(2, 30);
+          await waitFor(() => card('102') && card('212'), 'hide test page did not finish');
+          selectView('threaded');
+          const hideAction = (id) => card(id)?.querySelector('.wt-v2ex-ignore-action');
+          check(hideAction('201') && hideAction('205'), 'native Flex or legacy/shared-area hide control missing');
+          check(!hideAction('102') && !hideAction('204'), 'ancestor or ineligible reply inherited hide capability');
+          check(!hideAction('201').hasAttribute('onclick') && !hideAction('201').outerHTML.includes('fixture-201'), 'cloned hide retained a handler or request token');
+          const ignoreBefore = state.ignoreCalls.length;
+          state.confirmation = false;
+          hideAction('201').click();
+          check(state.ignoreCalls.length === ignoreBefore && !card('201').classList.contains('wt-v2ex-ignored-reply'), 'cancelled hiding changed state');
+          state.confirmation = true;
+          const nativeIgnore = window.ignoreReply;
+          window.ignoreReply = undefined;
+          hideAction('205').click();
+          check(state.ignoreCalls.length === ignoreBefore, 'missing native bridge still hid a reply');
+          window.ignoreReply = nativeIgnore;
+          const hiddenParentAction = hideAction('201');
+          hiddenParentAction.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+          hiddenParentAction.click();
+          check(state.ignoreCalls.length === ignoreBefore + 1 && state.ignoreCalls.at(-1).id === '201', 'hide used a floor ID or dispatched twice');
+          check(getComputedStyle(card('201').querySelector('table')).display === 'none', 'hidden reply content remains visible');
+          check(getComputedStyle(card('212')).display !== 'none' && card('212').getBoundingClientRect().height > 0, 'hiding a parent removed its child discussion');
+          selectView('original');
+          check(getComputedStyle(document.querySelector('#r_201')).display === 'none', 'original mode revived a hidden reply');
+          selectView('threaded');
+          const hideOnly = { id: '215', floor: 115, page: 2, author: 'HideOnly', content: 'native hide without thanks', count: null, canThank: false, canHide: true, ignoreInside: true };
+          state.replies.set(hideOnly.id, hideOnly);
+          const hideHolder = document.createElement('div');
+          hideHolder.innerHTML = renderPage(2);
+          document.querySelector('#topic-replies .box').append(hideHolder.querySelector('#r_215'));
+          await waitFor(() => card('215'), 'hide-only reply did not initialize');
+          check(hideAction('215') && !hideAction('215').closest('.wt-v2ex-thank-area').hidden, 'hide-only shared area became inaccessible');
+          check(getComputedStyle(card('201').querySelector('table')).display === 'none', 'redraw revived hidden content');
+          const liveHide = document.querySelector('#r_205 .ignore');
+          liveHide.setAttribute('onclick', "ignoreReply(205, 'fresh-fixture-token'); return false;");
+          hideAction('205').closest('.wt-v2ex-thank-area').focus();
+          hideAction('205').focus();
+          check(document.activeElement === hideAction('205'), 'hide keyboard focus could not enter the native area');
+          hideAction('205').click();
+          check(document.activeElement === document.querySelector('.wt-v2ex-settings-toggle'), 'hiding left focus inside an invisible action');
+          check(state.ignoreCalls.at(-1).id === '205' && state.ignoreCalls.at(-1).token === 'fresh-fixture-token', 'hide did not read the live own-reply token');
+          const forged = document.createElement('a');
+          forged.className = 'wt-v2ex-ignore-action'; forged.textContent = 'forged';
+          card('204').querySelector('.reply_content').append(forged);
+          const callsBeforeForged = state.ignoreCalls.length; forged.click();
+          check(state.ignoreCalls.length === callsBeforeForged, 'content forged a delegated hide control');
+          const ownHide = document.querySelector('#r_215 .ignore');
+          const ownHandler = ownHide.getAttribute('onclick');
+          ownHide.setAttribute('onclick', "ignoreReply(999, 'wrong-reply');");
+          hideAction('215').click();
+          check(state.ignoreCalls.length === callsBeforeForged, 'mismatched reply identity was accepted');
+          ownHide.setAttribute('onclick', ownHandler);
+          selectView('original'); ownHide.click(); selectView('threaded');
+          check(getComputedStyle(card('215').querySelector('table')).display === 'none', 'native original-view hiding did not synchronize');
+          record('原生隐藏支持 Flex/旧布局/仅隐藏区域，确认取消、实时身份、防重复及子讨论保留正确', true);
+
+          const scrollSetting = document.querySelector('[data-setting="scrollTopEnabled"]');
+          if (!scrollSetting.checked) scrollSetting.click();
+          const scrollTop = document.querySelector('.wt-v2ex-scroll-top');
+          window.scrollTo(0, 0); window.dispatchEvent(new Event('scroll'));
+          check(!scrollTop.hidden, 'scroll-to-top hidden at the page top');
+          window.scrollTo(0, document.body.scrollHeight); window.dispatchEvent(new Event('scroll'));
+          check(!scrollTop.hidden, 'scroll-to-top hidden below the top');
+          const originalScrollTo = window.scrollTo;
+          let scrollTarget;
+          window.scrollTo = (options) => { scrollTarget = options; };
+          scrollTop.click();
+          window.scrollTo = originalScrollTo;
+          check(scrollTarget?.top === 0, 'scroll-to-top no longer scrolls to zero');
+          window.scrollTo(0, 0);
+          scrollSetting.click();
+          check(scrollTop.hidden && document.querySelector('.wt-v2ex-settings-toggle').isConnected, 'setting did not hide only the scroll button');
+          scrollSetting.click();
+          check(!scrollTop.hidden && document.querySelectorAll('.wt-v2ex-scroll-top').length === 1, 'scroll toggle duplicated the always-visible button');
+          record('返回顶部在页首和滚动后均常显，点击与设置开关正常且不重复创建', true);
 
           check(state.calls.filter((call) => call.method === 'POST').every((call) => call.credentials === 'same-origin'), 'some write requests omitted same-origin credentials');
           document.body.dataset.fixtureState = 'passed';
