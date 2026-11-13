@@ -691,7 +691,7 @@
     area.classList.add('wt-v2ex-thank-area');
     const completed = document.createElement('span');
     completed.className = 'wt-v2ex-thank-completed';
-    if (reply.thanks.thanked && presentation?.area) completed.append(...area.childNodes);
+    if (presentation?.area?.classList.contains('thanked')) completed.append(...area.childNodes);
     else completed.textContent = '感谢已发送'; // Native thankReply success text, verified in V2EX's JS.
     const action = presentation?.action?.cloneNode(true) || document.createElement('span');
     action.classList.add('wt-v2ex-thank-action');

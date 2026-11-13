@@ -379,7 +379,17 @@
           check(posts('202') === 1, 'a repeated click/keyboard activation sent duplicate thanks requests');
           await waitFor(() => count('202') === 1, 'first thanks count was not refreshed');
           check(['small', 'fade', 'flex-one-row', 'gap5'].every((name) => card('202').querySelector('.wt-v2ex-thank-count').classList.contains(name)), 'newly appearing heart count lost its native presentation');
-          record('同一回复连击和键盘激活只产生一次感谢请求', true);
+          const redrawReply = { id: '214', floor: 114, page: 2, author: 'Redraw', content: 'force redraw after confirmed thanks', count: null, canThank: false };
+          state.replies.set(redrawReply.id, redrawReply);
+          const redrawHolder = document.createElement('div');
+          redrawHolder.innerHTML = renderPage(2);
+          document.querySelector('#topic-replies .box').append(redrawHolder.querySelector('#r_214'));
+          await waitFor(() => card('214'), 'confirmed-thanks redraw did not run');
+          for (const id of ['201', '202']) {
+            check(status(id).trim() === '感谢已发送', 'redraw replaced confirmed completion with stale unthanked markup');
+            check(!card(id).querySelector('.wt-v2ex-thank-completed a'), 'redraw reintroduced an inert native thanks action');
+          }
+          record('同一回复连击和键盘激活只产生一次感谢请求，重绘保持原生完成状态', true);
 
           state.modes.set('206', { type: 'failure', delay: 40 });
           action('206').click();
