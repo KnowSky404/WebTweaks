@@ -1,11 +1,14 @@
 // ==UserScript==
 // @name         GitHub Page Tools
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.0.0
-// @description  Scroll to the top and copy the actual Raw URL from a GitHub file page.
+// @version      1.1.0
+// @description  Scroll to the top and copy a GitHub file's Raw URL from the userscript menu.
 // @author       KnowSky404
 // @match        https://github.com/*
-// @grant        none
+// @noframes
+// @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
+// @grant        GM_setClipboard
 // @run-at       document-idle
 // @homepageURL  https://github.com/KnowSky404/WebTweaks
 // @supportURL   https://github.com/KnowSky404/WebTweaks/issues
@@ -18,8 +21,9 @@
 
   const STYLE_ID = 'wt-gh-page-tools-style';
   const TOP_ID = 'wt-gh-scroll-top';
-  const COPY_ID = 'wt-gh-copy-raw-url';
+  const MENU_LABEL = '复制当前文件的 Raw 链接';
   const RAW_SELECTOR = 'a[data-testid="raw-button"], a[href*="/raw/"], a[href*="raw.githubusercontent.com/"]';
+  let menuCommandId = null;
 
   function isFilePage() {
     return /^\/[^/]+\/[^/]+\/blob\/.+\/.+/.test(location.pathname);
@@ -28,6 +32,7 @@
   function currentRawLink() {
     if (!isFilePage()) return null;
     const [, owner, repo] = location.pathname.split('/');
+    const blobSuffix = location.pathname.split('/').slice(4).join('/');
 
     for (const link of document.querySelectorAll(RAW_SELECTOR)) {
       const label = (link.textContent || '').trim();
@@ -39,10 +44,16 @@
         const raw = new URL(link.getAttribute('href'), location.href);
         const path = raw.pathname.split('/');
         const matchingRepo = path[1] === owner && path[2] === repo;
-        const supportedHost = raw.hostname === 'raw.githubusercontent.com' ||
-          (raw.hostname === 'github.com' && path[3] === 'raw');
-        if (raw.protocol === 'https:' && !raw.username && !raw.password && matchingRepo && supportedHost) {
-          return { link, url: raw.href };
+        const fromRawHost = raw.hostname === 'raw.githubusercontent.com';
+        const fromGitHub = raw.hostname === 'github.com' && path[3] === 'raw';
+        // Validate the file path without reconstructing URLs or guessing ref boundaries.
+        // GitHub may prefix Raw refs with refs/heads/ or refs/tags/.
+        const rawSuffix = path.slice(fromRawHost ? 3 : 4).join('/');
+        const matchingFile = rawSuffix === blobSuffix ||
+          rawSuffix.replace(/^refs\/(?:heads|tags)\//, '') === blobSuffix;
+        if (raw.protocol === 'https:' && !raw.username && !raw.password &&
+          matchingRepo && (fromRawHost || fromGitHub) && matchingFile) {
+          return raw.href;
         }
       } catch {
         // Ignore a malformed or unrecognized GitHub control.
@@ -56,7 +67,7 @@
     const style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = `
-      .wt-gh-scroll-top, .wt-gh-copy-raw-url {
+      .wt-gh-scroll-top {
         background: var(--button-default-bgColor-rest, var(--color-btn-bg, #f6f8fa));
         color: var(--fgColor-default, var(--color-fg-default, #24292f));
         border: 1px solid var(--button-default-borderColor-rest, var(--color-btn-border, #d0d7de));
@@ -64,8 +75,7 @@
         cursor: pointer;
         font: inherit;
       }
-      [data-color-mode="dark"] .wt-gh-scroll-top,
-      [data-color-mode="dark"] .wt-gh-copy-raw-url {
+      [data-color-mode="dark"] .wt-gh-scroll-top {
         background: var(--button-default-bgColor-rest, var(--color-btn-bg, #21262d));
         color: var(--fgColor-default, var(--color-fg-default, #e6edf3));
         border-color: var(--button-default-borderColor-rest, var(--color-btn-border, #30363d));
@@ -81,21 +91,13 @@
         z-index: 20;
         box-shadow: 0 2px 8px rgba(0, 0, 0, .15);
       }
-      .wt-gh-copy-raw-url {
-        margin-inline-start: 8px;
-        padding: 4px 9px;
-        font-size: 12px;
-        line-height: 20px;
-        white-space: nowrap;
-      }
-      .wt-gh-scroll-top:hover, .wt-gh-copy-raw-url:hover {
+      .wt-gh-scroll-top:hover {
         background: var(--button-default-bgColor-hover, var(--color-btn-hover-bg, #eaeef2));
       }
-      [data-color-mode="dark"] .wt-gh-scroll-top:hover,
-      [data-color-mode="dark"] .wt-gh-copy-raw-url:hover {
+      [data-color-mode="dark"] .wt-gh-scroll-top:hover {
         background: var(--button-default-bgColor-hover, var(--color-btn-hover-bg, #30363d));
       }
-      .wt-gh-scroll-top:focus-visible, .wt-gh-copy-raw-url:focus-visible {
+      .wt-gh-scroll-top:focus-visible {
         outline: 2px solid var(--focus-outlineColor, #0969da);
         outline-offset: 2px;
       }
@@ -119,46 +121,35 @@
     document.body.appendChild(button);
   }
 
-  async function copyRawUrl(button) {
-    const raw = currentRawLink();
-    if (!raw) return;
-
-    try {
-      await navigator.clipboard.writeText(raw.url);
-      button.textContent = 'Copied!';
-    } catch {
-      button.textContent = 'Copy failed';
-    }
-    window.setTimeout(() => {
-      if (button.isConnected) button.textContent = 'Copy Raw URL';
-    }, 1800);
-  }
-
-  function reconcileRawButton() {
-    const raw = currentRawLink();
-    const existing = document.getElementById(COPY_ID);
-    if (!raw) {
-      existing?.remove();
+  function copyRawUrl() {
+    // A saved command callback must recheck the current file when invoked.
+    const rawUrl = currentRawLink();
+    if (!rawUrl) {
+      window.alert('未找到当前文件的 Raw 链接，请在文件页面加载完成后重试。');
       return;
     }
-    if (existing?.previousElementSibling === raw.link) return;
-    existing?.remove();
+    try {
+      GM_setClipboard(rawUrl, 'text');
+    } catch {
+      window.alert('复制 Raw 链接失败，请检查脚本管理器的剪贴板权限。');
+    }
+  }
 
-    const button = document.createElement('button');
-    button.id = COPY_ID;
-    button.type = 'button';
-    button.className = 'wt-gh-copy-raw-url';
-    button.textContent = 'Copy Raw URL';
-    button.title = 'Copy the Raw URL of this file';
-    button.addEventListener('click', () => copyRawUrl(button));
-    raw.link.insertAdjacentElement('afterend', button);
+  function reconcileMenu() {
+    const available = currentRawLink() !== null;
+    if (available && menuCommandId === null) {
+      menuCommandId = GM_registerMenuCommand(MENU_LABEL, copyRawUrl);
+    } else if (!available && menuCommandId !== null) {
+      GM_unregisterMenuCommand(menuCommandId);
+      menuCommandId = null;
+    }
   }
 
   let scheduled = false;
   function reconcile() {
     ensureStyles();
     ensureScrollButton();
-    reconcileRawButton();
+    reconcileMenu();
   }
   function scheduleReconcile() {
     if (scheduled) return;
@@ -175,10 +166,18 @@
   }
   window.addEventListener('popstate', scheduleReconcile);
 
-  // GitHub also renders the file toolbar asynchronously; only react when Raw links appear.
+  // GitHub may replace or update its Raw link asynchronously after a soft navigation.
   const observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
-      for (const node of mutation.addedNodes) {
+      if (mutation.type === 'attributes') {
+        const href = mutation.oldValue || '';
+        if (mutation.target.matches(RAW_SELECTOR) || href.includes('/raw/') || href.includes('raw.githubusercontent.com/')) {
+          scheduleReconcile();
+          return;
+        }
+        continue;
+      }
+      for (const node of [...mutation.addedNodes, ...mutation.removedNodes]) {
         if (node.nodeType !== 1) continue;
         if (node.matches(RAW_SELECTOR) || node.querySelector(RAW_SELECTOR)) {
           scheduleReconcile();
@@ -187,5 +186,11 @@
       }
     }
   });
-  observer.observe(document.body, { childList: true, subtree: true });
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['href'],
+    attributeOldValue: true,
+  });
 })();
