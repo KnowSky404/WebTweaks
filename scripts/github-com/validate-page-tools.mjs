@@ -3,14 +3,14 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
 const source = readFileSync(new URL('./page-tools.user.js', import.meta.url), 'utf8');
-assert.match(source, /@version\s+1\.3\.1/);
+assert.match(source, /@version\s+1\.4\.0/);
 for (const api of ['GM_registerMenuCommand', 'GM_unregisterMenuCommand', 'GM_setClipboard']) {
   assert.ok(source.includes('// @grant        ' + api));
 }
 assert.ok(!source.includes('// @grant        none'));
 
-function fixture(pathname, { reducedMotion = false, clipboardError = false } = {}) {
-  const copied = [], alerts = [], scrolls = [], frames = [];
+function fixture(pathname, { reducedMotion = false, clipboardError = false, confirmResult = true } = {}) {
+  const copied = [], alerts = [], confirms = [], scrolls = [], frames = [];
   const menus = new Map(), events = new Map();
   const metrics = { registered: 0, unregistered: 0 };
   let clock = 100000, observer, observerOptions, nextId = 0;
@@ -79,6 +79,7 @@ function fixture(pathname, { reducedMotion = false, clipboardError = false } = {
     matchMedia: () => ({ matches: reducedMotion }),
     scrollTo: (args) => scrolls.push(args),
     alert: (msg) => alerts.push(msg),
+    confirm: (msg) => { confirms.push(msg); return confirmResult; },
     requestAnimationFrame: (fn) => frames.push(fn),
     addEventListener: (event, fn) => events.set(event, fn),
   };
@@ -106,7 +107,7 @@ function fixture(pathname, { reducedMotion = false, clipboardError = false } = {
   });
   function flush() { while (frames.length) frames.shift()(); }
   return {
-    document, location, window, list, copied, alerts, scrolls, menus, metrics, observerOptions,
+    document, location, window, list, copied, alerts, confirms, scrolls, menus, metrics, observerOptions,
     row(href, iconOutside = false) {
       const row = list.appendChild(new Element('div', { role: 'row' }));
       const anchor = row.appendChild(new Element('a', { href }));
@@ -130,6 +131,7 @@ function fixture(pathname, { reducedMotion = false, clipboardError = false } = {
     },
     rightClick(target) { events.get('contextmenu')?.({ target }); },
     copy() { [...menus.values()][0]?.callback(); },
+    copyLatest() { [...menus.values()].find((item) => item.name === '复制 Latest Release 下载链接')?.callback(); },
     top() { document.getElementById('wt-gh-scroll-top').click(); },
     refresh() {
       events.get('turbo:render')?.();
@@ -277,13 +279,16 @@ const rawHost = 'https://raw.githubusercontent.com';
 {
   const f = fixture('/alice/widgets/releases/tag/v1.2.3');
   const asset = f.asset('/alice/widgets/releases/download/v1.2.3/app-v1.2.3.zip');
-  assert.equal(f.menus.size, 1);
-  assert.equal([...f.menus.values()][0].name, '复制 Release 文件下载链接');
+  assert.equal(f.menus.size, 2);
+  assert.deepEqual([...f.menus.values()].map((entry) => entry.name), [
+    '复制 Release 文件下载链接',
+    '复制 Latest Release 下载链接',
+  ]);
   f.rightClick(asset.name);
   f.copy();
   assert.deepEqual(f.copied, ['https://github.com/alice/widgets/releases/download/v1.2.3/app-v1.2.3.zip']);
   f.refresh();
-  assert.equal(f.metrics.registered, 1, 'do not register duplicate release commands');
+  assert.equal(f.metrics.registered, 2, 'do not register duplicate release commands');
   assert.equal(f.document.getElementById('wt-gh-copy-raw-url'), null);
   f.top();
   assert.equal(f.scrolls[0].top, 0);
@@ -300,7 +305,7 @@ const rawHost = 'https://raw.githubusercontent.com';
   f.rightClick(first.name);
   f.copy();
   assert.equal(f.copied.at(-1), 'https://github.com/alice/widgets/releases/download/v2.0/app-linux.tar.gz');
-  assert.equal(f.menus.size, 1);
+  assert.equal(f.menus.size, 2);
 }
 
 // GitHub native latest/download links and any native search query are preserved.
@@ -406,7 +411,7 @@ const rawHost = 'https://raw.githubusercontent.com';
   const f = fixture('/alice/widgets');
   const previousRaw = [...f.menus.values()][0].callback;
   f.navigate('/alice/widgets/releases/tag/v3');
-  assert.equal(f.menus.size, 1);
+  assert.equal(f.menus.size, 2);
   const asset = f.asset('/alice/widgets/releases/download/v3/x.zip');
   f.rightClick(asset.name);
   previousRaw();
@@ -417,8 +422,146 @@ const rawHost = 'https://raw.githubusercontent.com';
   assert.equal(f.menus.size, 1);
   assert.equal([...f.menus.values()][0].name, '复制右键文件的 Raw 链接');
   f.refresh();
-  assert.equal(f.metrics.registered, 3);
+  assert.equal(f.metrics.registered, 4);
+  assert.equal(f.metrics.unregistered, 3);
+}
+
+// Latest URL generated from a versioned Release without browsing to another page.
+{
+  const f = fixture('/alice/widgets/releases/tag/v3.0');
+  const asset = f.asset('/alice/widgets/releases/download/v3.0/app-linux.zip');
+  f.rightClick(asset.name);
+  f.copyLatest();
+  assert.deepEqual(f.copied, [
+    'https://github.com/alice/widgets/releases/latest/download/app-linux.zip',
+  ]);
+  assert.equal(f.confirms.length, 0, 'stable asset names do not require confirmation');
+  f.refresh();
+  assert.equal(f.metrics.registered, 2, 'both menu commands remain idempotent');
+}
+
+// The original Release command is still pinned; the new one is a moving alias.
+{
+  const f = fixture('/alice/widgets/releases');
+  const asset = f.asset('/alice/widgets/releases/download/v4/app.tar.gz?token=synthetic-secret&download=1');
+  f.rightClick(asset.name);
+  f.copy();
+  assert.equal(f.copied[0],
+    'https://github.com/alice/widgets/releases/download/v4/app.tar.gz?token=synthetic-secret&download=1');
+  f.rightClick(asset.name);
+  f.copyLatest();
+  assert.equal(f.copied[1], 'https://github.com/alice/widgets/releases/latest/download/app.tar.gz');
+  assert.ok(!f.copied[1].includes('synthetic-secret'), 'version-scoped auth query never leaks to the alias');
+}
+
+// A real Git tag named latest is different from the latest-release alias.
+{
+  const f = fixture('/alice/widgets/releases/tag/latest');
+  const asset = f.asset('/alice/widgets/releases/download/latest/tool.zip');
+  f.rightClick(asset.name);
+  f.copyLatest();
+  assert.deepEqual(f.copied, ['https://github.com/alice/widgets/releases/latest/download/tool.zip']);
+  f.rightClick(asset.name);
+  f.copy();
+  assert.equal(f.copied[1], 'https://github.com/alice/widgets/releases/download/latest/tool.zip');
+}
+
+// A native latest/download asset URL is already the desired alias (query is not inherited).
+{
+  const f = fixture('/alice/widgets/releases/latest');
+  const asset = f.asset('/alice/widgets/releases/latest/download/tool%20pro.zip?download=1');
+  f.rightClick(asset.name);
+  f.copyLatest();
+  assert.deepEqual(f.copied, ['https://github.com/alice/widgets/releases/latest/download/tool%20pro.zip']);
+}
+
+// Versioned filenames trigger an informed choice without silently rewriting names.
+{
+  const f = fixture('/alice/widgets/releases/tag/v2', { confirmResult: false });
+  const asset = f.asset('/alice/widgets/releases/download/v2/project-v2.3.4-linux.zip');
+  f.rightClick(asset.name);
+  f.copyLatest();
+  assert.equal(f.copied.length, 0);
+  assert.equal(f.confirms.length, 1);
+  assert.match(f.confirms[0], /后续 Release/);
+  // Cancelling the warning must not leave a reusable stale selection.
+  f.copyLatest();
+  assert.equal(f.copied.length, 0);
+  const accepting = fixture('/alice/widgets/releases/tag/v2');
+  const versioned = accepting.asset('/alice/widgets/releases/download/v2/app_1.2.3.zip');
+  accepting.rightClick(versioned.name);
+  accepting.copyLatest();
+  assert.equal(accepting.confirms.length, 1);
+  assert.equal(accepting.copied[0],
+    'https://github.com/alice/widgets/releases/latest/download/app_1.2.3.zip');
+}
+
+// Source archive URLs and unrelated links are not valid Latest Release assets.
+{
+  const f = fixture('/alice/widgets/releases/tag/v1');
+  for (const href of [
+    '/alice/widgets/archive/refs/tags/v1.zip',
+    '/alice/widgets/archive/refs/tags/v1.tar.gz',
+    '/alice/widgets/releases/tag/v1',
+    '/other/widgets/releases/download/v1/tool.zip',
+    'https://evil.example/alice/widgets/releases/download/v1/tool.zip',
+    '/alice/widgets/releases/download/v1',
+  ]) {
+    const asset = f.asset(href);
+    f.rightClick(asset.name);
+    f.copyLatest();
+  }
+  assert.equal(f.copied.length, 0);
+  assert.equal(f.alerts.length, 6);
+}
+
+// Last context cannot be copied after navigation, link mutation, or timeout.
+{
+  const f = fixture('/alice/widgets/releases/tag/v3');
+  const asset = f.asset('/alice/widgets/releases/download/v3/tool.zip');
+  f.rightClick(asset.name);
+  f.changeHref(asset.anchor, '/alice/widgets/releases/download/v3/other.zip');
+  f.copyLatest();
+  assert.equal(f.copied.length, 0);
+  f.rightClick(asset.name);
+  f.navigate('/alice/widgets/issues');
+  f.navigate('/alice/widgets/releases/tag/v3');
+  f.copyLatest();
+  assert.equal(f.copied.length, 0);
+  f.rightClick(asset.name);
+  f.advance(61000);
+  f.copyLatest();
+  assert.equal(f.copied.length, 0);
+  f.rightClick(asset.name);
+  f.rightClick(f.list);
+  f.copyLatest();
+  assert.equal(f.copied.length, 0);
+}
+
+// The second Release command is removed when leaving Releases and re-added once.
+{
+  const f = fixture('/alice/widgets/releases/latest');
+  const stale = [...f.menus.values()].find(x => x.name === '复制 Latest Release 下载链接').callback;
+  f.navigate('/alice/widgets');
+  assert.equal(f.menus.size, 1);
   assert.equal(f.metrics.unregistered, 2);
+  stale();
+  assert.equal(f.copied.length, 0);
+  f.navigate('/alice/widgets/releases/latest');
+  assert.equal(f.menus.size, 2);
+  f.refresh();
+  assert.equal(f.metrics.registered, 5);
+  assert.equal(f.metrics.unregistered, 3);
+}
+
+// Latest clipboard error must not claim success.
+{
+  const f = fixture('/alice/widgets/releases', { clipboardError: true });
+  const asset = f.asset('/alice/widgets/releases/download/v1/tool.zip');
+  f.rightClick(asset.name);
+  f.copyLatest();
+  assert.equal(f.copied.length, 0);
+  assert.match(f.alerts[0], /复制 Latest Release 下载链接失败/);
 }
 
 // A Release clipboard error must not be presented as a successful copy.
@@ -441,4 +584,4 @@ const rawHost = 'https://raw.githubusercontent.com';
   assert.match(f.alerts[0], /复制 Raw 链接失败/);
 }
 
-console.log('GitHub Page Tools: 17 fixture groups passed (literal latest tag vs alias, Raw/Release menus, navigation, safety, clipboard, scroll).');
+console.log('GitHub Page Tools: 26 fixture groups passed (pinned and Latest Release URLs, warnings, safety, navigation, Raw, scroll).');
