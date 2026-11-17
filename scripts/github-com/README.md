@@ -4,7 +4,7 @@
 
 ## Installation
 
-[Install or update the script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/github-com/page-tools.user.js). Version **1.2.0** retains the three manager grants introduced in 1.1.0: `GM_registerMenuCommand`, `GM_unregisterMenuCommand`, and `GM_setClipboard`.
+[Install or update the script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/github-com/page-tools.user.js). Version **1.2.1** retains the three manager grants introduced in 1.1.0: `GM_registerMenuCommand`, `GM_unregisterMenuCommand`, and `GM_setClipboard`.
 
 ## Features
 
@@ -19,7 +19,7 @@ Copied links always use `https://raw.githubusercontent.com/<owner>/<repo>/<ref>/
 
 The script captures the most recent `contextmenu` event and validates the clicked link on invocation. It accepts one file link in the current repository, including row icons outside the anchor. It rejects directories (`/tree/`), other repositories, untrusted hosts, removed or changed anchors, navigation to another URL, and selections older than 60 seconds. A new right-click elsewhere clears the selection. Firefox Shift+right-click may bypass the page event, so that gesture does not select a file. If no valid file is selected, nothing is copied and a message explains why. When using the manager toolbar rather than the browser context menu, first right-click the file to establish the selection.
 
-On a file-detail page, the native Raw link remains a fallback for the popup command. Private-repository Raw URLs can still require authentication; copying does not make them public. No file contents are read or transmitted.
+On a file-detail page, the native Raw link remains a fallback for the popup command. When GitHub's validated native Raw link contains a temporary authentication query (such as `?token=…`), the script **preserves that query** when converting to `raw.githubusercontent.com` so private-file links remain usable as intended. **Treat copied token-bearing URLs as credentials**: do not share them publicly. Links may expire, and copying does not grant permanent public access. No file contents are read or transmitted.
 
 ## Permissions and validation
 
@@ -31,4 +31,4 @@ node --check scripts/github-com/validate-page-tools.mjs
 node scripts/github-com/validate-page-tools.mjs
 ```
 
-The dependency-free fixture checks right-clicked root/nested files, slash-containing refs, direct Raw URL formatting, unsafe and directory links, context invalidation, SPA navigation, repeated setup, clipboard errors, file-page fallback, and reduced-motion scrolling. Simulated DOM tests are **not** live GitHub/Tampermonkey/Violentmonkey validation. Manually verify repository root and nested listing, files/directories, file detail, light/dark themes, Firefox/Chromium and Tampermonkey's right-click/popup settings before merging.
+The dependency-free fixture checks right-clicked root/nested files, slash-containing refs, direct Raw URL formatting, unsafe and directory links, context invalidation, SPA navigation, repeated setup, clipboard errors, file-page fallback, preservation of synthetic private Raw query parameters, and reduced-motion scrolling. Simulated DOM tests are **not** live GitHub/Tampermonkey/Violentmonkey validation. Manually verify repository root and nested listing, files/directories, file detail, light/dark themes, Firefox/Chromium and Tampermonkey's right-click/popup settings before merging.
