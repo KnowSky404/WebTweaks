@@ -3,231 +3,255 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
 const source = readFileSync(new URL('./page-tools.user.js', import.meta.url), 'utf8');
-assert.match(source, /@version\s+1\.1\.0/);
-for (const grant of ['GM_registerMenuCommand', 'GM_unregisterMenuCommand', 'GM_setClipboard']) {
-  assert.ok(source.includes('// @grant        ' + grant));
+assert.match(source, /@version\s+1\.2\.0/);
+for (const api of ['GM_registerMenuCommand', 'GM_unregisterMenuCommand', 'GM_setClipboard']) {
+  assert.ok(source.includes('// @grant        ' + api));
 }
 assert.ok(!source.includes('// @grant        none'));
 
-function fixture(pathname, href = null, { reducedMotion = false, clipboardThrows = false } = {}) {
-  const copied = [];
-  const alerts = [];
-  const scrollCalls = [];
-  const raf = [];
-  const menu = new Map();
-  const history = { registers: 0, unregisters: 0 };
-  const events = new Map();
-  let observer;
-  let observerOptions;
-  let nextId = 0;
-
-  function walk(node) {
-    return [node, ...node.children.flatMap(walk)];
-  }
+function fixture(pathname, { reducedMotion = false, clipboardError = false } = {}) {
+  const copied = [], alerts = [], scrolls = [], frames = [];
+  const menus = new Map(), events = new Map();
+  const metrics = { registered: 0, unregistered: 0 };
+  let clock = 100000, observer, observerOptions, nextId = 0;
+  const descend = (node) => [node, ...node.children.flatMap(descend)];
   class Element {
-    constructor(tag) {
+    constructor(tag, attrs = {}) {
       this.tagName = tag.toUpperCase();
       this.nodeType = 1;
-      this.parentNode = null;
+      this.attrs = attrs;
       this.children = [];
-      this.attributes = {};
-      this.listeners = {};
+      this.parentElement = null;
+      this.listeners = new Map();
       this.textContent = '';
     }
     get isConnected() {
-      return !!this.parentNode || this === document.head || this === document.body;
+      return this === document.body || this === document.head || this.parentElement?.isConnected || false;
     }
     appendChild(node) {
       node.remove();
-      node.parentNode = this;
+      node.parentElement = this;
       this.children.push(node);
       return node;
     }
     remove() {
-      if (!this.parentNode) return;
-      this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1);
-      this.parentNode = null;
+      if (!this.parentElement) return;
+      const siblings = this.parentElement.children;
+      siblings.splice(siblings.indexOf(this), 1);
+      this.parentElement = null;
     }
-    setAttribute(key, value) { this.attributes[key] = value; }
-    getAttribute(key) { return this.attributes[key] ?? null; }
-    addEventListener(type, callback) { this.listeners[type] = callback; }
-    click() { this.listeners.click?.(); }
-    matches() {
-      return this.tagName === 'A' && (
-        this.attributes['data-testid'] === 'raw-button' ||
-        (this.attributes.href || '').includes('/raw/') ||
-        (this.attributes.href || '').includes('raw.githubusercontent.com/')
+    getAttribute(key) { return this.attrs[key] ?? null; }
+    setAttribute(key, value) { this.attrs[key] = value; }
+    addEventListener(event, fn) { this.listeners.set(event, fn); }
+    click() { this.listeners.get('click')?.(); }
+    matches(selector) {
+      if (selector === 'a[href]') return this.tagName === 'A' && !!this.getAttribute('href');
+      if (selector.includes('role="row"')) return this.getAttribute('role') === 'row' || this.tagName === 'TR';
+      if (selector.includes('/blob/')) return this.tagName === 'A' && (this.getAttribute('href') || '').includes('/blob/');
+      if (selector.includes('raw-button')) return this.tagName === 'A' && (
+        this.getAttribute('data-testid') === 'raw-button' ||
+        (this.getAttribute('href') || '').includes('/raw/') ||
+        (this.getAttribute('href') || '').includes('raw.githubusercontent.com/')
       );
+      return false;
     }
-    querySelector() { return walk(this).find((node) => node !== this && node.matches()) || null; }
+    closest(selector) {
+      for (let node = this; node; node = node.parentElement) if (node.matches(selector)) return node;
+      return null;
+    }
+    querySelector(selector) { return descend(this).find((node) => node !== this && node.matches(selector)) || null; }
+    querySelectorAll(selector) { return descend(this).filter((node) => node !== this && node.matches(selector)); }
   }
   const document = {
-    body: new Element('body'),
-    head: new Element('head'),
+    body: new Element('body'), head: new Element('head'),
     createElement: (tag) => new Element(tag),
-    getElementById(id) { return [...walk(this.body), ...walk(this.head)].find((node) => node.id === id) || null; },
-    querySelectorAll() { return walk(this.body).filter((node) => node.matches()); },
-    addEventListener: (event, callback) => events.set(event, callback),
+    getElementById(key) { return [...descend(this.body), ...descend(this.head)].find((node) => node.id === key) || null; },
+    querySelectorAll(selector) { return this.body.querySelectorAll(selector); },
+    addEventListener(event, fn) { events.set(event, fn); },
   };
-  const toolbar = document.body.appendChild(new Element('div'));
-  function addRaw(value) {
-    if (!value) return null;
-    const link = new Element('a');
-    link.textContent = 'Raw';
-    link.setAttribute('data-testid', 'raw-button');
-    link.setAttribute('href', value);
-    toolbar.appendChild(link);
-    return link;
-  }
-  let raw = addRaw(href);
+  const list = document.body.appendChild(new Element('div', { role: 'table' }));
   const location = { pathname, href: 'https://github.com' + pathname };
   const window = {
     matchMedia: () => ({ matches: reducedMotion }),
-    scrollTo: (options) => scrollCalls.push(options),
-    alert: (message) => alerts.push(message),
-    requestAnimationFrame: (callback) => raf.push(callback),
-    addEventListener: (event, callback) => events.set(event, callback),
+    scrollTo: (args) => scrolls.push(args),
+    alert: (msg) => alerts.push(msg),
+    requestAnimationFrame: (fn) => frames.push(fn),
+    addEventListener: (event, fn) => events.set(event, fn),
   };
   class MutationObserver {
     constructor(callback) { observer = callback; }
     observe(_node, options) { observerOptions = options; }
   }
   runInNewContext(source, {
-    document, location, window, URL, MutationObserver,
-    GM_registerMenuCommand(label, callback) {
-      const id = 'cmd-' + ++nextId;
-      menu.set(id, { label, callback });
-      history.registers++;
+    document, location, window, MutationObserver, URL, Date: { now: () => clock },
+    GM_registerMenuCommand(name, callback) {
+      const id = ++nextId;
+      menus.set(id, { name, callback });
+      metrics.registered++;
       return id;
     },
     GM_unregisterMenuCommand(id) {
-      assert.ok(menu.delete(id), 'unregister a known id');
-      history.unregisters++;
+      assert.ok(menus.delete(id));
+      metrics.unregistered++;
     },
-    GM_setClipboard(value, type) {
-      if (clipboardThrows) throw Error('blocked');
+    GM_setClipboard(url, type) {
+      if (clipboardError) throw Error('clipboard denied');
       assert.equal(type, 'text');
-      copied.push(value);
+      copied.push(url);
     },
   });
-  function flush() { while (raf.length) raf.shift()(); }
-  function rawMutation(added, removed) {
-    observer([{ type: 'childList', addedNodes: added, removedNodes: removed }]);
-    flush();
-  }
+  function flush() { while (frames.length) frames.shift()(); }
   return {
-    document, menu, copied, alerts, scrollCalls, history, observerOptions,
-    get callback() { return [...menu.values()][0]?.callback; },
-    copy() { this.callback?.(); },
-    top() { document.getElementById('wt-gh-scroll-top')?.click(); },
+    document, location, window, list, copied, alerts, scrolls, menus, metrics, observerOptions,
+    row(href, iconOutside = false) {
+      const row = list.appendChild(new Element('div', { role: 'row' }));
+      const anchor = row.appendChild(new Element('a', { href }));
+      const text = anchor.appendChild(new Element('span'));
+      const icon = iconOutside ? row.appendChild(new Element('span')) : anchor.appendChild(new Element('span'));
+      return { row, anchor, text, icon };
+    },
+    raw(href) {
+      const link = document.body.appendChild(new Element('a', { href, 'data-testid': 'raw-button' }));
+      link.textContent = 'Raw';
+      observer([{ type: 'childList', addedNodes: [link], removedNodes: [] }]);
+      flush();
+      return link;
+    },
+    rightClick(target) { events.get('contextmenu')?.({ target }); },
+    copy() { [...menus.values()][0]?.callback(); },
+    top() { document.getElementById('wt-gh-scroll-top').click(); },
     refresh() {
       events.get('turbo:render')?.();
-      events.get('pjax:end')?.();
-      observer([{ type: 'childList', addedNodes: [toolbar], removedNodes: [] }]);
+      observer([{ type: 'childList', addedNodes: [list], removedNodes: [] }]);
       flush();
     },
-    navigate(path, nextRaw) {
+    navigate(path) {
       location.pathname = path;
       location.href = 'https://github.com' + path;
-      const old = raw;
-      old?.remove();
-      raw = addRaw(nextRaw);
       events.get('turbo:load')?.();
-      rawMutation(raw ? [raw] : [], old ? [old] : []);
-    },
-    setRaw(nextRaw) {
-      const old = raw;
-      old?.remove();
-      raw = addRaw(nextRaw);
-      rawMutation(raw ? [raw] : [], old ? [old] : []);
-    },
-    updateHref(nextRaw) {
-      const oldValue = raw.getAttribute('href');
-      raw.setAttribute('href', nextRaw);
-      observer([{ type: 'attributes', target: raw, oldValue }]);
       flush();
     },
-    detachRawBeforeObserver() { raw?.remove(); },
+    changeHref(anchor, href) {
+      const oldValue = anchor.getAttribute('href');
+      anchor.setAttribute('href', href);
+      observer([{ type: 'attributes', target: anchor, oldValue }]);
+      flush();
+    },
+    advance(ms) { clock += ms; },
   };
 }
 
-const file = '/alice/widgets/blob/feature/ui/src/index.js';
-const raw = '/alice/widgets/raw/refs/heads/feature/ui/src/index.js';
+const rawHost = 'https://raw.githubusercontent.com';
 
-// One menu entry, original Raw link unmodified, scroll button unchanged.
+// Copy right-clicked package.json from the repository root and preserve scroll-to-top.
 {
-  const f = fixture(file, raw);
-  assert.equal(f.menu.size, 1);
-  assert.equal([...f.menu.values()][0].label, '复制当前文件的 Raw 链接');
-  assert.equal(f.document.getElementById('wt-gh-copy-raw-url'), null);
+  const f = fixture('/alice/widgets');
+  const file = f.row('/alice/widgets/blob/main/package.json');
+  assert.equal(f.menus.size, 1);
+  assert.equal([...f.menus.values()][0].name, '复制右键文件的 Raw 链接');
+  f.rightClick(file.text);
   f.copy();
-  assert.deepEqual(f.copied, ['https://github.com' + raw]);
+  assert.deepEqual(f.copied, [rawHost + '/alice/widgets/main/package.json']);
   f.top();
-  assert.equal(f.scrollCalls[0].top, 0);
-  assert.equal(f.scrollCalls[0].behavior, 'smooth');
+  assert.deepEqual(f.scrolls[0].top, 0);
+  assert.equal(f.scrolls[0].behavior, 'smooth');
   f.refresh();
-  assert.equal(f.history.registers, 1);
-  assert.equal(f.document.body.children.length, 2);
+  assert.equal(f.metrics.registered, 1);
+  assert.equal(f.document.getElementById('wt-gh-copy-raw-url'), null);
 }
 
-// Soft navigation both registers and unregisters; an old callback cannot copy.
+// Nested path, explicit slash-containing branch ref, icon outside the file link.
 {
-  const f = fixture('/alice/widgets/issues', raw, { reducedMotion: true });
-  assert.equal(f.menu.size, 0);
+  const f = fixture('/alice/widgets/tree/feature/ui/src');
+  const file = f.row('/alice/widgets/blob/refs/heads/feature/ui/src/package.json', true);
+  f.rightClick(file.icon);
+  f.copy();
+  assert.deepEqual(f.copied, [rawHost + '/alice/widgets/refs/heads/feature/ui/src/package.json']);
+  const folder = f.row('/alice/widgets/tree/refs/heads/feature/ui/src/widgets');
+  f.rightClick(folder.text);
+  f.copy();
+  assert.equal(f.copied.length, 1);
+  assert.equal(f.alerts.length, 1);
+}
+
+// Reject other hosts/repositories, directory links, and non-file anchors.
+{
+  const f = fixture('/alice/widgets');
+  for (const href of [
+    '/other/repo/blob/main/file.txt',
+    'https://example.com/alice/widgets/blob/main/file.txt',
+    '/alice/widgets/tree/main/src',
+    '/alice/widgets/blob/main',
+    'https://github.com/',
+  ]) {
+    const link = f.row(href);
+    f.rightClick(link.text);
+    f.copy();
+  }
+  assert.equal(f.copied.length, 0);
+  assert.equal(f.alerts.length, 5);
+}
+
+// Clear right-click context on a different target, removed link, navigation, or age.
+{
+  const f = fixture('/alice/widgets');
+  const file = f.row('/alice/widgets/blob/main/package.json');
+  f.rightClick(file.text);
+  f.rightClick(f.list);
+  f.copy();
+  assert.equal(f.copied.length, 0);
+  f.rightClick(file.text);
+  file.row.remove();
+  f.copy();
+  assert.equal(f.copied.length, 0);
+  const second = f.row('/alice/widgets/blob/main/LICENSE');
+  f.rightClick(second.text);
+  f.navigate('/alice/widgets/issues');
+  assert.equal(f.menus.size, 0);
+  f.navigate('/alice/widgets');
+  f.copy();
+  assert.equal(f.copied.length, 0);
+  f.rightClick(second.text);
+  f.advance(61000);
+  f.copy();
+  assert.equal(f.copied.length, 0);
+}
+
+// On file detail pages normalize the native github.com/raw link to raw.githubusercontent.com.
+{
+  const f = fixture('/alice/widgets/blob/main/package.json');
+  f.raw('/alice/widgets/raw/refs/heads/main/package.json');
+  f.copy();
+  assert.deepEqual(f.copied, [rawHost + '/alice/widgets/refs/heads/main/package.json']);
+  f.navigate('/alice/widgets/blob/feature/ui/src/index.js');
+  f.raw('/alice/widgets/raw/refs/heads/feature/ui/src/index.js');
+  f.copy();
+  assert.equal(f.copied.at(-1), rawHost + '/alice/widgets/refs/heads/feature/ui/src/index.js');
+}
+
+// Detect changed file links and preserve reduced-motion scroll preference.
+{
+  const f = fixture('/alice/widgets', { reducedMotion: true });
+  const file = f.row('/alice/widgets/blob/main/package.json');
+  f.rightClick(file.text);
+  f.changeHref(file.anchor, '/alice/widgets/blob/main/private.txt');
+  f.copy();
+  assert.equal(f.copied.length, 0);
+  f.rightClick(file.text);
+  f.copy();
+  assert.deepEqual(f.copied, [rawHost + '/alice/widgets/main/private.txt']);
   f.top();
-  assert.equal(f.scrollCalls[0].behavior, 'auto');
-  f.navigate(file, raw);
-  const previous = f.callback;
-  assert.equal(f.menu.size, 1);
-  f.navigate('/alice/widgets/tree/main', null);
-  assert.equal(f.menu.size, 0);
-  assert.equal(f.history.unregisters, 1);
-  previous();
-  assert.equal(f.copied.length, 0);
-  assert.equal(f.alerts.length, 1);
-  f.navigate(file, raw);
-  f.copy();
-  assert.deepEqual(f.copied, ['https://github.com' + raw]);
+  assert.equal(f.scrolls[0].behavior, 'auto');
 }
 
-// Malicious, cross-repo, wrong-file and stale links do not create a menu command.
+// Fail closed when the userscript manager denies clipboard writes.
 {
-  const f = fixture(file, 'https://example.com/alice/widgets/raw/feature/ui/src/index.js');
-  assert.equal(f.menu.size, 0);
-  f.setRaw('/other/repo/raw/feature/ui/src/index.js');
-  assert.equal(f.menu.size, 0);
-  f.setRaw('/alice/widgets/raw/refs/heads/main/src/index.js');
-  assert.equal(f.menu.size, 0);
-  f.setRaw('https://raw.githubusercontent.com/alice/widgets/refs/heads/feature/ui/src/index.js');
-  f.copy();
-  assert.deepEqual(f.copied, ['https://raw.githubusercontent.com/alice/widgets/refs/heads/feature/ui/src/index.js']);
-  f.updateHref('https://raw.githubusercontent.com/alice/widgets/main/src/index.js');
-  assert.equal(f.menu.size, 0);
-  f.updateHref('https://raw.githubusercontent.com/alice/widgets/feature/ui/src/index.js');
-  assert.equal(f.menu.size, 1);
-}
-
-// Async Raw toolbar insertion/removal; recheck the link at the moment of invocation.
-{
-  const f = fixture(file);
-  assert.equal(f.menu.size, 0);
-  f.setRaw(raw);
-  const callback = f.callback;
-  f.detachRawBeforeObserver();
-  callback();
-  assert.equal(f.copied.length, 0);
-  assert.equal(f.alerts.length, 1);
-  f.setRaw(null);
-  assert.equal(f.menu.size, 0);
-  assert.equal(f.observerOptions.attributeOldValue, true);
-}
-
-// Privileged clipboard failures report an error rather than a false success.
-{
-  const f = fixture(file, raw, { clipboardThrows: true });
+  const f = fixture('/alice/widgets', { clipboardError: true });
+  const file = f.row('/alice/widgets/blob/main/package.json');
+  f.rightClick(file.text);
   f.copy();
   assert.equal(f.copied.length, 0);
   assert.match(f.alerts[0], /复制 Raw 链接失败/);
 }
 
-console.log('GitHub Page Tools: 5 fixture scenarios passed (menu, clipboard, SPA, URL safety, scroll).');
+console.log('GitHub Page Tools: 7 fixture groups passed (targeted context, Raw host, navigation, safety, clipboard, scroll).');

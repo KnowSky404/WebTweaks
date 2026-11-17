@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GitHub Page Tools
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.1.0
-// @description  Scroll to the top and copy a GitHub file's Raw URL from the userscript menu.
+// @version      1.2.0
+// @description  Scroll to top and copy a right-clicked GitHub file's direct Raw URL.
 // @author       KnowSky404
 // @match        https://github.com/*
 // @noframes
@@ -21,12 +21,78 @@
 
   const STYLE_ID = 'wt-gh-page-tools-style';
   const TOP_ID = 'wt-gh-scroll-top';
-  const MENU_LABEL = '复制当前文件的 Raw 链接';
+  const MENU_LABEL = '复制右键文件的 Raw 链接';
+  const FILE_SELECTOR = 'a[href*="/blob/"]';
+  const CONTEXT_MAX_AGE_MS = 60_000;
   const RAW_SELECTOR = 'a[data-testid="raw-button"], a[href*="/raw/"], a[href*="raw.githubusercontent.com/"]';
   let menuCommandId = null;
+  let lastContext = null;
+  let lastPageUrl = location.href;
+
+  function repoIdentity() {
+    const segments = location.pathname.split('/');
+    if (segments.length < 3 || !segments[1] || !segments[2]) return null;
+    if (['settings', 'features', 'marketplace', 'topics', 'orgs', 'organizations',
+      'search', 'notifications', 'login', 'signup', 'explore'].includes(segments[1])) return null;
+    return { owner: segments[1], repo: segments[2] };
+  }
+
+  function isCodePage() {
+    const segments = location.pathname.split('/');
+    return repoIdentity() !== null &&
+      (segments.length === 3 || (segments.length === 4 && !segments[3]) ||
+        (['blob', 'tree'].includes(segments[3]) && segments.length >= 5));
+  }
 
   function isFilePage() {
-    return /^\/[^/]+\/[^/]+\/blob\/.+\/.+/.test(location.pathname);
+    return isCodePage() && location.pathname.split('/')[3] === 'blob';
+  }
+
+  function sameRepository(owner, repo) {
+    const current = repoIdentity();
+    return current && owner && repo &&
+      owner.toLowerCase() === current.owner.toLowerCase() &&
+      repo.toLowerCase() === current.repo.toLowerCase();
+  }
+
+  function rawFromBlobHref(href) {
+    if (!href) return null;
+    let url;
+    try {
+      url = new URL(href, location.href);
+    } catch {
+      return null;
+    }
+    if (url.protocol !== 'https:' || url.username || url.password || url.hostname !== 'github.com') return null;
+    const [, owner, repo, action, ...suffix] = url.pathname.split('/');
+    if (!owner || !repo || action !== 'blob' || !sameRepository(owner, repo) ||
+      suffix.length < 2 || suffix.some((part) => !part)) return null;
+    // Preserve GitHub's complete ref + file suffix. Slash-containing branches
+    // and explicit refs/heads/ or refs/tags/ paths must not be guessed apart.
+    return 'https://raw.githubusercontent.com/' + owner + '/' + repo + '/' + suffix.join('/');
+  }
+
+  function fileFromTarget(target) {
+    const element = target?.nodeType === 1 ? target : target?.parentElement;
+    if (!element?.isConnected) return null;
+    const anchor = element.closest('a[href]');
+    if (anchor) return rawFromBlobHref(anchor.getAttribute('href')) ? anchor : null;
+    // A right-click on a row icon is valid only when that row has one file link.
+    const row = element.closest('[role="row"], tr, [data-testid="file-row"]');
+    if (!row) return null;
+    const matches = [...row.querySelectorAll(FILE_SELECTOR)]
+      .filter((link) => rawFromBlobHref(link.getAttribute('href')));
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  function rememberContextMenu(event) {
+    lastContext = null;
+    if (!isCodePage()) return;
+    const anchor = fileFromTarget(event.target);
+    if (!anchor) return;
+    const href = anchor.getAttribute('href');
+    if (!rawFromBlobHref(href)) return;
+    lastContext = { anchor, href, pageUrl: location.href, at: Date.now() };
   }
 
   function currentRawLink() {
@@ -53,7 +119,7 @@
           rawSuffix.replace(/^refs\/(?:heads|tags)\//, '') === blobSuffix;
         if (raw.protocol === 'https:' && !raw.username && !raw.password &&
           matchingRepo && (fromRawHost || fromGitHub) && matchingFile) {
-          return raw.href;
+          return 'https://raw.githubusercontent.com/' + path[1] + '/' + path[2] + '/' + rawSuffix;
         }
       } catch {
         // Ignore a malformed or unrecognized GitHub control.
@@ -122,10 +188,18 @@
   }
 
   function copyRawUrl() {
-    // A saved command callback must recheck the current file when invoked.
-    const rawUrl = currentRawLink();
+    let rawUrl = null;
+    const captured = lastContext;
+    lastContext = null;
+    if (captured && captured.pageUrl === location.href &&
+      Date.now() - captured.at <= CONTEXT_MAX_AGE_MS &&
+      captured.anchor.isConnected && captured.anchor.getAttribute('href') === captured.href) {
+      rawUrl = rawFromBlobHref(captured.href);
+    }
+    // Keep the v1.1 file-page command usable from the manager toolbar popup.
+    if (!rawUrl) rawUrl = currentRawLink();
     if (!rawUrl) {
-      window.alert('未找到当前文件的 Raw 链接，请在文件页面加载完成后重试。');
+      window.alert('请在 GitHub 文件列表中右键具体文件后重试，或打开文件详情页。');
       return;
     }
     try {
@@ -136,10 +210,13 @@
   }
 
   function reconcileMenu() {
-    const available = currentRawLink() !== null;
-    if (available && menuCommandId === null) {
+    if (lastPageUrl !== location.href) {
+      lastPageUrl = location.href;
+      lastContext = null;
+    }
+    if (isCodePage() && menuCommandId === null) {
       menuCommandId = GM_registerMenuCommand(MENU_LABEL, copyRawUrl);
-    } else if (!available && menuCommandId !== null) {
+    } else if (!isCodePage() && menuCommandId !== null) {
       GM_unregisterMenuCommand(menuCommandId);
       menuCommandId = null;
     }
@@ -160,18 +237,21 @@
     });
   }
 
+  // Capture a selected file without preventing GitHub's native right-click menu.
+  document.addEventListener('contextmenu', rememberContextMenu, true);
   reconcile();
   for (const event of ['turbo:load', 'turbo:render', 'pjax:end']) {
     document.addEventListener(event, scheduleReconcile);
   }
   window.addEventListener('popstate', scheduleReconcile);
 
-  // GitHub may replace or update its Raw link asynchronously after a soft navigation.
+  // GitHub renders repository file lists and file toolbars asynchronously.
   const observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
       if (mutation.type === 'attributes') {
         const href = mutation.oldValue || '';
-        if (mutation.target.matches(RAW_SELECTOR) || href.includes('/raw/') || href.includes('raw.githubusercontent.com/')) {
+        if (mutation.target.matches(FILE_SELECTOR) || mutation.target.matches(RAW_SELECTOR) ||
+          href.includes('/blob/') || href.includes('/raw/')) {
           scheduleReconcile();
           return;
         }
@@ -179,7 +259,8 @@
       }
       for (const node of [...mutation.addedNodes, ...mutation.removedNodes]) {
         if (node.nodeType !== 1) continue;
-        if (node.matches(RAW_SELECTOR) || node.querySelector(RAW_SELECTOR)) {
+        if (node.matches(FILE_SELECTOR) || node.matches(RAW_SELECTOR) ||
+          node.querySelector(FILE_SELECTOR) || node.querySelector(RAW_SELECTOR)) {
           scheduleReconcile();
           return;
         }
