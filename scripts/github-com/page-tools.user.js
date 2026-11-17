@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GitHub Page Tools
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.2.1
-// @description  Scroll to top and copy a right-clicked GitHub file's direct Raw URL.
+// @version      1.3.0
+// @description  Scroll to top and copy Raw files or Release download links from GitHub context menus.
 // @author       KnowSky404
 // @match        https://github.com/*
 // @noframes
@@ -22,11 +22,15 @@
   const STYLE_ID = 'wt-gh-page-tools-style';
   const TOP_ID = 'wt-gh-scroll-top';
   const MENU_LABEL = '复制右键文件的 Raw 链接';
+  const RELEASE_MENU_LABEL = '复制 Release 文件下载链接';
   const FILE_SELECTOR = 'a[href*="/blob/"]';
+  const RELEASE_SELECTOR = 'a[href*="/releases/download/"], a[href*="/releases/latest/download/"], a[href*="/archive/"]';
   const CONTEXT_MAX_AGE_MS = 60_000;
   const RAW_SELECTOR = 'a[data-testid="raw-button"], a[href*="/raw/"], a[href*="raw.githubusercontent.com/"]';
   let menuCommandId = null;
+  let releaseMenuCommandId = null;
   let lastContext = null;
+  let lastReleaseContext = null;
   let lastPageUrl = location.href;
 
   function repoIdentity() {
@@ -42,6 +46,14 @@
     return repoIdentity() !== null &&
       (segments.length === 3 || (segments.length === 4 && !segments[3]) ||
         (['blob', 'tree'].includes(segments[3]) && segments.length >= 5));
+  }
+
+  function isReleasePage() {
+    const parts = location.pathname.split('/').filter(Boolean);
+    if (!repoIdentity() || parts[2] !== 'releases') return false;
+    return parts.length === 3 ||
+      (parts.length === 4 && parts[3] === 'latest') ||
+      (parts.length >= 5 && ['tag', 'expanded_assets'].includes(parts[3]));
   }
 
   function isFilePage() {
@@ -72,6 +84,48 @@
     return 'https://raw.githubusercontent.com/' + owner + '/' + repo + '/' + suffix.join('/');
   }
 
+  function releaseDownloadFromHref(href) {
+    if (!href) return null;
+    let url;
+    try {
+      url = new URL(href, location.href);
+    } catch {
+      return null;
+    }
+    if (url.protocol !== 'https:' || url.hostname !== 'github.com' ||
+      url.username || url.password) return null;
+
+    const [, owner, repo, ...route] = url.pathname.split('/');
+    if (!sameRepository(owner, repo) || route.some((part) => !part)) return null;
+
+    const asset = route.length === 4 && route[0] === 'releases' &&
+      ((route[1] === 'download' && route[2] !== 'latest') ||
+        (route[1] === 'latest' && route[2] === 'download'));
+    const sourceArchive = route.length >= 4 && route[0] === 'archive' &&
+      route[1] === 'refs' && route[2] === 'tags' &&
+      /\.(?:zip|tar\.gz)$/i.test(route.at(-1));
+    if (!asset && !sourceArchive) return null;
+
+    // The native link is the stable GitHub entry point. Do not follow its
+    // redirect to a short-lived storage URL or rewrite it as a Raw file URL.
+    return url.href;
+  }
+
+  function releaseFromTarget(target) {
+    const element = target?.nodeType === 1 ? target : target?.parentElement;
+    if (!element?.isConnected) return null;
+    const anchor = element.closest('a[href]');
+    if (anchor) return releaseDownloadFromHref(anchor.getAttribute('href')) ? anchor : null;
+
+    // A Release asset's icon can sit next to the anchor inside its list item.
+    // Never use an entire Assets list when more than one download link exists.
+    const row = element.closest('li, [role="listitem"], [data-testid="release-asset"]');
+    if (!row) return null;
+    const matches = [...row.querySelectorAll(RELEASE_SELECTOR)]
+      .filter((link) => releaseDownloadFromHref(link.getAttribute('href')));
+    return matches.length === 1 ? matches[0] : null;
+  }
+
   function fileFromTarget(target) {
     const element = target?.nodeType === 1 ? target : target?.parentElement;
     if (!element?.isConnected) return null;
@@ -87,12 +141,21 @@
 
   function rememberContextMenu(event) {
     lastContext = null;
-    if (!isCodePage()) return;
-    const anchor = fileFromTarget(event.target);
+    lastReleaseContext = null;
+    if (isCodePage()) {
+      const anchor = fileFromTarget(event.target);
+      if (!anchor) return;
+      const href = anchor.getAttribute('href');
+      if (!rawFromBlobHref(href)) return;
+      lastContext = { anchor, href, pageUrl: location.href, at: Date.now() };
+      return;
+    }
+    if (!isReleasePage()) return;
+    const anchor = releaseFromTarget(event.target);
     if (!anchor) return;
     const href = anchor.getAttribute('href');
-    if (!rawFromBlobHref(href)) return;
-    lastContext = { anchor, href, pageUrl: location.href, at: Date.now() };
+    if (!releaseDownloadFromHref(href)) return;
+    lastReleaseContext = { anchor, href, pageUrl: location.href, at: Date.now() };
   }
 
   function currentRawLink() {
@@ -211,16 +274,43 @@
     }
   }
 
+  function copyReleaseUrl() {
+    const captured = lastReleaseContext;
+    lastReleaseContext = null;
+    const downloadUrl = isReleasePage() && captured &&
+      captured.pageUrl === location.href &&
+      Date.now() - captured.at <= CONTEXT_MAX_AGE_MS &&
+      captured.anchor.isConnected &&
+      captured.anchor.getAttribute('href') === captured.href
+      ? releaseDownloadFromHref(captured.href) : null;
+    if (!downloadUrl) {
+      window.alert('请在 GitHub Release 页面右键一个附件或源码归档链接后重试。');
+      return;
+    }
+    try {
+      GM_setClipboard(downloadUrl, 'text');
+    } catch {
+      window.alert('复制 Release 下载链接失败，请检查脚本管理器的剪贴板权限。');
+    }
+  }
+
   function reconcileMenu() {
     if (lastPageUrl !== location.href) {
       lastPageUrl = location.href;
       lastContext = null;
+      lastReleaseContext = null;
     }
     if (isCodePage() && menuCommandId === null) {
       menuCommandId = GM_registerMenuCommand(MENU_LABEL, copyRawUrl);
     } else if (!isCodePage() && menuCommandId !== null) {
       GM_unregisterMenuCommand(menuCommandId);
       menuCommandId = null;
+    }
+    if (isReleasePage() && releaseMenuCommandId === null) {
+      releaseMenuCommandId = GM_registerMenuCommand(RELEASE_MENU_LABEL, copyReleaseUrl);
+    } else if (!isReleasePage() && releaseMenuCommandId !== null) {
+      GM_unregisterMenuCommand(releaseMenuCommandId);
+      releaseMenuCommandId = null;
     }
   }
 
@@ -253,7 +343,8 @@
       if (mutation.type === 'attributes') {
         const href = mutation.oldValue || '';
         if (mutation.target.matches(FILE_SELECTOR) || mutation.target.matches(RAW_SELECTOR) ||
-          href.includes('/blob/') || href.includes('/raw/')) {
+          mutation.target.matches(RELEASE_SELECTOR) || href.includes('/blob/') ||
+          href.includes('/raw/') || href.includes('/releases/download/') || href.includes('/archive/')) {
           scheduleReconcile();
           return;
         }
@@ -261,8 +352,8 @@
       }
       for (const node of [...mutation.addedNodes, ...mutation.removedNodes]) {
         if (node.nodeType !== 1) continue;
-        if (node.matches(FILE_SELECTOR) || node.matches(RAW_SELECTOR) ||
-          node.querySelector(FILE_SELECTOR) || node.querySelector(RAW_SELECTOR)) {
+        if (node.matches(FILE_SELECTOR) || node.matches(RAW_SELECTOR) || node.matches(RELEASE_SELECTOR) ||
+          node.querySelector(FILE_SELECTOR) || node.querySelector(RAW_SELECTOR) || node.querySelector(RELEASE_SELECTOR)) {
           scheduleReconcile();
           return;
         }
