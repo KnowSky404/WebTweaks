@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub Page Tools
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.2.0
+// @version      1.2.1
 // @description  Scroll to top and copy a right-clicked GitHub file's direct Raw URL.
 // @author       KnowSky404
 // @match        https://github.com/*
@@ -119,7 +119,9 @@
           rawSuffix.replace(/^refs\/(?:heads|tags)\//, '') === blobSuffix;
         if (raw.protocol === 'https:' && !raw.username && !raw.password &&
           matchingRepo && (fromRawHost || fromGitHub) && matchingFile) {
-          return 'https://raw.githubusercontent.com/' + path[1] + '/' + path[2] + '/' + rawSuffix;
+          // A private file's native Raw URL may contain a temporary auth token.
+          // Keep its query while normalizing the direct Raw host; do not log it.
+          return 'https://raw.githubusercontent.com/' + path[1] + '/' + path[2] + '/' + rawSuffix + raw.search;
         }
       } catch {
         // Ignore a malformed or unrecognized GitHub control.

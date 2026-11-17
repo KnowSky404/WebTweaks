@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
 const source = readFileSync(new URL('./page-tools.user.js', import.meta.url), 'utf8');
-assert.match(source, /@version\s+1\.2\.0/);
+assert.match(source, /@version\s+1\.2\.1/);
 for (const api of ['GM_registerMenuCommand', 'GM_unregisterMenuCommand', 'GM_setClipboard']) {
   assert.ok(source.includes('// @grant        ' + api));
 }
@@ -229,6 +229,24 @@ const rawHost = 'https://raw.githubusercontent.com';
   assert.equal(f.copied.at(-1), rawHost + '/alice/widgets/refs/heads/feature/ui/src/index.js');
 }
 
+// Private file Raw links can carry temporary authorization query parameters.
+{
+  const f = fixture('/alice/widgets/blob/main/private.txt');
+  f.raw('/alice/widgets/raw/refs/heads/main/private.txt?token=fixture-token%2F1&expires=12345');
+  f.copy();
+  assert.equal(
+    f.copied.at(-1),
+    rawHost + '/alice/widgets/refs/heads/main/private.txt?token=fixture-token%2F1&expires=12345'
+  );
+  f.navigate('/alice/widgets/blob/main/another.txt');
+  f.raw('https://raw.githubusercontent.com/alice/widgets/main/another.txt?token=fixture-second&expires=67890');
+  f.copy();
+  assert.equal(
+    f.copied.at(-1),
+    rawHost + '/alice/widgets/main/another.txt?token=fixture-second&expires=67890'
+  );
+}
+
 // Detect changed file links and preserve reduced-motion scroll preference.
 {
   const f = fixture('/alice/widgets', { reducedMotion: true });
@@ -254,4 +272,4 @@ const rawHost = 'https://raw.githubusercontent.com';
   assert.match(f.alerts[0], /复制 Raw 链接失败/);
 }
 
-console.log('GitHub Page Tools: 7 fixture groups passed (targeted context, Raw host, navigation, safety, clipboard, scroll).');
+console.log('GitHub Page Tools: 8 fixture groups passed (targeted context, Raw host, navigation, safety, clipboard, scroll).');
