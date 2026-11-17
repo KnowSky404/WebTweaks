@@ -4,7 +4,7 @@
 
 ## Installation
 
-[Install or update the script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/github-com/page-tools.user.js). Version **1.3.0** retains the three manager grants introduced in 1.1.0: `GM_registerMenuCommand`, `GM_unregisterMenuCommand`, and `GM_setClipboard`.
+[Install or update the script](https://raw.githubusercontent.com/KnowSky404/WebTweaks/main/scripts/github-com/page-tools.user.js). Version **1.3.1** retains the three manager grants introduced in 1.1.0: `GM_registerMenuCommand`, `GM_unregisterMenuCommand`, and `GM_setClipboard`.
 
 ## Features
 
@@ -21,6 +21,7 @@ GitHub Release assets are **not** repository Raw files. Uploaded assets use stab
 ```text
 https://github.com/OWNER/REPO/releases/download/v1.0.0/app.zip
 https://github.com/OWNER/REPO/releases/latest/download/app.zip
+https://github.com/OWNER/REPO/releases/download/latest/app.zip
 ```
 
 GitHub-generated source archives use GitHub archive URLs such as:
@@ -29,6 +30,8 @@ GitHub-generated source archives use GitHub archive URLs such as:
 https://github.com/OWNER/REPO/archive/refs/tags/v1.0.0.zip
 https://github.com/OWNER/REPO/archive/refs/tags/v1.0.0.tar.gz
 ```
+
+The tag name `latest` is valid in `/releases/download/latest/FILE` and is distinct from the moving `/releases/latest/download/FILE` alias. Both are accepted without reinterpreting the path.
 
 The script copies the **validated native `href`** (including a native query string) without following redirects or rewriting it to `raw.githubusercontent.com`. Final redirects to GitHub asset storage are not copied; such URLs may expire. Only HTTPS links under `github.com` for the **current repository** and recognized Release asset or source-archive patterns are accepted. The script does not fabricate a `latest/download` link when GitHub only provides a versioned download.
 

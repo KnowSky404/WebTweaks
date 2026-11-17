@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub Page Tools
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.3.0
+// @version      1.3.1
 // @description  Scroll to top and copy Raw files or Release download links from GitHub context menus.
 // @author       KnowSky404
 // @match        https://github.com/*
@@ -99,7 +99,7 @@
     if (!sameRepository(owner, repo) || route.some((part) => !part)) return null;
 
     const asset = route.length === 4 && route[0] === 'releases' &&
-      ((route[1] === 'download' && route[2] !== 'latest') ||
+      (route[1] === 'download' ||
         (route[1] === 'latest' && route[2] === 'download'));
     const sourceArchive = route.length >= 4 && route[0] === 'archive' &&
       route[1] === 'refs' && route[2] === 'tags' &&
