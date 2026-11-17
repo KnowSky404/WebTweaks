@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GitHub Page Tools
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.3.1
-// @description  Scroll to top and copy Raw files or Release download links from GitHub context menus.
+// @version      1.4.0
+// @description  Scroll to top and copy Raw, Release, or Latest Release asset URLs via GitHub context menus.
 // @author       KnowSky404
 // @match        https://github.com/*
 // @noframes
@@ -23,12 +23,14 @@
   const TOP_ID = 'wt-gh-scroll-top';
   const MENU_LABEL = '复制右键文件的 Raw 链接';
   const RELEASE_MENU_LABEL = '复制 Release 文件下载链接';
+  const LATEST_RELEASE_MENU_LABEL = '复制 Latest Release 下载链接';
   const FILE_SELECTOR = 'a[href*="/blob/"]';
   const RELEASE_SELECTOR = 'a[href*="/releases/download/"], a[href*="/releases/latest/download/"], a[href*="/archive/"]';
   const CONTEXT_MAX_AGE_MS = 60_000;
   const RAW_SELECTOR = 'a[data-testid="raw-button"], a[href*="/raw/"], a[href*="raw.githubusercontent.com/"]';
   let menuCommandId = null;
   let releaseMenuCommandId = null;
+  let latestReleaseMenuCommandId = null;
   let lastContext = null;
   let lastReleaseContext = null;
   let lastPageUrl = location.href;
@@ -109,6 +111,25 @@
     // The native link is the stable GitHub entry point. Do not follow its
     // redirect to a short-lived storage URL or rewrite it as a Raw file URL.
     return url.href;
+  }
+
+  function latestReleaseFromHref(href) {
+    const trusted = releaseDownloadFromHref(href);
+    if (!trusted) return null;
+
+    // The generated source-code ZIP/TAR links are not uploaded release assets.
+    const url = new URL(trusted);
+    const [, owner, repo, section, segment, next, filename, ...rest] = url.pathname.split('/');
+    if (section !== 'releases' || !filename || rest.length ||
+      !(segment === 'download' || (segment === 'latest' && next === 'download'))) return null;
+
+    // The "latest" tag in /releases/download/latest/FILE is not the moving alias.
+    // Keep only the encoded native asset filename. The version-specific query
+    // (possibly containing an auth token) is not valid for the moving alias.
+    return {
+      url: 'https://github.com/' + owner + '/' + repo + '/releases/latest/download/' + filename,
+      filename,
+    };
   }
 
   function releaseFromTarget(target) {
@@ -294,6 +315,35 @@
     }
   }
 
+  function copyLatestReleaseUrl() {
+    const captured = lastReleaseContext;
+    lastReleaseContext = null;
+    const target = isReleasePage() && captured &&
+      captured.pageUrl === location.href &&
+      Date.now() - captured.at <= CONTEXT_MAX_AGE_MS &&
+      captured.anchor.isConnected &&
+      captured.anchor.getAttribute('href') === captured.href
+      ? latestReleaseFromHref(captured.href) : null;
+    if (!target) {
+      window.alert('请右键 Release 上传的附件后重试；源码 ZIP/TAR 归档不支持 Latest 下载链接。');
+      return;
+    }
+
+    // Versioned asset names are not renamed by GitHub across releases.
+    // Confirm rather than falsely suggesting the generated URL is future-proof.
+    let filename = target.filename;
+    try { filename = decodeURIComponent(filename); } catch { /* Use encoded filename. */ }
+    if (/(?:^|[-_.])v?\d+(?:\.\d+){1,3}(?=[-_.]|$)/i.test(filename) &&
+      !window.confirm('附件文件名包含版本号（' + filename +
+        '）。后续 Release 如果改名，该 Latest 链接会失效。仍要复制吗？')) return;
+
+    try {
+      GM_setClipboard(target.url, 'text');
+    } catch {
+      window.alert('复制 Latest Release 下载链接失败，请检查脚本管理器的剪贴板权限。');
+    }
+  }
+
   function reconcileMenu() {
     if (lastPageUrl !== location.href) {
       lastPageUrl = location.href;
@@ -311,6 +361,12 @@
     } else if (!isReleasePage() && releaseMenuCommandId !== null) {
       GM_unregisterMenuCommand(releaseMenuCommandId);
       releaseMenuCommandId = null;
+    }
+    if (isReleasePage() && latestReleaseMenuCommandId === null) {
+      latestReleaseMenuCommandId = GM_registerMenuCommand(LATEST_RELEASE_MENU_LABEL, copyLatestReleaseUrl);
+    } else if (!isReleasePage() && latestReleaseMenuCommandId !== null) {
+      GM_unregisterMenuCommand(latestReleaseMenuCommandId);
+      latestReleaseMenuCommandId = null;
     }
   }
 
