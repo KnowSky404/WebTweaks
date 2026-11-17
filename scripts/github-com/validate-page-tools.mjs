@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
 const source = readFileSync(new URL('./page-tools.user.js', import.meta.url), 'utf8');
-assert.match(source, /@version\s+1\.3\.0/);
+assert.match(source, /@version\s+1\.3\.1/);
 for (const api of ['GM_registerMenuCommand', 'GM_unregisterMenuCommand', 'GM_setClipboard']) {
   assert.ok(source.includes('// @grant        ' + api));
 }
@@ -312,6 +312,24 @@ const rawHost = 'https://raw.githubusercontent.com';
   assert.equal(f.copied[0], 'https://github.com/alice/widgets/releases/latest/download/app.zip?download=1');
 }
 
+// A literal tag named "latest" is different from GitHub's moving latest-release alias.
+{
+  const tag = fixture('/alice/widgets/releases/tag/latest');
+  const asset = tag.asset('/alice/widgets/releases/download/latest/special-build.zip');
+  tag.rightClick(asset.name);
+  tag.copy();
+  assert.deepEqual(tag.copied, [
+    'https://github.com/alice/widgets/releases/download/latest/special-build.zip',
+  ]);
+  const alias = fixture('/alice/widgets/releases/latest');
+  const aliasAsset = alias.asset('/alice/widgets/releases/latest/download/special-build.zip');
+  alias.rightClick(aliasAsset.name);
+  alias.copy();
+  assert.deepEqual(alias.copied, [
+    'https://github.com/alice/widgets/releases/latest/download/special-build.zip',
+  ]);
+}
+
 // GitHub-generated release source-code snapshots are archives, not Raw file URLs.
 {
   const f = fixture('/alice/widgets/releases/tag/v1.2.3');
@@ -423,4 +441,4 @@ const rawHost = 'https://raw.githubusercontent.com';
   assert.match(f.alerts[0], /复制 Raw 链接失败/);
 }
 
-console.log('GitHub Page Tools: 16 fixture groups passed (Raw/Release context menus, download URLs, navigation, safety, clipboard, scroll).');
+console.log('GitHub Page Tools: 17 fixture groups passed (literal latest tag vs alias, Raw/Release menus, navigation, safety, clipboard, scroll).');
