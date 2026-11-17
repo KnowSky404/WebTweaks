@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
 const source = readFileSync(new URL('./page-tools.user.js', import.meta.url), 'utf8');
-assert.match(source, /@version\s+1\.2\.1/);
+assert.match(source, /@version\s+1\.3\.0/);
 for (const api of ['GM_registerMenuCommand', 'GM_unregisterMenuCommand', 'GM_setClipboard']) {
   assert.ok(source.includes('// @grant        ' + api));
 }
@@ -47,6 +47,10 @@ function fixture(pathname, { reducedMotion = false, clipboardError = false } = {
     matches(selector) {
       if (selector === 'a[href]') return this.tagName === 'A' && !!this.getAttribute('href');
       if (selector.includes('role="row"')) return this.getAttribute('role') === 'row' || this.tagName === 'TR';
+      if (selector.startsWith('li, ')) return this.tagName === 'LI' || this.getAttribute('role') === 'listitem';
+      if (selector.includes('/releases/download/') || selector.includes('/archive/')) return this.tagName === 'A' &&
+        (/\/releases\/(?:download|latest\/download)\//.test(this.getAttribute('href') || '') ||
+          (this.getAttribute('href') || '').includes('/archive/'));
       if (selector.includes('/blob/')) return this.tagName === 'A' && (this.getAttribute('href') || '').includes('/blob/');
       if (selector.includes('raw-button')) return this.tagName === 'A' && (
         this.getAttribute('data-testid') === 'raw-button' ||
@@ -109,6 +113,13 @@ function fixture(pathname, { reducedMotion = false, clipboardError = false } = {
       const text = anchor.appendChild(new Element('span'));
       const icon = iconOutside ? row.appendChild(new Element('span')) : anchor.appendChild(new Element('span'));
       return { row, anchor, text, icon };
+    },
+    asset(href, iconOutside = false) {
+      const item = list.appendChild(new Element('li'));
+      const anchor = item.appendChild(new Element('a', { href }));
+      const name = anchor.appendChild(new Element('span'));
+      const icon = iconOutside ? item.appendChild(new Element('span')) : anchor.appendChild(new Element('span'));
+      return { item, anchor, name, icon };
     },
     raw(href) {
       const link = document.body.appendChild(new Element('a', { href, 'data-testid': 'raw-button' }));
@@ -262,6 +273,146 @@ const rawHost = 'https://raw.githubusercontent.com';
   assert.equal(f.scrolls[0].behavior, 'auto');
 }
 
+// Release page: copy the selected asset's stable GitHub download URL.
+{
+  const f = fixture('/alice/widgets/releases/tag/v1.2.3');
+  const asset = f.asset('/alice/widgets/releases/download/v1.2.3/app-v1.2.3.zip');
+  assert.equal(f.menus.size, 1);
+  assert.equal([...f.menus.values()][0].name, '复制 Release 文件下载链接');
+  f.rightClick(asset.name);
+  f.copy();
+  assert.deepEqual(f.copied, ['https://github.com/alice/widgets/releases/download/v1.2.3/app-v1.2.3.zip']);
+  f.refresh();
+  assert.equal(f.metrics.registered, 1, 'do not register duplicate release commands');
+  assert.equal(f.document.getElementById('wt-gh-copy-raw-url'), null);
+  f.top();
+  assert.equal(f.scrolls[0].top, 0);
+}
+
+// Two release cards on /releases must select the actual right-clicked asset.
+{
+  const f = fixture('/alice/widgets/releases');
+  const first = f.asset('/alice/widgets/releases/download/v2.0/app-linux.tar.gz');
+  const second = f.asset('/alice/widgets/releases/download/v1.0/app-windows.exe', true);
+  f.rightClick(second.icon);
+  f.copy();
+  assert.equal(f.copied.at(-1), 'https://github.com/alice/widgets/releases/download/v1.0/app-windows.exe');
+  f.rightClick(first.name);
+  f.copy();
+  assert.equal(f.copied.at(-1), 'https://github.com/alice/widgets/releases/download/v2.0/app-linux.tar.gz');
+  assert.equal(f.menus.size, 1);
+}
+
+// GitHub native latest/download links and any native search query are preserved.
+{
+  const f = fixture('/alice/widgets/releases/latest');
+  const latest = f.asset('https://github.com/alice/widgets/releases/latest/download/app.zip?download=1');
+  f.rightClick(latest.name);
+  f.copy();
+  assert.equal(f.copied[0], 'https://github.com/alice/widgets/releases/latest/download/app.zip?download=1');
+}
+
+// GitHub-generated release source-code snapshots are archives, not Raw file URLs.
+{
+  const f = fixture('/alice/widgets/releases/tag/v1.2.3');
+  for (const href of [
+    '/alice/widgets/archive/refs/tags/v1.2.3.zip',
+    '/alice/widgets/archive/refs/tags/v1.2.3.tar.gz',
+    '/alice/widgets/archive/refs/tags/feature/ui.zip',
+  ]) {
+    const a = f.asset(href);
+    f.rightClick(a.name);
+    f.copy();
+  }
+  assert.deepEqual(f.copied, [
+    'https://github.com/alice/widgets/archive/refs/tags/v1.2.3.zip',
+    'https://github.com/alice/widgets/archive/refs/tags/v1.2.3.tar.gz',
+    'https://github.com/alice/widgets/archive/refs/tags/feature/ui.zip',
+  ]);
+}
+
+// Reject untrusted downloads, other repos and non-download links.
+{
+  const f = fixture('/alice/widgets/releases');
+  for (const href of [
+    'https://example.org/alice/widgets/releases/download/v1/x.zip',
+    'https://raw.githubusercontent.com/alice/widgets/releases/download/v1/x.zip',
+    '/other/widgets/releases/download/v1/x.zip',
+    '/alice/other/releases/download/v1/x.zip',
+    '/alice/widgets/releases/tag/v1',
+    '/alice/widgets/releases/download/v1',
+    '/alice/widgets/releases/latest/download',
+    '/alice/widgets/archive/refs/tags/v1.js',
+    '/alice/widgets/archive/refs/heads/main.zip',
+    '/alice/widgets/archive/refs/tags/v1.zip/extra',
+  ]) {
+    const a = f.asset(href);
+    f.rightClick(a.name);
+    f.copy();
+  }
+  assert.equal(f.copied.length, 0);
+  assert.equal(f.alerts.length, 10);
+}
+
+// Validate the clicked Release target again on activation: no stale URLs.
+{
+  const f = fixture('/alice/widgets/releases/tag/v2');
+  const asset = f.asset('/alice/widgets/releases/download/v2/example.zip');
+  f.rightClick(asset.name);
+  f.changeHref(asset.anchor, '/alice/widgets/releases/download/v2/other.zip');
+  f.copy();
+  assert.equal(f.copied.length, 0);
+  f.rightClick(asset.name);
+  asset.item.remove();
+  f.copy();
+  assert.equal(f.copied.length, 0);
+  const another = f.asset('/alice/widgets/releases/download/v2/new.zip');
+  f.rightClick(another.name);
+  f.navigate('/alice/widgets/issues');
+  assert.equal(f.menus.size, 0);
+  f.navigate('/alice/widgets/releases');
+  f.copy();
+  assert.equal(f.copied.length, 0);
+  f.rightClick(another.name);
+  f.advance(61000);
+  f.copy();
+  assert.equal(f.copied.length, 0);
+  f.rightClick(another.name);
+  f.rightClick(f.list);
+  f.copy();
+  assert.equal(f.copied.length, 0);
+}
+
+// Navigation across Code and Releases switches commands without duplicates.
+{
+  const f = fixture('/alice/widgets');
+  const previousRaw = [...f.menus.values()][0].callback;
+  f.navigate('/alice/widgets/releases/tag/v3');
+  assert.equal(f.menus.size, 1);
+  const asset = f.asset('/alice/widgets/releases/download/v3/x.zip');
+  f.rightClick(asset.name);
+  previousRaw();
+  assert.equal(f.copied.length, 0);
+  f.copy();
+  assert.equal(f.copied.at(-1), 'https://github.com/alice/widgets/releases/download/v3/x.zip');
+  f.navigate('/alice/widgets/tree/main/lib');
+  assert.equal(f.menus.size, 1);
+  assert.equal([...f.menus.values()][0].name, '复制右键文件的 Raw 链接');
+  f.refresh();
+  assert.equal(f.metrics.registered, 3);
+  assert.equal(f.metrics.unregistered, 2);
+}
+
+// A Release clipboard error must not be presented as a successful copy.
+{
+  const f = fixture('/alice/widgets/releases', { clipboardError: true });
+  const a = f.asset('/alice/widgets/releases/download/v3/a.zip');
+  f.rightClick(a.name);
+  f.copy();
+  assert.equal(f.copied.length, 0);
+  assert.match(f.alerts[0], /复制 Release 下载链接失败/);
+}
+
 // Fail closed when the userscript manager denies clipboard writes.
 {
   const f = fixture('/alice/widgets', { clipboardError: true });
@@ -272,4 +423,4 @@ const rawHost = 'https://raw.githubusercontent.com';
   assert.match(f.alerts[0], /复制 Raw 链接失败/);
 }
 
-console.log('GitHub Page Tools: 8 fixture groups passed (targeted context, Raw host, navigation, safety, clipboard, scroll).');
+console.log('GitHub Page Tools: 16 fixture groups passed (Raw/Release context menus, download URLs, navigation, safety, clipboard, scroll).');
