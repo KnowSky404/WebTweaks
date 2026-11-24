@@ -2,7 +2,7 @@
 
 `account-usage-dashboard.user.js` adds a small floating usage icon to `chatgpt.com`. Click it to open the full, draggable account-usage panel. It is a standalone Tampermonkey/Violentmonkey userscript and does not require a build step, package manager, or remote dependency.
 
-Version 1.7.1 remembers the last compact/wide panel layout and synchronizes Range Analysis with the selected UTC usage range, including daily detail, model usage and a clearly labeled hypothetical Standard API-equivalent USD estimate. Actual quota windows remain independent, and authoritative cost data is still unavailable.
+Version 1.8.0 remembers the last compact/wide panel layout and synchronizes Range Analysis with the selected UTC usage range, including daily detail, model usage and auditable Standard API-equivalent USD estimates that prefer reconciled model-level token data, otherwise use explicitly hypothetical share allocation. Actual quota windows remain independent, and authoritative cost data is still unavailable.
 
 ## Installation
 
@@ -28,9 +28,9 @@ The compact view is only an icon with an optional health dot; it does not show t
 - every recognized primary and additional rate-limit window, with duration, used/remaining percentages, progress, reset time, countdown, and limit state;
 - optional Credits and spend-control fields only when the server supplies values, without treating missing or `null` values as zero;
 - range analysis with Tokens, Turns, Threads, daily model usage and a hypothetical API-equivalent cost estimate, all following the selected range; optional real-Credit capacity extrapolation appears only for an actual current quota window derived from `reset_at - limit_window_seconds`;
-- a daily breakdown with date, Tokens, Turns, Threads, primary model, and API-equivalent estimate when the required data is available;
+- a daily breakdown with date, Tokens, Turns, Threads, primary model, and API-equivalent estimate when the required data is available; expand each date to inspect raw shares, calculation weights, three token classes, model identifiers, speed, price mapping, and cost;
 - current quota period, month, last 7 days, and last 30 days, including server-supplied Credits, token classes, threads, turns, and dates with data;
-- client aggregates sorted by tokens and a native CSS bar chart for the selected daily metric;
+- client aggregates sorted by tokens, reconciled against each day's total with a separate unclassified residual and discrepancy notice; a native CSS bar chart for the selected daily metric;
 - a model-usage pie chart and daily model rows when the model-breakdown data is available: the same model and speed are merged, rows are sorted in descending share order, zero-valued rows are hidden, and the value is shown as a percentage/model-usage share. The field is never presented as `Credits`, `Token usage`, or a fabricated token count;
 - a native conic-gradient model-usage pie chart with accessible legend tooltips, synchronized with the selected usage-statistics range;
 - a title-bar expand/restore button for switching between compact and wide layouts without fetching data again;
@@ -55,7 +55,9 @@ The model-usage breakdown belongs to Usage Statistics and comes from ChatGPT Ana
 
 ### API-equivalent scenario (USD)
 
-This is an illustrative calculation, **not measured per-model token attribution, a ChatGPT/Codex bill, purchased Credits, or an estimate of remaining quota**. For each UTC date, join the Workspace Analytics row (uncached input, cached input, output) with that date's positive Model Breakdown shares. Assume the three token classes have the same model distribution, normalize that day's returned weights, and calculate each model's hypothetical cost as:
+This is a Standard API-equivalent calculation, **not a ChatGPT/Codex bill, purchased Credits, or an estimate of remaining quota**. For each UTC date, prefer absolute per-model counts if Workspace Analytics supplies a `models` array with recognized model identities and all three token classes (uncached input, cached input, output). Each model's total must be consistent and each of the three per-model sums must match the corresponding daily total exactly. Price those counts directly; the percentage endpoint is not needed for that day. The presence of `models`, a model name, or a credit percentage alone does not prove model-level token attribution.
+
+When the absolute model detail is absent, incomplete or does not reconcile, fall back to that date's valid Model Breakdown shares. Assume the three token classes have the same model distribution, normalize that day's returned weights, and calculate each model's hypothetical cost as:
 
 `weight × (uncached_input × input_rate + cached_input × cached_rate + output × output_rate) / 1,000,000`
 
@@ -80,11 +82,25 @@ The following **USD per million text tokens** rates are a local Standard short-c
 
 The snapshot reprices historical usage at these reference rates; it is not historical billing. Fast, long-context surcharges, cache writes, tools, discounts, taxes, regional surcharges and other fees are not modeled. Only documented model aliases/snapshots are mapped; unknown names are never assigned a guessed tier.
 
-Both sources must cover the selected interval. Days missing a token class, a matching model distribution, a valid total, or a rate for any positive-share model are excluded, not priced as zero or redistributed to known models. Completeness is checked before allocation; even a malformed entry discarded during normalization invalidates the whole day's cost estimate, with an explicit unavailable reason. Per-day weights need not sum to exactly 100, because the source's denominator is not independently verified. All-invalid dates remain represented as incomplete instead of disappearing. A subsequent successful refresh can replace the incomplete distribution. A successful empty response does not establish zero usage. The UI labels partial results as a subtotal, shows priced/returned/calendar date counts, unavailable reasons and stale-data notices, and exposes daily USD estimates and a collapsible model cost breakdown. Even with all dates priced, the attribution assumption remains hypothetical. Only the returned daily metrics and model usage shares are observed data.
+Workspace Analytics must cover the selected interval; Model Breakdown coverage is required only for share-based allocation. Days missing a token class, valid daily total, complete model distribution for fallback, or a rate for any participating model are excluded, not priced as zero or redistributed to known models. A reconciled absolute-model day with an unknown price is not silently replaced by a percentage-based estimate. Completeness is checked before allocation; a malformed share entry invalidates that day's share-based estimate, with an explicit unavailable reason. Per-day weights need not sum to exactly 100 because the source's denominator is not independently verified. All-invalid dates remain represented as incomplete. A subsequent successful refresh can replace the distribution. A successful empty response does not establish zero usage.
+
+The UI labels partial results as a subtotal and shows priced/returned/calendar date counts, token-volume coverage (priced tokens divided by the known returned daily totals; unavailable when any returned total is unknown or the denominator is zero), separate reconciled-model and hypothetical-allocation token/day counts, and stale-data notices. Expand each date to inspect raw shares versus normalized weights, allocated or observed token classes, model/speed, exact pricing ID and per-million rates, individual USD estimates, and exclusion reasons. Model-level absolute token counts, where present and reconciled, are returned data; share allocation remains hypothetical even with 100% token coverage. No coverage metric proves the endpoint includes every account activity.
+
+### Analytics scope and client reconciliation
+
+The private Workspace Analytics endpoint is not a documented, complete account or Platform API billing ledger. A returned client ID describes a client, not necessarily a product/surface: Web or Desktop cannot by itself distinguish ordinary Chat, Work, and Codex. Compare each day's absolute total with the sum of client rows, report positive differences as unclassified, and suppress range percentages when any daily group exceeds the total or any required count is missing. Unclassified differences are **not** inferred Chat usage. Missing token classes cannot be used to derive a complete total. OpenAI's [shared ChatGPT/Codex allowance announcement](https://help.openai.com/en/articles/20001625-understanding-chatgpt-and-codex-usage-limits) describes a December 2026 transition and excludes Instant chat from that shared allowance; this policy alone does not establish what these private endpoints currently return. Verify product coverage in a signed-in account with controlled usage and allow for reporting delays.
+
+### Open-source implementation references
+
+- [ccusage Codex adapter](https://github.com/ccusage/ccusage/tree/main/rust/adapters/codex): calculates from local session model/token records, distinguishes cached and uncached input, and supports separate pricing tiers. Local logs are not an account-wide ledger.
+- [CodexBar pricing design](https://github.com/steipete/CodexBar/blob/main/docs/model-pricing.md): exact provider/model pricing, explicit aliases, versioned rates and unknown-price handling.
+- [codex-meter usage domain](https://github.com/Wangnov/codex-meter/blob/main/codex-meter-extension/domain/usage-domain.js): same private analytics data family, client residual reconciliation and optional absolute model token rows. Its Credit calculations are not substituted for this script's Standard API price table.
+
+These references inform the data handling and audit design; no third-party runtime dependency or source-code import is required. The optional model schema and product scope still require live account verification.
 
 ## Cost capability boundary
 
-The existing `usageCostProviders` seam retains `threadUsageProvider`, `creditProvider`, and `tokenPricingProvider` for distinct sources. The model-share scenario is deliberately calculated separately and cannot become a real Credit or billing estimate through the cost resolver. Version 1.7.1 does not probe Thread Usage during ordinary refresh. Diagnostics retain `costCapability: unavailable` for authoritative cost and report a separate API-equivalent scenario label without any USD amounts. Actual quota percentages and Credits remain independent of this scenario.
+The existing `usageCostProviders` seam retains `threadUsageProvider`, `creditProvider`, and `tokenPricingProvider` for distinct sources. The API-equivalent estimate (reconciled model tokens or model-share scenario) is deliberately calculated separately and cannot become a real Credit or billing estimate through the cost resolver. Version 1.8.0 does not probe Thread Usage during ordinary refresh. Diagnostics retain `costCapability: unavailable` for authoritative cost and report a separate reconciled-model/share-allocation capability label without any USD amounts. Actual quota percentages and Credits remain independent of this scenario.
 
 ## Safe diagnostics
 
@@ -124,8 +140,8 @@ The script only sends requests to `chatgpt.com`. It does not upload account or u
 - `/backend-api/wham/*` is an internal ChatGPT interface and may change without notice. Unknown fields are ignored and recognized fields remain best-effort.
 - `plan_type` is a plan label, not proof of the complete billing or subscription lifecycle. The panel does not infer subscription validity from a plan name.
 - Analytics data may be delayed or unavailable for an account or plan. Daily aggregation uses UTC date buckets where possible; the trend does not estimate or interpolate values.
-- The model-breakdown Analytics data may be delayed or unavailable. Its percentages describe model usage share only; they do not provide model-level Token attribution, and therefore cannot support a dollar amount on their own.
-- Authoritative cost data remains unavailable. The API-equivalent scenario assumes the model usage shares can serve as allocation weights for each day's token classes. Actual model token distributions may differ substantially, and the result is neither a billing estimate nor an official quota conversion.
+- The model-breakdown Analytics data may be delayed or unavailable. Its percentages describe model usage share only; they do not provide model-level Token attribution. Prefer optional absolute model counts from Workspace Analytics only when all token classes reconcile; availability depends on the account and response.
+- Authoritative cost data remains unavailable. The fallback API-equivalent scenario assumes the model usage shares can serve as allocation weights for each day's token classes. Actual model token distributions may differ substantially; neither path is an official bill or quota conversion.
 - When a current quota period is represented as daily rows, the reset day can include data from outside the exact quota boundary.
 - Percentages are shown only when supplied or safely derived from the other percentage; unknown percentages use an empty track and an explicit notice rather than a fabricated grey fill. The script does not invent an official total quota, message count, or token total.
 - A real signed-in browser session is required for live account data. This repository validation cannot guarantee access to a user's private ChatGPT session.
@@ -138,7 +154,7 @@ Run the dependency-free fixture suite with Node.js:
 node --test scripts/chatgpt-com/account-usage-dashboard.test.cjs
 ```
 
-The suite evaluates the actual userscript with startup disabled, using synthetic daily data, mocked requests, and a fixed clock. It covers UTC boundaries, preset/custom aggregation, multi-day model shares, cache reuse and forced replacement, independent source failures, obsolete range responses, compact/wide anchor restoration, remembered layout and launcher interaction, verified price arithmetic, selected-range daily estimates, missing/stale inputs, and incomplete model distributions (including all-invalid days, split date buckets and successful cache replacement after refresh). It does not replace the authenticated browser checks below.
+The suite evaluates the actual userscript with startup disabled, using synthetic daily data, mocked requests, and a fixed clock. It covers UTC boundaries, preset/custom aggregation, multi-day model shares, cache reuse and forced replacement, independent source failures, obsolete range responses, compact/wide anchor restoration, remembered layout and launcher interaction, verified price arithmetic, selected-range daily estimates, missing/stale inputs, incomplete model distributions (including all-invalid days, split date buckets and successful cache replacement after refresh), reconciled absolute-model precedence, unknown prices, token-weighted coverage, daily audit details and client residual/mismatch handling. It does not replace the authenticated browser checks below.
 
 ## Manual test checklist
 
@@ -152,7 +168,7 @@ On a disposable browser profile or a signed-in ChatGPT session, verify:
 6. A usage response with missing, `null`, unknown, snake_case, camelCase, single-window, array, object, and additional-window shapes renders without an uncaught exception.
 7. Switch among current cycle, month, 7 days, 30 days, and a custom range with different usage. The date caption, metrics, model pie/legend, client distribution, and trend match the same UTC interval; the range analysis, daily table, daily model rows and API-equivalent estimates follow that interval; real quota windows remain independent. The trend tooltip matches the returned value and the Analytics link works. Repeat with an older custom range, a canceled date draft, a rapid range switch while loading, a failed request, and a manual refresh.
 8. The title bar contains refresh, official Analytics, expand/restore, and collapse. Check the initial compact panel, wide layout, collapse/reopen and reload of either remembered layout, launcher drag/click after closing wide mode, return to the original anchor, and narrow-viewport reflow in light/dark themes. Switching layout does not request data or change the selected date range, draft values, section state, or chart metric; no footer settings/link block is rendered.
-9. Each first-level section expands and collapses independently, and section preferences persist across reloads. Verify known-price days, missing token classes, unknown models, malformed/missing model shares and identities, partial and stale API-equivalent subtotals; never reinterpret them as Credits or true account cost.
+9. Each first-level section expands and collapses independently, and section preferences persist across reloads. Verify known-price days, missing token classes, unknown models, malformed/missing model shares and identities, absolute-model reconciliation versus fallback, per-date audit rates/weights, token coverage, client residuals and discrepancies, partial and stale API-equivalent subtotals; never reinterpret them as Credits or true account cost.
 10. Mock 403, 404, 429, 5xx, timeout, empty-Analytics, and schema-change responses remain understandable without uncaught errors.
 11. Quota progress colors are continuous at 20%, 50%, 80%, and 95%; the percentage remains visible and the progressbar has accessible values.
 12. Multiple model/speed rows merge correctly, zero values are hidden, the model pie chart and legend remain accessible, and daily model rows are grouped by date and sorted descending.

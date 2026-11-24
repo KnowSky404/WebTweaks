@@ -23,10 +23,10 @@ async function runRegressionTests(source, assert, Params, test) {
   function load(storage = new Map()) {
     const marker = '  window.wtChatgptAccountUsageCleanup = cleanup;\n  initialize();';
     assert.ok(source.includes(marker));
-    const patched = source.replace(marker, `  return { runtime, deriveRanges, analyticsRequestRange, normalizeDailyRows, normalizeModelBreakdown, aggregateModelShares, modelBreakdownForRange, selectedAnalyticsRange, rebuildAnalyticsRanges, mergeCoverage, isRangeCovered, rangeError, fetchAnalyticsRange, fetchModelBreakdown, selectAnalyticsRange, commitAnalyticsRange, applyPosition, validateCustomRange, inclusiveRangeToExclusiveRange, estimateApiCost, estimateDailyApiEquivalent, estimateRangeApiEquivalent, renderRangeAnalysis, isWidePanel, setWidePreference, startDrag, setRequest(fn) { requestJSON = fn; } };`).replace('(() => {', 'return (() => {');
+    const patched = source.replace(marker, `  return { runtime, deriveRanges, analyticsRequestRange, normalizeDailyRows, normalizeModelBreakdown, aggregateModelShares, modelBreakdownForRange, selectedAnalyticsRange, rebuildAnalyticsRanges, mergeCoverage, isRangeCovered, rangeError, fetchAnalyticsRange, fetchModelBreakdown, selectAnalyticsRange, commitAnalyticsRange, applyPosition, validateCustomRange, inclusiveRangeToExclusiveRange, estimateApiCost, estimateDailyApiEquivalent, estimateRangeApiEquivalent, reconcileClientTotals, renderRangeAnalysis, isWidePanel, setWidePreference, startDrag, setRequest(fn) { requestJSON = fn; } };`).replace('(() => {', 'return (() => {');
     const localStorage = { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) };
     const document = { createElement(tag) {
-      return { tag, className: '', textContent: '', children: [], append(...children) { this.children.push(...children); } };
+      return { tag, className: '', textContent: '', dataset: {}, children: [], append(...children) { this.children.push(...children); } };
     } };
     const api = new Function('Date', 'URLSearchParams', 'localStorage', 'window', 'document', patched)(FixedDate, Params, localStorage, { innerWidth: 1440, innerHeight: 900 }, document);
     api.runtime.state.data = { windows: [windowFixture] };
@@ -372,7 +372,7 @@ async function runRegressionTests(source, assert, Params, test) {
     const rendered = collect(api.renderRangeAnalysis());
     assert.ok(rendered.includes('模型分布不完整'));
     assert.ok(rendered.includes('仅为可估算日期小计'));
-    assert.ok(rendered.includes('不参与区间占比及 API 估算'));
+    assert.ok(rendered.includes('不参与区间占比或占比分摊'));
     await api.selectAnalyticsRange('cycle');
     payload = { units: 'percent', data: [
       { date: '2026-11-22', models: [{ model: 'gpt-6.2-sol', credits: 50 }, { model: 'gpt-6.2-astra', credits: 50 }] },
@@ -385,6 +385,126 @@ async function runRegressionTests(source, assert, Params, test) {
     assert.equal(estimate.days.get('2026-11-22').reason, null);
     assert.ok(api.modelBreakdownForRange(api.selectedAnalyticsRange()).dailyRows.every((day) => day.complete));
     assert.ok(!collect(api.renderRangeAnalysis()).includes('模型分布不完整'));
+  });
+
+  await test('reconciled model-level absolute tokens take precedence over model shares without double-counting', async () => {
+    const api = load();
+    const totals = { text_total_tokens: 3_000_000, uncached_text_input_tokens: 1_000_000, cached_text_input_tokens: 1_000_000, text_output_tokens: 1_000_000 };
+    const raw = { date: '2026-11-23', totals, models: [
+      { model: 'gpt-6.2-sol', uncached_text_input_tokens: 1_000_000, cached_text_input_tokens: 1_000_000, text_output_tokens: 0 },
+      { model: 'gpt-6.2-astra', totals: { uncached_text_input_tokens: 0, cached_text_input_tokens: 0, text_output_tokens: 1_000_000 } }
+    ] };
+    const share = { units: 'percent', data: [{ date: raw.date, models: [{ model: 'gpt-6.2-sol', credits: 100 }] }] };
+    const distribution = api.normalizeModelBreakdown(share).dailyRows[0];
+    const day = api.normalizeDailyRows([raw])[0];
+    const actual = api.estimateDailyApiEquivalent(day.metrics, distribution, day.absoluteModels);
+    assert.equal(actual.method, 'model-tokens');
+    assert.ok(Math.abs(actual.valueUsd - 42.1) < 1e-9);
+    assert.equal(actual.allocations[1].outputTokens, 1_000_000);
+    assert.equal(actual.allocations[1].pricing.outputPerMillion, 40);
+    const fallback = api.estimateDailyApiEquivalent(day.metrics, distribution);
+    assert.equal(fallback.method, 'model-share');
+    assert.ok(Math.abs(fallback.valueUsd - 12.1) < 1e-9);
+    for (const invalid of [
+      [{ model: 'gpt-6.2-sol', uncached_text_input_tokens: 1_000_000, cached_text_input_tokens: 1_000_000 }],
+      [{ model: 'gpt-6.2-sol', uncached_text_input_tokens: 0, cached_text_input_tokens: 2_000_000, text_output_tokens: 1_000_000 }],
+      [{ model: 'gpt-6.2-sol', uncached_text_input_tokens: 1_000_000, cached_text_input_tokens: 1_000_000, text_output_tokens: 1_000_000, text_total_tokens: 'bad' }],
+      [{ model: 'gpt-6.2-sol', uncached_text_input_tokens: 1_000_000, cached_text_input_tokens: 1_000_000, text_output_tokens: 1_000_000 }, null]
+    ]) {
+      const normalized = api.normalizeDailyRows([{ ...raw, models: invalid }])[0];
+      const result = api.estimateDailyApiEquivalent(normalized.metrics, distribution, normalized.absoluteModels);
+      assert.equal(result.method, 'model-share');
+      assert.ok(result.fallbackReason);
+      assert.ok(Math.abs(result.valueUsd - 12.1) < 1e-9);
+    }
+    const unknown = api.normalizeDailyRows([{ ...raw, models: [{ model: 'unknown-model', ...totals }] }])[0];
+    const unknownResult = api.estimateDailyApiEquivalent(unknown.metrics, distribution, unknown.absoluteModels);
+    assert.equal(unknownResult.method, 'model-tokens');
+    assert.equal(unknownResult.valueUsd, null);
+    assert.equal(unknownResult.allocations[0].pricing, null);
+
+    api.setRequest(async (url) => url.includes('daily-token-usage-breakdown') ? fail : ok([raw]));
+    const { start, end } = api.analyticsRequestRange([windowFixture]);
+    await Promise.all([api.fetchAnalyticsRange(start, end), api.fetchModelBreakdown(start, end)]);
+    const estimate = api.estimateRangeApiEquivalent(api.selectedAnalyticsRange());
+    assert.equal(estimate.modelCovered, false);
+    assert.equal(estimate.measuredDays, 1);
+    assert.equal(estimate.allocatedDays, 0);
+    assert.equal(estimate.tokenCoveragePercent, 100);
+    assert.ok(Math.abs(estimate.valueUsd - 42.1) < 1e-9);
+    const collect = (node) => [node.textContent, ...node.children.flatMap(collect)].join(' ');
+    const rendered = collect(api.renderRangeAnalysis());
+    assert.ok(rendered.includes('逐类对账通过'));
+    assert.ok(rendered.includes('Token 计价覆盖率：100%'));
+  });
+
+  await test('coverage weights returned token volumes rather than day count and audits daily allocations', async () => {
+    const api = load();
+    const ws = [
+      { date: '2026-11-22', totals: { tokens: 1_000_000, uncached_input_tokens: 1_000_000, cached_input_tokens: 0, output_tokens: 0 } },
+      { date: '2026-11-23', totals: { tokens: 9_000_000, uncached_input_tokens: 9_000_000, cached_input_tokens: 0, output_tokens: 0 } }
+    ];
+    const md = { units: 'percent', data: [
+      { date: '2026-11-22', models: [{ model: 'gpt-6.2-sol', speed: 'standard', credits: 20 }, { model: 'gpt-6.2-astra', speed: 'fast', credits: 30 }] },
+      { date: '2026-11-23', models: [{ model: 'unknown-model', credits: 100 }] }
+    ] };
+    api.setRequest(async (url) => ok(url.includes('daily-token-usage-breakdown') ? md : ws));
+    const { start, end } = api.analyticsRequestRange([windowFixture]);
+    await Promise.all([api.fetchAnalyticsRange(start, end), api.fetchModelBreakdown(start, end)]);
+    let estimate = api.estimateRangeApiEquivalent(api.selectedAnalyticsRange());
+    assert.equal(estimate.pricedDays, 1);
+    assert.equal(estimate.reportedTokens, 10_000_000);
+    assert.equal(estimate.pricedTokens, 1_000_000);
+    assert.equal(estimate.tokenCoveragePercent, 10);
+    assert.equal(estimate.allocatedDays, 1);
+    assert.ok(Math.abs(estimate.valueUsd - 5.6) < 1e-9);
+    const allocations = estimate.days.get('2026-11-22').allocations;
+    const sol = allocations.find((row) => row.model === 'gpt-6.2-sol');
+    assert.equal(sol.rawShare, 20);
+    assert.equal(sol.weight, .4);
+    assert.equal(sol.uncachedInputTokens, 400_000);
+    assert.equal(sol.valueUsd, .8);
+    assert.equal(estimate.days.get('2026-11-23').allocations[0].valueUsd, null);
+    const collect = (node) => [node.textContent, ...node.children.flatMap(collect)].join(' ');
+    const rendered = collect(api.renderRangeAnalysis());
+    assert.ok(rendered.includes('Token 计价覆盖率：10%'));
+    assert.ok(rendered.includes('2026-11-22 · 计价明细'));
+    assert.ok(rendered.includes('400,000'));
+    assert.ok(rendered.includes('20%'));
+    assert.ok(rendered.includes('40%'));
+    assert.ok(rendered.includes('无已知 Standard 费率'));
+    ws[1].totals = { uncached_input_tokens: 9_000_000 };
+    await api.fetchAnalyticsRange(start, end, {}, true);
+    estimate = api.estimateRangeApiEquivalent(api.selectedAnalyticsRange());
+    assert.equal(estimate.unknownTokenDays, 1);
+    assert.equal(estimate.tokenCoveragePercent, null);
+    assert.equal(estimate.reportedTokens, 1_000_000);
+  });
+
+  await test('client shares reconcile against daily totals and never identify residual as Chat usage', () => {
+    const api = load();
+    const rows = api.normalizeDailyRows([
+      { date: '2026-11-22', totals: { text_total_tokens: 100 }, clients: [{ client_id: 'CLI', text_total_tokens: 60 }, { client_id: 'WEB', text_total_tokens: 10 }] },
+      { date: '2026-11-23', totals: { text_total_tokens: 200 }, clients: [{ client_id: 'CLI', text_total_tokens: 100 }] }
+    ]);
+    let result = api.reconcileClientTotals(rows, '2026-11-22', '2026-11-24');
+    assert.equal(result.reportedTokens, 300);
+    assert.equal(result.groupedTokens, 170);
+    assert.equal(result.unclassifiedTokens, 130);
+    assert.equal(result.rows.find((row) => row.unclassified).tokens, 130);
+    assert.ok(Math.abs(result.rows.reduce((sum, row) => sum + row.tokenShare, 0) - 100) < 1e-9);
+    rows[0].clients[0].metrics.tokens = 120;
+    result = api.reconcileClientTotals(rows, '2026-11-22', '2026-11-24');
+    assert.equal(result.excessDays, 1);
+    assert.equal(result.unclassifiedTokens, 100);
+    assert.ok(result.rows.every((row) => row.tokenShare === null));
+    const malformed = api.normalizeDailyRows([{ date: '2026-11-23', totals: { tokens: 100 }, clients: [null, { client_id: 'CLI', tokens: 20 }] }]);
+    result = api.reconcileClientTotals(malformed, '2026-11-23', '2026-11-24');
+    assert.equal(result.unknownDays, 1);
+    assert.equal(result.unclassifiedTokens, 0);
+    assert.ok(result.rows.every((row) => row.tokenShare === null));
+    const partial = api.normalizeDailyRows([{ date: '2026-11-23', totals: { cached_text_input_tokens: 100 } }]);
+    assert.equal(partial[0].metrics.tokens, null);
   });
 }
 
