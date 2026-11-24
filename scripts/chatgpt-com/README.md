@@ -2,7 +2,7 @@
 
 `account-usage-dashboard.user.js` adds a small floating usage icon to `chatgpt.com`. Click it to open the full, draggable account-usage panel. It is a standalone Tampermonkey/Violentmonkey userscript and does not require a build step, package manager, or remote dependency.
 
-Version 1.6.0 synchronizes the selected UTC usage range across metrics, model usage share, client distribution, and daily trends, while keeping quota-cycle analysis independent. It adds a responsive wide dashboard alongside the existing compact floating panel. Cost calculation is disabled because the current account does not expose authoritative cost data.
+Version 1.7.0 remembers the last compact/wide panel layout and synchronizes Range Analysis with the selected UTC usage range, including daily detail, model usage and a clearly labeled hypothetical Standard API-equivalent USD estimate. Actual quota windows remain independent, and authoritative cost data is still unavailable.
 
 ## Installation
 
@@ -27,8 +27,8 @@ The compact view is only an icon with an optional health dot; it does not show t
 - signed-in state, display name, masked email, plan context (including `Pro Lite` as a plan tier), usage status, and update time;
 - every recognized primary and additional rate-limit window, with duration, used/remaining percentages, progress, reset time, countdown, and limit state;
 - optional Credits and spend-control fields only when the server supplies values, without treating missing or `null` values as zero;
-- current cycle analysis derived from each quota window's `reset_at - limit_window_seconds`, including Tokens, Turns, Threads, daily model usage, and an optional estimated cycle capacity;
-- a daily breakdown with date, Tokens, Turns, Threads, and the primary model;
+- range analysis with Tokens, Turns, Threads, daily model usage and a hypothetical API-equivalent cost estimate, all following the selected range; optional real-Credit capacity extrapolation appears only for an actual current quota window derived from `reset_at - limit_window_seconds`;
+- a daily breakdown with date, Tokens, Turns, Threads, primary model, and API-equivalent estimate when the required data is available;
 - current quota period, month, last 7 days, and last 30 days, including server-supplied Credits, token classes, threads, turns, and dates with data;
 - client aggregates sorted by tokens and a native CSS bar chart for the selected daily metric;
 - a model-usage pie chart and daily model rows when the model-breakdown data is available: the same model and speed are merged, rows are sorted in descending share order, zero-valued rows are hidden, and the value is shown as a percentage/model-usage share. The field is never presented as `Credits`, `Token usage`, or a fabricated token count;
@@ -43,32 +43,52 @@ The compact view is only an icon with an optional health dot; it does not show t
 
 ## UI design and product boundary
 
-The launcher is a 44–48px draggable utility button with a generic usage/activity inline SVG, a subtle border and shadow, and a status indicator. A small pointer movement does not open the panel after a drag. The expanded panel uses the local `wt-` design tokens, a compact account summary, quota-window sections, analytics, title-bar icon actions, and collapsed diagnostics. It opens in the existing compact layout (approximately 400px wide), with an expand/restore icon in the top-right header. Wide mode is centered, up to 1120px wide with 12px viewport margins, and keeps scrolling inside the panel. On sufficiently wide screens, quota cards reflow into columns, Tokens/Turns/Threads use a three-column metric grid, model usage and client distribution sit side-by-side, and daily charts and tables have more space. Narrow viewports retain a single-column flow. Both layouts use the same data, range selection, theme, and section state.
+The launcher is a 44–48px draggable utility button with a generic usage/activity inline SVG, a subtle border and shadow, and a status indicator. A small pointer movement does not open the panel after a drag. The expanded panel uses the local `wt-` design tokens, a compact account summary, quota-window sections, analytics, title-bar icon actions, and collapsed diagnostics. It opens in the remembered layout (compact, approximately 400px wide, on first use), with an expand/restore icon in the top-right header. Wide mode is centered, up to 1120px wide with 12px viewport margins, and keeps scrolling inside the panel. On sufficiently wide screens, quota cards reflow into columns, Tokens/Turns/Threads use a three-column metric grid, model usage and client distribution sit side-by-side, and daily charts and tables have more space. Narrow viewports retain a single-column flow. Both layouts use the same data, range selection, theme, and section state.
 
 The visual direction is a local adaptation of public [OpenAI Apps SDK UI](DESIGN.md#official-references) patterns. This is an unofficial userscript, not an OpenAI, ChatGPT, or Codex product. It does not use the OpenAI Logo, Blossom, wordmark, or other OpenAI marks; launcher icons are generic usage/activity symbols. See [`DESIGN.md`](DESIGN.md) for the complete site-level specification.
 
-The launcher and compact panel share one size-independent viewport anchor. Dragging either updates that anchor; wide mode is centered and not draggable, and entering/leaving it never rewrites the compact anchor. Closing the panel or reloading the page returns to compact mode on the next open. Window-size changes may temporarily clamp the visible surface without overwriting the saved position.
+The launcher and compact panel share one size-independent viewport anchor. Dragging either updates that anchor; wide mode is centered and not draggable, and entering/leaving it never rewrites the compact anchor. Closing the panel, navigating or reloading the page retains the last explicitly chosen layout. The launcher remains compact and draggable even if wide mode is remembered. The layout preference and collapsed state are independent. Window-size changes may temporarily clamp the visible surface without overwriting the saved position.
 
 ## Model usage and cost contract
 
-The model-usage breakdown belongs to Usage Statistics and comes from ChatGPT Analytics. A response with `units: "percent"` makes each model/speed value a usage percentage or model share. The source field is named `credits`, but the UI must not call it Credits, Token usage, or token percentage. Same-model/same-speed entries are merged per UTC date and then summed across the selected date buckets and normalized to 100% before descending sorting; zero values are omitted. Without authoritative per-day weights this is a normalized summary of the returned daily model values, not a token-weighted or independently verified account-wide consumption percentage. No token count is inferred from a percentage.
+The model-usage breakdown belongs to Usage Statistics and comes from ChatGPT Analytics. A response with `units: "percent"` makes each model/speed value a usage percentage or model share. The source field is named `credits`, but the UI must not call it Credits, Token usage, or token percentage. Same-model/same-speed entries are merged per UTC date and then summed across the selected date buckets and normalized to 100% before descending sorting; zero values are omitted. Without authoritative per-day weights this is a normalized summary of the returned daily model values, not a token-weighted or independently verified account-wide consumption percentage. The distribution UI never presents model share as a token count; the separate API-equivalent scenario below uses it only as an explicitly hypothetical allocation weight.
 
-The current UI does not calculate or display API-equivalent value, USD, billing, or cost summaries. When the source field is `units: "percent"`, model `credits` values remain percentages (`模型使用占比`) and are never treated as Credits, Tokens, or USD.
+### API-equivalent scenario (USD)
 
-The integration boundary uses the following provider architecture:
+This is an illustrative calculation, **not measured per-model token attribution, a ChatGPT/Codex bill, purchased Credits, or an estimate of remaining quota**. For each UTC date, join the Workspace Analytics row (uncached input, cached input, output) with that date's positive Model Breakdown shares. Assume the three token classes have the same model distribution, normalize that day's returned weights, and calculate each model's hypothetical cost as:
 
-- `MODEL_PRICING` is a per-model table with input, cached-input, output prices, and an effective date. It must cover `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5`; it must not substitute one global price for all models.
-- A rate card entry with no source-confirmed price remains unavailable rather than becoming a guessed amount; the UI never turns model share into a dollar value.
-- `estimateApiCost({ model, inputTokens, cachedInputTokens, outputTokens })` calculates uncached input cost plus cached input cost plus output cost. It must not multiply total Tokens by an average price or multiply a percentage by USD.
-- `usageCostProviders` contains `threadUsageProvider`, `creditProvider`, and `tokenPricingProvider` as an internal extension seam only. These providers are not rendered as cost cards or billing values.
+`weight × (uncached_input × input_rate + cached_input × cached_rate + output × output_rate) / 1,000,000`
+
+Sum the daily model contributions across the committed range, rather than applying the period's unweighted aggregate pie chart to total tokens. Do not interpret the model percentages as actual token shares. Model/speed rows remain separate in the distribution; the cost scenario uses the same Standard model rate for all speed values.
+
+The following **USD per million text tokens** rates are a local Standard short-context reference snapshot checked **2026-11-23**, from [OpenAI API Pricing](https://developers.openai.com/api/docs/pricing) and the [official model catalog](https://developers.openai.com/api/docs/models). Individual legacy rates were verified against the model pages for [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol), [Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra), [Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna), [GPT-5.5](https://developers.openai.com/api/docs/models/gpt-5.5), [GPT-5.4](https://developers.openai.com/api/docs/models/gpt-5.4), and [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol). The pricing page notes GPT-5.6 Sol promotional pricing through 2026-11-30; this dated snapshot must be rechecked when prices change.
+
+| API model ID | Uncached input | Cached input | Output |
+| --- | ---: | ---: | ---: |
+| `gpt-6.2-astra` | $8 | $0.40 | $40 |
+| `gpt-6.2-sol` | $2 | $0.10 | $10 |
+| `gpt-6-astra` | $10 | $1 | $50 |
+| `gpt-6.1-sol` | $2 | $0.10 | $10 |
+| `gpt-6.1-terra` | $1 | $0.05 | $5 |
+| `gpt-6-sol` | $2 | $0.20 | $10 |
+| `gpt-6-luna` | $0.10 | $0.01 | $0.50 |
+| `gpt-5.6-sol` | $4 | $0.40 | $20 |
+| `gpt-5.6-terra` | $2 | $0.20 | $12 |
+| `gpt-5.6-luna` | $0.20 | $0.02 | $1.20 |
+| `gpt-5.5` | $5 | $0.50 | $30 |
+| `gpt-5.4` | $2.50 | $0.25 | $15 |
+
+The snapshot reprices historical usage at these reference rates; it is not historical billing. Fast, long-context surcharges, cache writes, tools, discounts, taxes, regional surcharges and other fees are not modeled. Only documented model aliases/snapshots are mapped; unknown names are never assigned a guessed tier.
+
+Both sources must cover the selected interval. Days missing a token class, a matching model distribution, a valid total, or a rate for any positive-share model are excluded, not priced as zero or redistributed to known models. A successful empty response does not establish zero usage. The UI labels partial results as a subtotal, shows priced/returned/calendar date counts, unavailable reasons and stale-data notices, and exposes daily USD estimates and a collapsible model cost breakdown. Even with all dates priced, the attribution assumption remains hypothetical. Only the returned daily metrics and model usage shares are observed data.
 
 ## Cost capability boundary
 
-The internal provider seam retains future `thread_usage`, `real_credit`, and `token_estimate` capability names, but version 1.6.0 does not probe Thread Usage or render any cost result. Diagnostics report `Thread Usage: unavailable`, `Credit: unavailable` when no positive Credit data is present, and `costCapability: unavailable`. No response body, thread ID, account ID, cookie, access token, authorization header, USD amount, or billing estimate is shown or copied.
+The existing `usageCostProviders` seam retains `threadUsageProvider`, `creditProvider`, and `tokenPricingProvider` for distinct sources. The model-share scenario is deliberately calculated separately and cannot become a real Credit or billing estimate through the cost resolver. Version 1.7.0 does not probe Thread Usage during ordinary refresh. Diagnostics retain `costCapability: unavailable` for authoritative cost and report a separate API-equivalent scenario label without any USD amounts. Actual quota percentages and Credits remain independent of this scenario.
 
 ## Safe diagnostics
 
-Diagnostics may expose only redacted state useful for troubleshooting: source availability, model-breakdown status, model-row count, request status, and safe window-shape metadata. They must never expose Token values, cookies, authorization values, account IDs, thread IDs, raw responses, USD values, or other authentication material. The same rule applies to the UI, console, clipboard, and persistent storage.
+Diagnostics may expose only redacted state useful for troubleshooting: source availability, model-breakdown status, model-row count, request status, and safe window-shape metadata. They must never expose Token values, cookies, authorization values, account IDs, thread IDs, raw responses, USD values, or other authentication material. No raw responses or authentication material may appear in the UI, console, clipboard, or persistent storage. The ordinary analytics UI may show the requested token metrics and the explicitly labeled hypothetical USD estimate; diagnostics, console, clipboard, and persistent storage must not contain these values.
 
 ## Plan labels and quota semantics
 
@@ -89,7 +109,7 @@ Analytics supports the current cycle, current month, last 7 days, last 30 days, 
 
 Custom dates use UTC date buckets and an inclusive UI end date: `2026-08-01 — 2026-08-14` includes August 14. The internal range converts that end date to the next UTC date for exclusive filtering. The Workspace Analytics request uses the exclusive end, while the model-breakdown request preserves its existing inclusive `end_date` convention. A custom range must be valid, must not end in the future, and is limited to a maximum of 366 days as a project-side defensive limit, not an OpenAI API limit.
 
-Preset ranges share a contiguous daily-data request per source covering the current quota cycle, current month, and last 30 days. Changing to a covered range uses the cached rows for both sources; an uncovered custom range requests its exact dates separately. Applying a valid custom range commits the selection synchronously, and late responses update only date-scoped caches. Canceling a draft leaves the committed range unchanged. The quota-cycle summary and its daily model rows always use the cycle range, not the selected Usage Statistics tab. Where no valid quota window is available, the existing 30-day fallback is explicitly labeled.
+Preset ranges share a contiguous daily-data request per source covering the current quota cycle, current month, and last 30 days. Changing to a covered range uses the cached rows for both sources; an uncovered custom range requests its exact dates separately. Applying a valid custom range commits the selection synchronously, and late responses update only date-scoped caches. Canceling a draft leaves the committed range unchanged. Range Analysis, its daily table, daily model rows, and the API-equivalent scenario follow the committed Usage Statistics interval. Actual quota-window reset times, percentages and real-Credit capacity extrapolation remain tied to the real quota window; the latter is displayed only when the current-cycle range is selected and relevant Credit data exists. Where no valid quota window is available, the existing 30-day fallback is explicitly labeled.
 
 Manual and scheduled refreshes bypass coverage caches and replace rows inside the requested interval, including successful empty responses. Failures retain only the last successful rows for the same covered interval, label them as stale, and do not use unrelated date ranges or fabricate values; failure of one source does not disable the other. Cache coverage and errors are scoped to the requested UTC dates and cleared with account-specific state.
 
@@ -97,7 +117,7 @@ Daily analytics rows, derived client/metric aggregates, and internal capability 
 
 ## Privacy and security
 
-The script only sends requests to `chatgpt.com`. It does not upload account or usage data, add telemetry, call third-party services, or perform account mutations. It does not persist tokens, cookies, account IDs, thread IDs, session objects, email addresses, usernames, raw payloads, or usage snapshots. Only non-sensitive UI preferences are saved: panel position, collapsed state, selected range, email visibility, chart metric, and custom start/end dates. Refresh is always fixed at five minutes and has no saved setting. Authentication values and Thread Usage input are never placed in the console, clipboard, or error text.
+The script only sends requests to `chatgpt.com`. It does not upload account or usage data, add telemetry, call third-party services, or perform account mutations. It does not persist tokens, cookies, account IDs, thread IDs, session objects, email addresses, usernames, raw payloads, or usage snapshots. Only non-sensitive UI preferences are saved: panel position, collapsed state, compact/wide preference, section states, selected range, email visibility, chart metric, and custom start/end dates. Refresh is always fixed at five minutes and has no saved setting. Authentication values and Thread Usage input are never placed in the console, clipboard, or error text.
 
 ## Known limitations
 
@@ -105,7 +125,7 @@ The script only sends requests to `chatgpt.com`. It does not upload account or u
 - `plan_type` is a plan label, not proof of the complete billing or subscription lifecycle. The panel does not infer subscription validity from a plan name.
 - Analytics data may be delayed or unavailable for an account or plan. Daily aggregation uses UTC date buckets where possible; the trend does not estimate or interpolate values.
 - The model-breakdown Analytics data may be delayed or unavailable. Its percentages describe model usage share only; they do not provide model-level Token attribution, and therefore cannot support a dollar amount on their own.
-- Cost data is intentionally unavailable in the UI. The internal capability seam remains for a future authoritative source, but no current endpoint is treated as a billing source.
+- Authoritative cost data remains unavailable. The API-equivalent scenario assumes the model usage shares can serve as allocation weights for each day's token classes. Actual model token distributions may differ substantially, and the result is neither a billing estimate nor an official quota conversion.
 - When a current quota period is represented as daily rows, the reset day can include data from outside the exact quota boundary.
 - Percentages are shown only when supplied or safely derived from the other percentage; unknown percentages use an empty track and an explicit notice rather than a fabricated grey fill. The script does not invent an official total quota, message count, or token total.
 - A real signed-in browser session is required for live account data. This repository validation cannot guarantee access to a user's private ChatGPT session.
@@ -118,7 +138,7 @@ Run the dependency-free fixture suite with Node.js:
 node --test scripts/chatgpt-com/account-usage-dashboard.test.cjs
 ```
 
-The suite evaluates the actual userscript with startup disabled, using synthetic daily data, mocked requests, and a fixed clock. It covers UTC boundaries, preset/custom aggregation, multi-day model shares, cache reuse and forced replacement, independent source failures, obsolete range responses, and compact/wide anchor restoration. It does not replace the authenticated browser checks below.
+The suite evaluates the actual userscript with startup disabled, using synthetic daily data, mocked requests, and a fixed clock. It covers UTC boundaries, preset/custom aggregation, multi-day model shares, cache reuse and forced replacement, independent source failures, obsolete range responses, compact/wide anchor restoration, remembered layout and launcher interaction, verified price arithmetic, selected-range daily estimates, and missing/stale inputs. It does not replace the authenticated browser checks below.
 
 ## Manual test checklist
 
@@ -130,9 +150,9 @@ On a disposable browser profile or a signed-in ChatGPT session, verify:
 4. Light and dark themes, narrow viewports, keyboard focus, reduced motion, and screen-reader labels remain usable.
 5. Signed-out, 401/403, 404, 429, timeout, empty-analytics, and partial-schema states remain understandable.
 6. A usage response with missing, `null`, unknown, snake_case, camelCase, single-window, array, object, and additional-window shapes renders without an uncaught exception.
-7. Switch among current cycle, month, 7 days, 30 days, and a custom range with different usage. The date caption, metrics, model pie/legend, client distribution, and trend match the same UTC interval; the cycle summary and daily model rows remain independent. The trend tooltip matches the returned value and the Analytics link works. Repeat with an older custom range, a canceled date draft, a rapid range switch while loading, a failed request, and a manual refresh.
-8. The title bar contains refresh, official Analytics, expand/restore, and collapse. Check the default compact panel, wide layout, return to the original anchor, and narrow-viewport reflow in light/dark themes. Switching layout does not request data or change the selected date range, draft values, section state, or chart metric; no footer settings/link block is rendered.
-9. Each first-level section expands and collapses independently, and only those section states persist across reloads.
+7. Switch among current cycle, month, 7 days, 30 days, and a custom range with different usage. The date caption, metrics, model pie/legend, client distribution, and trend match the same UTC interval; the range analysis, daily table, daily model rows and API-equivalent estimates follow that interval; real quota windows remain independent. The trend tooltip matches the returned value and the Analytics link works. Repeat with an older custom range, a canceled date draft, a rapid range switch while loading, a failed request, and a manual refresh.
+8. The title bar contains refresh, official Analytics, expand/restore, and collapse. Check the initial compact panel, wide layout, collapse/reopen and reload of either remembered layout, launcher drag/click after closing wide mode, return to the original anchor, and narrow-viewport reflow in light/dark themes. Switching layout does not request data or change the selected date range, draft values, section state, or chart metric; no footer settings/link block is rendered.
+9. Each first-level section expands and collapses independently, and section preferences persist across reloads. Verify known-price days, missing token classes, unknown models, partial and stale API-equivalent subtotals; never reinterpret them as Credits or true account cost.
 10. Mock 403, 404, 429, 5xx, timeout, empty-Analytics, and schema-change responses remain understandable without uncaught errors.
 11. Quota progress colors are continuous at 20%, 50%, 80%, and 95%; the percentage remains visible and the progressbar has accessible values.
 12. Multiple model/speed rows merge correctly, zero values are hidden, the model pie chart and legend remain accessible, and daily model rows are grouped by date and sorted descending.
