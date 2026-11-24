@@ -39,15 +39,15 @@ The references inform roles, contrast, density, accessible component behavior, a
 
 ## Data semantics and integration contracts
 
-The 1.5.0 contract treats `/backend-api/wham/usage/daily-token-usage-breakdown` as a ChatGPT Analytics data source. When the response declares `units: "percent"`, its `credits` values mean percentage/model-usage share. The UI must render them only as `模型使用占比` and never treat them as Credits, Tokens, or USD. Real Codex Credit data, when present, remains separate from model shares.
+The 1.6.0 contract treats `/backend-api/wham/usage/daily-token-usage-breakdown` as a ChatGPT Analytics data source. When the response declares `units: "percent"`, its `credits` values mean percentage/model-usage share. The UI must render them only as `模型使用占比` and never treat them as Credits, Tokens, or USD. Real Codex Credit data, when present, remains separate from model shares.
 
 ### Model usage component
 
-The model-usage component sits inside Usage Statistics and uses a native conic-gradient pie with an accessible legend rather than implying a token ledger. Normalize rows by merging the same model and speed, sort the merged rows in descending share order, hide zero-valued rows, and show the resulting percentage. Do not infer or display fake token counts from these shares. Keep account-level Credits semantically separate from the Analytics response field named `credits`.
+The model-usage component sits inside Usage Statistics and uses a native conic-gradient pie with an accessible legend rather than implying a token ledger. Merge same-model/same-speed rows per UTC date, filter the daily buckets by the selected range, sum the returned values and normalize the selected total to 100%, then sort descending and hide zero-valued rows. Do not apply the per-row percentage validation limit to multi-day sums. Explain that the normalized summary of daily model values is not a token-weighted share; authoritative weighting is not available. Do not infer or display fake token counts from these shares. Keep account-level Credits semantically separate from the Analytics response field named `credits`.
 
 ### Cost capability boundary
 
-The internal capability seam remains available for future `thread_usage`, `real_credit`, and `token_estimate` providers. Version 1.5.0 does not render a cost card, cost badge, USD amount, API-equivalent value, or billing summary. The model-breakdown `credits` field is never used as a cost input. Diagnostics report `costCapability: unavailable` until an authoritative current source is intentionally supported.
+The internal capability seam remains available for future `thread_usage`, `real_credit`, and `token_estimate` providers. Version 1.6.0 does not render a cost card, cost badge, USD amount, API-equivalent value, or billing summary. The model-breakdown `credits` field is never used as a cost input. Diagnostics report `costCapability: unavailable` until an authoritative current source is intentionally supported.
 
 ### Data-source diagnostics
 
@@ -112,9 +112,13 @@ Prefer one consistent gap between siblings over repeated ad-hoc margins. On narr
 
 The launcher is a compact, draggable utility button with a generic usage/activity inline SVG. It is visually centered, has a light border and shadow, and exposes a small status indicator. A small pointer movement must not be mistaken for a click; dragging must not open the panel. Its position is stored as a size-independent viewport anchor (`left`/`right` plus `top`/`bottom` offsets), so the same anchor can position both modes.
 
-The expanded panel is approximately 400px wide with `max-width: calc(100vw - 24px)` and a `max-height` near 70vh. It stays within the viewport after dragging. Near the right edge it expands to the left, and near the bottom it expands upward, while retaining the same viewport anchor as the launcher. Its structure is:
+The default expanded panel is approximately 400px wide with `max-width: calc(100vw - 24px)` and a body height near 70vh. It stays within the viewport after dragging. Near the right edge it expands to the left, and near the bottom it expands upward, while retaining the same viewport anchor as the launcher.
 
-1. Header: `用量与额度`, update/status text, refresh, official Analytics icon, and collapse control.
+The top-right expand/restore action switches to a centered wide layout up to 1120px, inset at least 12px from the viewport edges. The panel height is bounded by the viewport; its body scrolls independently and the header remains visible. Wide mode is not draggable. Above 760px viewport width, use responsive quota-card columns, a three-column metric grid, side-by-side model and client distributions, a taller daily chart, and roomier daily detail rows; below that breakpoint preserve the single-column layout. Keep a single shared component tree, visual token set, and statistics state in both layouts. Toggle only layout attributes and geometry, not data or the DOM tree; restore the saved compact anchor on exit. Closing the panel resets wide mode for the next open.
+
+Its structure is:
+
+1. Header: `用量与额度`, update/status text, refresh, official Analytics icon, expand/restore, and collapse control.
 2. Compact account summary: identity and plan badge in one block, with no redundant full-width “signed in” row.
 3. Quota windows: primary and additional windows, percentages when known, progress, reset time, countdown, and state.
 4. Usage statistics: selected range, Tokens, token subtypes, Turns, Threads, client distribution, model usage percentage, and a native CSS/SVG daily trend.
@@ -122,10 +126,17 @@ The expanded panel is approximately 400px wide with `max-width: calc(100vw - 24p
 6. Footer: diagnostics and necessary explanatory notices only; automatic refresh is fixed at five minutes and has no settings UI.
 7. Diagnostics: collapsed by default and safe to copy.
 
+## Analytics range contract
+
+- Internally use a single UTC half-open interval `[start, end)` for selected statistics. Preserve the source-specific request convention: exclusive end for Workspace Analytics, inclusive end for Model Breakdown.
+- Maintain independent in-memory daily rows, successful date coverage, and failed date intervals for the two sources. Prefetch one common preset envelope per source and fetch uncovered custom ranges separately; never issue per-day requests. A range change recomputes every aggregate from that same interval. Cycle Analysis uses its own quota-window range, even when another statistics tab is active.
+- Refresh bypasses coverage and replaces the requested interval, rather than only appending returned days. Do not render uncovered partial aggregates as complete. Keep same-range cached data with a stale notice when a refresh fails; an unrelated successful request must not clear that notice. Reject stale account results and never let an asynchronous response change the committed selection.
+- Keep model percentages, actual Credits, and Tokens distinct. No new request hosts, dependencies, or persistent usage data.
+
 ## Interaction and position lifecycle
 
 - The stored position is a versioned viewport anchor, not a mutable mode-specific `left`/`top` pair.
-- Mode changes and ordinary renders apply an effective, viewport-clamped anchor but never write that temporary clamp back to the stored anchor. This prevents expanded-panel size changes from causing cumulative launcher drift.
+- Compact/launcher renders apply an effective, viewport-clamped anchor but never write that temporary clamp back to the stored anchor. Wide mode is centered independently and never changes the persisted anchor. Layout changes must preserve range, drafts, open sections, and focus without causing another request.
 - Dragging either the launcher or the panel uses temporary coordinates during movement. On pointer release, the actual surface rectangle is converted back into a shared anchor and persisted once; a click without movement keeps the launcher toggle behavior.
 - Legacy `{ left, top }` preferences are clamped and converted to the anchor format after the first laid-out frame. Resize handling reapplies the stored anchor without creating a preference-write loop.
 
@@ -134,7 +145,7 @@ The panel should use a small number of clear sections rather than a stack of vis
 ## Components
 
 - **Launcher:** generic usage/gauge/activity icon, `currentColor`, `viewBox="0 0 24 24"`, round line caps and joins, plus a text-accessible status label.
-- **Header:** one clear title, a low-emphasis update state, manual refresh, official Analytics, and collapse; every icon control has an accessible name. The header has exactly three controls, each using the same 40 × 40px border-box. Analytics is the only retained official navigation link, and its visual dimensions match the button controls. The dashboard does not dynamically discover or display an official Usage shortcut.
+- **Header:** one clear title, a low-emphasis update state, manual refresh, official Analytics, expand/restore, and collapse; every icon control has an accessible name. The header has exactly four controls, each using the same 40 × 40px border-box; the expand/restore action exposes `aria-pressed` and an updated accessible label. Analytics is the only retained official navigation link, and its visual dimensions match the button controls. The dashboard does not dynamically discover or display an official Usage shortcut.
 - **Account summary:** display name and masked email together when available; show a plan badge beside that identity; omit missing fields rather than leaving blank rows.
 - **Quota window:** name, primary/additional context, used and remaining values, progressbar, reset information, and textual state.
 - **Badge and indicator:** compact semantic status, never status by color alone.
@@ -145,7 +156,7 @@ The panel should use a small number of clear sections rather than a stack of vis
 - **Model usage distribution:** model and speed labels with merged, descending percentage shares; hide zero values, render a native conic-gradient pie chart, provide legend tooltips, and never invent token counts. This component identifies the values as Analytics/model usage share, not Token usage.
 - **Data-source diagnostics:** show safe availability values for Workspace Analytics, Model Breakdown, Thread Usage, Credit, and `costCapability`; do not show cost amounts or provider internals.
 - **Daily trend:** native CSS only; each bar is the actual Analytics value for one UTC date bucket, with a custom Tooltip for hover, focus, and touch that preserves source precision and does not estimate missing dates as zero.
-- **Range selector:** compact keyboard-operable control for current cycle, month, 7 days, 30 days, and custom.
+- **Range selector:** compact keyboard-operable control for current cycle, month, 7 days, 30 days, and custom. Display exact inclusive UTC date bounds. The committed range filters metrics, model shares, clients, and trend together; opening a custom draft does not change that range. Cycle analysis and its daily model rows remain tied to the quota window.
 - **Custom date editor:** native date inputs with labels, inclusive end-date language, inline validation, apply/cancel, and an `aria-live` error region.
 - **Footer and diagnostics:** necessary explanatory notices and a safe, collapsed diagnostic disclosure; no settings or official-link footer. Safe diagnostics may include source availability, model-breakdown status, model-row count, request status, and window-shape metadata only.
 
