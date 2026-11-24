@@ -219,19 +219,20 @@ async function runRegressionTests(source, assert, Params, test) {
     const api = load();
     const metrics = { tokens: 3_000_000, uncachedInputTokens: 1_000_000, cachedInputTokens: 1_000_000, outputTokens: 1_000_000 };
     const rows = [{ model: 'gpt-6.2-sol', sharePercent: 75 }, { model: 'gpt-6.2-astra', sharePercent: 25 }];
-    const result = api.estimateDailyApiEquivalent(metrics, rows);
+    const complete = (rows) => ({ rows, complete: true });
+    const result = api.estimateDailyApiEquivalent(metrics, complete(rows));
     assert.ok(Math.abs(result.valueUsd - (12.1 * .75 + 48.4 * .25)) < 1e-9);
     assert.equal(result.modelCosts.length, 2);
     assert.equal(api.estimateApiCost({ model: 'gpt-5.6', inputTokens: 1_000_000, cachedInputTokens: 0, outputTokens: 0 }).valueUsd, 4);
     assert.equal(api.estimateApiCost({ model: 'gpt-6.1-terra', inputTokens: 0, cachedInputTokens: 1_000_000, outputTokens: 0 }).valueUsd, .05);
     assert.equal(api.estimateApiCost({ model: 'gpt-6-luna', inputTokens: 0, cachedInputTokens: 1_000_000, outputTokens: 0 }).valueUsd, .01);
-    assert.equal(api.estimateDailyApiEquivalent({ ...metrics, cachedInputTokens: null }, rows).valueUsd, null);
-    assert.equal(api.estimateDailyApiEquivalent({ ...metrics, tokens: 4_000_000 }, rows).valueUsd, null);
-    assert.equal(api.estimateDailyApiEquivalent(metrics, [{ ...rows[0] }, { model: 'unknown-model', sharePercent: 25 }]).valueUsd, null);
-    assert.equal(api.estimateDailyApiEquivalent(metrics, []).valueUsd, null);
-    assert.equal(api.estimateDailyApiEquivalent(metrics, [{ model: 'constructor', sharePercent: 100 }]).valueUsd, null);
+    assert.equal(api.estimateDailyApiEquivalent({ ...metrics, cachedInputTokens: null }, complete(rows)).valueUsd, null);
+    assert.equal(api.estimateDailyApiEquivalent({ ...metrics, tokens: 4_000_000 }, complete(rows)).valueUsd, null);
+    assert.equal(api.estimateDailyApiEquivalent(metrics, complete([{ ...rows[0] }, { model: 'unknown-model', sharePercent: 25 }])).valueUsd, null);
+    assert.equal(api.estimateDailyApiEquivalent(metrics, complete([])).valueUsd, null);
+    assert.equal(api.estimateDailyApiEquivalent(metrics, complete([{ model: 'constructor', sharePercent: 100 }])).valueUsd, null);
     const zero = { tokens: 0, uncachedInputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
-    assert.equal(api.estimateDailyApiEquivalent(zero, rows).valueUsd, 0);
+    assert.equal(api.estimateDailyApiEquivalent(zero, complete(rows)).valueUsd, 0);
   });
 
   await test('range analysis uses selected dates, calculates daily before summing, and marks incomplete or stale estimates', async () => {
@@ -289,6 +290,101 @@ async function runRegressionTests(source, assert, Params, test) {
     assert.equal(estimate.valueUsd, 4);
     const fresh = load();
     assert.equal(fresh.estimateRangeApiEquivalent(fresh.selectedAnalyticsRange()).valueUsd, null);
+  });
+
+  await test('normalization retains incomplete daily model distributions rather than pricing survivors', () => {
+    const api = load();
+    const metrics = { tokens: 1_000_000, uncachedInputTokens: 1_000_000, cachedInputTokens: 0, outputTokens: 0 };
+    const valid = { model: 'gpt-6.2-sol', credits: 50 };
+    for (const malformed of [
+      { credits: 50 }, { model: ' ', credits: 50 }, { model: 123, credits: 50 },
+      { model: 'gpt-6.2-astra' }, { model: 'gpt-6.2-astra', credits: null },
+      { model: 'gpt-6.2-astra', credits: 'invalid' }, { model: 'gpt-6.2-astra', credits: ' ' },
+      { model: 'gpt-6.2-astra', credits: -1 }, { model: 'gpt-6.2-astra', credits: 101 },
+      { model: 'gpt-6.2-astra', credits: [] }, { model: 'gpt-6.2-astra', credits: true }, null
+    ]) {
+      const normalized = api.normalizeModelBreakdown({ units: 'percent', data: [{ date: '2026-11-23', models: [valid, malformed] }] });
+      assert.equal(normalized.dailyRows.length, 1);
+      const day = normalized.dailyRows[0];
+      assert.equal(day.complete, false);
+      assert.equal(day.rows.length, 1);
+      assert.equal(normalized.rows.length, 0);
+      const estimate = api.estimateDailyApiEquivalent(metrics, day);
+      assert.equal(estimate.valueUsd, null);
+      assert.ok(estimate.reason.includes('模型分布不完整'));
+    }
+    const allInvalid = api.normalizeModelBreakdown({ units: 'percent', data: [{ date: '2026-11-23', models: [{ credits: 50 }] }] });
+    assert.equal(allInvalid.dailyRows.length, 1);
+    assert.equal(allInvalid.dailyRows[0].complete, false);
+    assert.equal(allInvalid.dailyRows[0].rows.length, 0);
+
+    // Rows for the same date may arrive in separate flat or nested buckets.
+    const split = api.normalizeModelBreakdown({ units: 'percent', data: [
+      { date: '2026-11-23', ...valid },
+      { date: '2026-11-23', credits: 50 },
+      { date: '2026-11-22', models: [valid] },
+      { date: '2026-11-22', models: { credits: 50 } }
+    ] });
+    assert.equal(split.dailyRows.length, 2);
+    assert.ok(split.dailyRows.every((day) => day.complete === false));
+
+    // Preserve existing weight semantics: returned per-day weights are not
+    // required to sum to 100; a known zero may be ignored safely.
+    const complete = api.normalizeModelBreakdown({ units: 'percent', data: [
+      { date: '2026-11-23', models: [valid, { model: 'gpt-6.2-astra', credits: '25' }, { credits: 0 }] }
+    ] });
+    assert.equal(complete.dailyRows[0].complete, true);
+    assert.equal(complete.dailyRows[0].rows.length, 2);
+    assert.ok(Math.abs(api.estimateDailyApiEquivalent(metrics, complete.dailyRows[0]).valueUsd - 4) < 1e-9);
+    const unknownPrice = api.normalizeModelBreakdown({ units: 'percent', data: [
+      { date: '2026-11-23', models: [valid, { model: 'unknown-model', credits: 50 }] }
+    ] });
+    assert.equal(unknownPrice.dailyRows[0].complete, true);
+    assert.equal(api.estimateDailyApiEquivalent(metrics, unknownPrice.dailyRows[0]).valueUsd, null);
+  });
+
+  await test('incomplete distributions remain excluded through fetch, range cache and rendering; valid refresh repairs the day', async () => {
+    const api = load();
+    const totals = { tokens: 1_000_000, uncached_input_tokens: 1_000_000, cached_input_tokens: 0, output_tokens: 0 };
+    const ws = ['2026-11-21', '2026-11-22', '2026-11-23'].map((date) => ({ date, totals }));
+    let payload = { units: 'percent', data: [
+      { date: '2026-11-21', models: [{ model: 'gpt-6.2-astra', credits: 100 }] },
+      { date: '2026-11-22', models: [{ model: 'gpt-6.2-sol', credits: 50 }, { credits: 50 }] },
+      { date: '2026-11-23', models: [{ credits: 100 }] }
+    ] };
+    api.setRequest(async (url) => ok(url.includes('daily-token-usage-breakdown') ? payload : ws));
+    const { start, end } = api.analyticsRequestRange([windowFixture]);
+    await Promise.all([api.fetchAnalyticsRange(start, end), api.fetchModelBreakdown(start, end)]);
+    let estimate = api.estimateRangeApiEquivalent(api.selectedAnalyticsRange());
+    assert.equal(estimate.pricedDays, 0);
+    assert.equal(estimate.returnedDays, 2);
+    assert.equal(estimate.valueUsd, null);
+    assert.ok(estimate.days.get('2026-11-22').reason.includes('模型分布不完整'));
+    assert.ok(estimate.days.get('2026-11-23').reason.includes('模型分布不完整'));
+    await api.selectAnalyticsRange('7d');
+    estimate = api.estimateRangeApiEquivalent(api.selectedAnalyticsRange());
+    assert.equal(estimate.pricedDays, 1);
+    assert.equal(estimate.returnedDays, 3);
+    assert.equal(estimate.valueUsd, 8);
+    assert.deepEqual(estimate.modelCosts, [{ model: 'gpt-6.2-astra', valueUsd: 8 }]);
+    assert.deepEqual(api.runtime.state.modelBreakdown.rows.map((row) => row.model), ['gpt-6.2-astra']);
+    const collect = (node) => [node.textContent, ...node.children.flatMap(collect)].join(' ');
+    const rendered = collect(api.renderRangeAnalysis());
+    assert.ok(rendered.includes('模型分布不完整'));
+    assert.ok(rendered.includes('仅为可估算日期小计'));
+    assert.ok(rendered.includes('不参与区间占比及 API 估算'));
+    await api.selectAnalyticsRange('cycle');
+    payload = { units: 'percent', data: [
+      { date: '2026-11-22', models: [{ model: 'gpt-6.2-sol', credits: 50 }, { model: 'gpt-6.2-astra', credits: 50 }] },
+      { date: '2026-11-23', models: [{ model: 'gpt-6.2-sol', credits: 100 }] }
+    ] };
+    await api.fetchModelBreakdown('2026-11-22', '2026-11-24', {}, true);
+    estimate = api.estimateRangeApiEquivalent(api.selectedAnalyticsRange());
+    assert.equal(estimate.pricedDays, 2);
+    assert.equal(estimate.valueUsd, 7);
+    assert.equal(estimate.days.get('2026-11-22').reason, null);
+    assert.ok(api.modelBreakdownForRange(api.selectedAnalyticsRange()).dailyRows.every((day) => day.complete));
+    assert.ok(!collect(api.renderRangeAnalysis()).includes('模型分布不完整'));
   });
 }
 

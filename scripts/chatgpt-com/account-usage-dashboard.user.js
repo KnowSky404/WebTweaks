@@ -2,7 +2,7 @@
 // @name         ChatGPT Account Usage Dashboard
 // @name:zh-CN   ChatGPT 账户用量浮窗
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.7.0
+// @version      1.7.1
 // @description  Display the current ChatGPT account plan, Codex limits, and reliable usage analytics in a private floating dashboard.
 // @description:zh-CN 在 ChatGPT 页面显示当前账号套餐、Codex 额度与可靠的使用统计。
 // @author       KnowSky404
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.7.0';
+  const VERSION = '1.7.1';
   const HOST_ID = 'wt-chatgpt-account-usage-host';
   const SESSION_ENDPOINT = '/api/auth/session';
   const USAGE_ENDPOINT = '/backend-api/wham/usage';
@@ -525,29 +525,48 @@
 
   function normalizeModelRows(modelRows) {
     const merged = new Map();
+    let complete = true;
     for (const modelRow of modelRows) {
-      if (!isRecord(modelRow)) continue;
+      if (!isRecord(modelRow)) {
+        complete = false;
+        continue;
+      }
+      const rawShare = firstDefined(modelRow, ['credits', 'sharePercent']);
+      const value = typeof rawShare === 'number' || (typeof rawShare === 'string' && rawShare.trim())
+        ? numberOrNull(rawShare) : null;
+      // An invalid/missing share is unknown, not zero. A known zero has no
+      // allocation weight and may be ignored even if its model name is absent.
+      if (value === null || value < 0 || value > 100) {
+        complete = false;
+        continue;
+      }
+      if (value === 0) continue;
       const model = firstDefined(modelRow, ['model', 'model_name', 'modelName']);
+      if (typeof model !== 'string' || !model.trim() || model.includes('\u0000')) {
+        complete = false;
+        continue;
+      }
       const speed = firstDefined(modelRow, ['speed', 'mode', 'inference_speed', 'inferenceSpeed']) || 'unknown';
-      const value = numberOrNull(firstDefined(modelRow, ['credits', 'sharePercent']));
-      if (typeof model !== 'string' || !model.trim() || value === null || value <= 0 || value > 100) continue;
       const key = `${model.trim()}\u0000${String(speed).trim()}`;
       merged.set(key, (merged.get(key) || 0) + value);
     }
-    return [...merged.entries()]
+    const rows = [...merged.entries()]
       .map(([key, sharePercent]) => {
         const separator = key.indexOf('\u0000');
-        return { model: key.slice(0, separator), speed: key.slice(separator + 1), sharePercent: numberOrNull(sharePercent) };
+        return { model: key.slice(0, separator), speed: key.slice(separator + 1), sharePercent };
       })
-      .filter((row) => row.sharePercent !== null && row.sharePercent > 0)
       .sort((left, right) => right.sharePercent - left.sharePercent || left.model.localeCompare(right.model) || left.speed.localeCompare(right.speed));
+    return { rows, complete };
   }
 
   function aggregateModelShares(dailyRows) {
     // Values in dailyRows have already been validated and merged per date.
     // Do not apply the per-input 100% limit to sums spanning multiple dates.
     const merged = new Map();
-    for (const { rows } of dailyRows) {
+    for (const { rows, complete } of dailyRows) {
+      // Do not normalize the survivors of a malformed distribution into a
+      // seemingly complete pie. Daily details may still show known values.
+      if (!complete) continue;
       for (const row of rows) {
         const key = `${row.model}\u0000${row.speed}`;
         const previous = merged.get(key);
@@ -573,13 +592,16 @@
       const date = typeof rawDate === 'string' && /^\d{4}-\d{2}-\d{2}/.test(rawDate)
         ? rawDate.slice(0, 10) : timestamp === null ? null : dateKeyUTC(timestamp);
       if (!isValidDateKey(date)) continue;
-      const models = asArray(firstDefined(dailyRow, ['models', 'model_usage', 'modelUsage']));
+      const models = firstDefined(dailyRow, ['models', 'model_usage', 'modelUsage']);
       const dateRows = byDate.get(date) || [];
-      dateRows.push(...(models.length ? models : [dailyRow]));
+      // Keep malformed nested distributions as an invalid entry, not as an
+      // empty/valid array or a flattened row with a silently omitted share.
+      if (Array.isArray(models)) dateRows.push(...models);
+      else dateRows.push(models === null ? dailyRow : null);
       byDate.set(date, dateRows);
     }
-    const dailyRows = [...byDate.entries()].map(([date, models]) => ({ date, rows: normalizeModelRows(models) }))
-      .filter((row) => row.rows.length).sort((left, right) => right.date.localeCompare(left.date));
+    const dailyRows = [...byDate.entries()].map(([date, models]) => ({ date, ...normalizeModelRows(models) }))
+      .filter((day) => day.rows.length || !day.complete).sort((left, right) => right.date.localeCompare(left.date));
     return { units, rows: aggregateModelShares(dailyRows), dailyRows, supported: true };
   }
 
@@ -616,7 +638,7 @@
     });
   }
 
-  function estimateDailyApiEquivalent(metrics, rows) {
+  function estimateDailyApiEquivalent(metrics, distribution) {
     // This is an explicit hypothetical allocation, NOT model-token attribution.
     // Never allocate a day's missing/unknown model share to known-priced models.
     const unavailable = (reason) => ({ valueUsd: null, modelCosts: [], reason });
@@ -624,6 +646,9 @@
     if (counts.some((value) => !Number.isFinite(value) || value < 0)) return unavailable('Token 分类不完整');
     const tokenSum = counts.reduce((sum, value) => sum + value, 0);
     if (!Number.isFinite(tokenSum) || (metrics.tokens !== null && metrics.tokens !== undefined && metrics.tokens !== tokenSum)) return unavailable('Token 分类与总量不一致');
+    if (!distribution) return unavailable('缺少每日模型占比');
+    if (distribution.complete !== true) return unavailable('每日模型分布不完整，存在无法识别的模型或占比');
+    const { rows } = distribution;
     if (!Array.isArray(rows) || !rows.length) return unavailable('缺少每日模型占比');
     const shares = rows.map((row) => row.sharePercent);
     const shareSum = shares.reduce((sum, value) => sum + value, 0);
@@ -654,7 +679,7 @@
     };
     if (!result.covered) return result;
     const workspaceDays = new Map(range.stats.rows.map((row) => [row.date, row.metrics]));
-    const modelDays = new Map(model.dailyRows.map((row) => [row.date, row.rows]));
+    const modelDays = new Map(model.dailyRows.map((day) => [day.date, day]));
     const dates = [...new Set([...workspaceDays.keys(), ...modelDays.keys()])].sort();
     result.returnedDays = dates.length;
     const modelCosts = new Map();
@@ -1952,8 +1977,9 @@
     rows.slice().reverse().forEach((row) => {
       const tr = el('tr');
       const tokenText = row.metrics.tokens === null ? '未提供' : formatCompactNumber(row.metrics.tokens);
-      const model = modelDays.find((item) => item.date === row.date)?.rows[0];
-      const mainModel = model ? `${formatModelName(model.model)} · ${formatModelSpeed(model.speed)}` : '未提供';
+      const modelDay = modelDays.find((item) => item.date === row.date);
+      const model = modelDay?.rows[0];
+      const mainModel = modelDay && !modelDay.complete ? '分布不完整' : model ? `${formatModelName(model.model)} · ${formatModelSpeed(model.speed)}` : '未提供';
       [row.date, tokenText, row.metrics.turns === null ? '未提供' : formatNumber(row.metrics.turns), row.metrics.threads === null ? '未提供' : formatNumber(row.metrics.threads), mainModel].forEach((value) => tr.append(el('td', '', value)));
       const day = apiEstimate.days.get(row.date);
       const costCell = el('td', 'wt-daily-api-cost', formatApiEquivalent(day?.valueUsd));
@@ -1972,6 +1998,8 @@
     wrapper.append(el('h4', 'wt-subtitle', '模型使用占比'));
     if (modelBreakdown.loading) wrapper.append(setAttributes(el('p', 'wt-notice wt-notice-info', '正在读取所选范围的模型使用情况。'), { 'aria-live': 'polite' }));
     if (modelBreakdown.error) wrapper.append(setAttributes(el('p', 'wt-notice wt-notice-warning', `${modelBreakdown.error}；不会把该接口字段当作余额或 Token 数量。`), { 'aria-live': 'polite' }));
+    const incompleteDays = modelBreakdown.dailyRows.filter((day) => !day.complete).length;
+    if (incompleteDays) wrapper.append(el('p', 'wt-notice wt-notice-warning', `有 ${incompleteDays} 个日期的模型分布不完整，已排除这些日期；图表仅汇总有效分布。`));
     if (!modelBreakdown.rows.length) {
       if (!modelBreakdown.loading && !modelBreakdown.error) wrapper.append(el('p', 'wt-empty', modelBreakdown.covered ? '所选范围没有可显示的非零模型占比' : '所选范围的模型数据尚未覆盖'));
       return wrapper;
@@ -2042,6 +2070,7 @@
     for (const dailyRow of dailyRows) {
       const day = el('div', 'wt-daily-model-day');
       day.append(el('strong', 'wt-daily-model-date', dailyRow.date));
+      if (!dailyRow.complete) day.append(el('p', 'wt-window-meta', '模型分布不完整，仅显示已识别记录，不参与区间占比及 API 估算。'));
       for (const row of dailyRow.rows) {
         const item = el('div', 'wt-daily-model-row');
         item.append(el('span', 'wt-model-usage-name', `${formatModelName(row.model)} · ${formatModelSpeed(row.speed)}`), el('strong', 'wt-model-usage-share', formatUsageShare(row.sharePercent)));
