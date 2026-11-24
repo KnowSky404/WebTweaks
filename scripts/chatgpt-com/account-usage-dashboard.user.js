@@ -2,7 +2,7 @@
 // @name         ChatGPT Account Usage Dashboard
 // @name:zh-CN   ChatGPT 账户用量浮窗
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.7.1
+// @version      1.8.0
 // @description  Display the current ChatGPT account plan, Codex limits, and reliable usage analytics in a private floating dashboard.
 // @description:zh-CN 在 ChatGPT 页面显示当前账号套餐、Codex 额度与可靠的使用统计。
 // @author       KnowSky404
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.7.1';
+  const VERSION = '1.8.0';
   const HOST_ID = 'wt-chatgpt-account-usage-host';
   const SESSION_ENDPOINT = '/api/auth/session';
   const USAGE_ENDPOINT = '/backend-api/wham/usage';
@@ -41,6 +41,13 @@
   });
   const MAX_CUSTOM_RANGE_DAYS = 366;
   const CREDIT_USD_RATE = 0.04;
+  const TOKEN_CLASS_KEYS = Object.freeze(['uncachedInputTokens', 'cachedInputTokens', 'outputTokens']);
+  const TOKEN_FIELDS = Object.freeze({
+    uncachedInputTokens: ['uncached_input_tokens', 'uncachedInputTokens', 'uncached_text_input_tokens'],
+    cachedInputTokens: ['cached_input_tokens', 'cachedInputTokens', 'cached_text_input_tokens'],
+    outputTokens: ['output_tokens', 'outputTokens', 'text_output_tokens'],
+    tokens: ['tokens', 'total_tokens', 'totalTokens', 'text_total_tokens', 'textTotalTokens']
+  });
   const METRIC_KEYS = Object.freeze(['credits', 'tokens', 'cachedInputTokens', 'uncachedInputTokens', 'outputTokens', 'threads', 'turns']);
   // Reference snapshot, not historical billing rates. Standard short-context text
   // token rates in USD per 1M tokens; verify against official model pages before updating.
@@ -464,6 +471,53 @@
     return result;
   }
 
+  function validTokenCount(value) {
+    return Number.isSafeInteger(value) && value >= 0;
+  }
+
+  function strictTokenCount(value) {
+    if (typeof value !== 'number' && !(typeof value === 'string' && value.trim())) return null;
+    const number = Number(value);
+    return validTokenCount(number) ? number : null;
+  }
+
+  // Read absolute counts from the same record, applying field-level fallback
+  // before deriving a total. A partial token breakdown is never a total.
+  function readAbsoluteTokenMetrics(item) {
+    const nested = firstDefined(item, ['totals', 'total']);
+    const raw = Object.fromEntries(Object.entries(TOKEN_FIELDS).map(([key, fields]) => [
+      key, firstDefined(nested, fields) ?? firstDefined(item, fields)
+    ]));
+    const metrics = Object.fromEntries(Object.entries(raw).map(([key, value]) => [key, strictTokenCount(value)]));
+    if (raw.tokens === null && TOKEN_CLASS_KEYS.every((key) => validTokenCount(metrics[key]))) {
+      const total = TOKEN_CLASS_KEYS.reduce((sum, key) => sum + metrics[key], 0);
+      metrics.tokens = validTokenCount(total) ? total : null;
+    }
+    return metrics;
+  }
+
+  // The same endpoint may expose absolute model counts on some accounts.
+  // Keep only allowlisted identity/count fields, not the raw response.
+  function normalizeAbsoluteModels(item) {
+    if (!Object.hasOwn(item, 'models')) return null;
+    if (!Array.isArray(item.models)) return { complete: false, rows: [] };
+    let complete = true;
+    const rows = [];
+    for (const entry of item.models) {
+      if (!isRecord(entry)) { complete = false; continue; }
+      const name = firstDefined(entry, ['model', 'model_name', 'modelName']);
+      const metrics = readAbsoluteTokenMetrics(entry);
+      const values = TOKEN_CLASS_KEYS.map((key) => metrics[key]);
+      const total = values.every(validTokenCount) ? values.reduce((sum, value) => sum + value, 0) : null;
+      if (!validTokenCount(total) || metrics.tokens !== total) { complete = false; continue; }
+      if (total === 0) continue;
+      if (typeof name !== 'string' || !name.trim()) { complete = false; continue; }
+      const speed = firstDefined(entry, ['speed', 'mode', 'inference_speed', 'inferenceSpeed']);
+      rows.push({ model: name.trim(), speed: typeof speed === 'string' && speed.trim() ? speed.trim() : 'unknown', metrics: { ...metrics, tokens: total } });
+    }
+    return { complete, rows };
+  }
+
   function normalizeMetrics(value) {
     const source = isRecord(value) ? value : {};
     const metrics = {
@@ -605,16 +659,20 @@
     return { units, rows: aggregateModelShares(dailyRows), dailyRows, supported: true };
   }
 
+  function resolveStandardPricing(model) {
+    const id = typeof model === 'string' && Object.hasOwn(MODEL_PRICING_ALIASES, model) ? MODEL_PRICING_ALIASES[model] : model;
+    const rates = typeof id === 'string' && Object.hasOwn(MODEL_PRICING, id) ? MODEL_PRICING[id] : null;
+    return rates && [rates.inputPerMillion, rates.cachedInputPerMillion, rates.outputPerMillion].every((value) => Number.isFinite(value) && value >= 0)
+      ? { id, ...rates } : null;
+  }
+
   function estimateApiCost({ model, inputTokens, cachedInputTokens, outputTokens } = {}) {
     const tokenCounts = [inputTokens, cachedInputTokens, outputTokens].map(numberOrNull);
     if (tokenCounts.some((value) => value === null || value < 0)) {
       return createCostEstimate({ notes: ['模型级 Token attribution 不完整，无法计算 API 等价成本'] });
     }
-    const pricingId = typeof model === 'string' && Object.hasOwn(MODEL_PRICING_ALIASES, model) ? MODEL_PRICING_ALIASES[model] : model;
-    const pricing = typeof pricingId === 'string' && Object.hasOwn(MODEL_PRICING, pricingId) ? MODEL_PRICING[pricingId] : null;
-    if (!pricing || [pricing.inputPerMillion, pricing.cachedInputPerMillion, pricing.outputPerMillion].some((value) => numberOrNull(value) === null)) {
-      return createCostEstimate({ notes: ['当前模型没有可用的独立定价条目'] });
-    }
+    const pricing = resolveStandardPricing(model);
+    if (!pricing) return createCostEstimate({ notes: ['当前模型没有可用的独立定价条目'] });
     const valueUsd = (tokenCounts[0] / 1_000_000) * pricing.inputPerMillion
       + (tokenCounts[1] / 1_000_000) * pricing.cachedInputPerMillion
       + (tokenCounts[2] / 1_000_000) * pricing.outputPerMillion;
@@ -638,31 +696,64 @@
     });
   }
 
-  function estimateDailyApiEquivalent(metrics, distribution) {
-    // This is an explicit hypothetical allocation, NOT model-token attribution.
-    // Never allocate a day's missing/unknown model share to known-priced models.
-    const unavailable = (reason) => ({ valueUsd: null, modelCosts: [], reason });
-    const counts = [metrics?.uncachedInputTokens, metrics?.cachedInputTokens, metrics?.outputTokens];
-    if (counts.some((value) => !Number.isFinite(value) || value < 0)) return unavailable('Token 分类不完整');
+  function reconcileAbsoluteModels(metrics, absoluteModels) {
+    if (!absoluteModels) return false;
+    if (!absoluteModels.complete || !absoluteModels.rows.length) return false;
+    return TOKEN_CLASS_KEYS.every((key) => validTokenCount(metrics[key]) &&
+      absoluteModels.rows.reduce((sum, row) => sum + row.metrics[key], 0) === metrics[key]);
+  }
+
+  function estimateDailyApiEquivalent(metrics, distribution, absoluteModels = null) {
+    const unavailable = (reason, method = null, allocations = []) => ({ valueUsd: null, modelCosts: [], reason, method, allocations });
+    const counts = TOKEN_CLASS_KEYS.map((key) => metrics?.[key]);
+    if (!counts.every(validTokenCount)) return unavailable('Token 分类不完整');
     const tokenSum = counts.reduce((sum, value) => sum + value, 0);
-    if (!Number.isFinite(tokenSum) || (metrics.tokens !== null && metrics.tokens !== undefined && metrics.tokens !== tokenSum)) return unavailable('Token 分类与总量不一致');
-    if (!distribution) return unavailable('缺少每日模型占比');
-    if (distribution.complete !== true) return unavailable('每日模型分布不完整，存在无法识别的模型或占比');
-    const { rows } = distribution;
-    if (!Array.isArray(rows) || !rows.length) return unavailable('缺少每日模型占比');
-    const shares = rows.map((row) => row.sharePercent);
-    const shareSum = shares.reduce((sum, value) => sum + value, 0);
-    if (shares.some((value) => !Number.isFinite(value) || value <= 0) || !Number.isFinite(shareSum) || shareSum <= 0) return unavailable('模型占比不可用');
+    if (!validTokenCount(tokenSum) || metrics.tokens !== tokenSum) return unavailable('Token 分类与总量不一致或总量未知');
+  
+    const measured = reconcileAbsoluteModels(metrics, absoluteModels);
+    const method = measured ? 'model-tokens' : 'model-share';
+    const fallbackReason = !measured && absoluteModels ? '接口模型级 Token 明细缺失或未通过逐类总量对账，改用占比分摊。' : null;
+    let allocations;
+    if (measured) {
+      allocations = absoluteModels.rows.map((row) => ({
+        model: row.model, speed: row.speed, rawShare: null,
+        weight: tokenSum > 0 ? row.metrics.tokens / tokenSum : null,
+        uncachedInputTokens: row.metrics.uncachedInputTokens,
+        cachedInputTokens: row.metrics.cachedInputTokens,
+        outputTokens: row.metrics.outputTokens
+      }));
+    } else {
+      // Percent is an allocation assumption, never observed model token data.
+      if (!distribution) return unavailable('缺少每日模型占比');
+      if (distribution.complete !== true) return unavailable('每日模型分布不完整，存在无法识别的模型或占比');
+      const { rows } = distribution;
+      if (!Array.isArray(rows) || !rows.length) return unavailable('缺少每日模型占比');
+      const shares = rows.map((row) => row.sharePercent);
+      const shareSum = shares.reduce((sum, value) => sum + value, 0);
+      if (shares.some((value) => !Number.isFinite(value) || value <= 0) || !Number.isFinite(shareSum) || shareSum <= 0) return unavailable('模型占比不可用');
+      allocations = rows.map((row) => {
+        const weight = row.sharePercent / shareSum;
+        return {
+          model: row.model, speed: row.speed, rawShare: row.sharePercent, weight,
+          uncachedInputTokens: counts[0] * weight, cachedInputTokens: counts[1] * weight, outputTokens: counts[2] * weight
+        };
+      });
+    }
     const modelCosts = new Map();
-    for (const row of rows) {
-      const weight = row.sharePercent / shareSum;
-      const cost = estimateApiCost({ model: row.model, inputTokens: counts[0] * weight, cachedInputTokens: counts[1] * weight, outputTokens: counts[2] * weight });
-      if (cost.valueUsd === null) return unavailable('存在未定价或无法计算的模型');
-      modelCosts.set(row.model, (modelCosts.get(row.model) || 0) + cost.valueUsd);
+    for (const row of allocations) {
+      row.pricing = resolveStandardPricing(row.model);
+      row.valueUsd = estimateApiCost({ model: row.model, inputTokens: row.uncachedInputTokens, cachedInputTokens: row.cachedInputTokens, outputTokens: row.outputTokens }).valueUsd;
+      if (row.valueUsd !== null) modelCosts.set(row.model, (modelCosts.get(row.model) || 0) + row.valueUsd);
+    }
+    if (allocations.some((row) => row.valueUsd === null)) {
+      return { ...unavailable('存在未定价或无法计算的模型；整日不计入区间小计', method, allocations), fallbackReason };
     }
     const valueUsd = [...modelCosts.values()].reduce((sum, value) => sum + value, 0);
-    if (!Number.isFinite(valueUsd)) return unavailable('API 等价估算超出有效数值范围');
-    return { valueUsd, modelCosts: [...modelCosts.entries()].map(([model, valueUsd]) => ({ model, valueUsd })), reason: null };
+    if (!Number.isFinite(valueUsd)) return unavailable('API 等价估算超出有效数值范围', method);
+    return {
+      valueUsd, method, fallbackReason, allocations, tokenSum,
+      modelCosts: [...modelCosts.entries()].map(([model, valueUsd]) => ({ model, valueUsd })), reason: null
+    };
   }
 
   function estimateRangeApiEquivalent(range) {
@@ -672,25 +763,43 @@
     const calendarDays = range ? dateDifferenceInDays(range.start, range.end) : 0;
     const result = {
       valueUsd: null, calendarDays, returnedDays: 0, pricedDays: 0,
-      modelCosts: [], days: new Map(),
+      reportedTokens: 0, pricedTokens: 0, unknownTokenDays: 0, tokenCoveragePercent: null,
+      measuredDays: 0, allocatedDays: 0, measuredTokens: 0, allocatedTokens: 0,
+      modelCosts: [], days: new Map(), modelCovered: model.covered,
       loading: model.loading || (analytics.loading && (!covered || rangesOverlap(range, analytics.lastRequest))),
       stale: model.stale || Boolean(covered && rangeError(analytics, range)),
-      covered: covered && model.covered
+      covered
     };
-    if (!result.covered) return result;
-    const workspaceDays = new Map(range.stats.rows.map((row) => [row.date, row.metrics]));
+    if (!covered) return result;
+    const workspaceDays = new Map(range.stats.rows.map((row) => [row.date, row]));
     const modelDays = new Map(model.dailyRows.map((day) => [day.date, day]));
     const dates = [...new Set([...workspaceDays.keys(), ...modelDays.keys()])].sort();
     result.returnedDays = dates.length;
     const modelCosts = new Map();
     let total = 0;
     for (const date of dates) {
-      const day = estimateDailyApiEquivalent(workspaceDays.get(date), modelDays.get(date));
+      const workspace = workspaceDays.get(date);
+      const reported = workspace?.metrics?.tokens;
+      if (validTokenCount(reported)) result.reportedTokens += reported;
+      else result.unknownTokenDays += 1;
+      const day = estimateDailyApiEquivalent(workspace?.metrics, modelDays.get(date), workspace?.absoluteModels);
       result.days.set(date, day);
       if (day.valueUsd === null) continue;
       result.pricedDays += 1;
       total += day.valueUsd;
+      if (validTokenCount(reported)) result.pricedTokens += reported;
+      if (day.method === 'model-tokens') {
+        result.measuredDays += 1;
+        result.measuredTokens += day.tokenSum;
+      } else {
+        result.allocatedDays += 1;
+        result.allocatedTokens += day.tokenSum;
+      }
       for (const row of day.modelCosts) modelCosts.set(row.model, (modelCosts.get(row.model) || 0) + row.valueUsd);
+    }
+    // No coverage percentage when the denominator is unknown or would be zero.
+    if (result.reportedTokens > 0 && !result.unknownTokenDays && Number.isSafeInteger(result.reportedTokens) && Number.isSafeInteger(result.pricedTokens)) {
+      result.tokenCoveragePercent = result.pricedTokens / result.reportedTokens * 100;
     }
     if (result.pricedDays && Number.isFinite(total)) {
       result.valueUsd = total;
@@ -1110,14 +1219,18 @@
       const date = typeof rawDate === 'string' && /^\d{4}-\d{2}-\d{2}/.test(rawDate)
         ? rawDate.slice(0, 10) : timestamp === null ? null : dateKeyUTC(timestamp);
       const totals = coalesceMetricValues(normalizeMetrics(firstDefined(item, ['totals', 'total'])), normalizeMetrics(item));
+      Object.assign(totals, readAbsoluteTokenMetrics(item));
       totals.credits = readDailyCredits(item);
-      const clients = asArray(firstDefined(item, ['clients', 'client_usage', 'clientUsage'])).map((client) => {
+      const clientSource = firstDefined(item, ['clients', 'client_usage', 'clientUsage']);
+      const clientsIncomplete = clientSource !== null && (!Array.isArray(clientSource) || clientSource.some((client) => !isRecord(client)));
+      const clients = asArray(clientSource).map((client) => {
         if (!isRecord(client)) return null;
         const clientMetrics = coalesceMetricValues(normalizeMetrics(firstDefined(client, ['totals', 'total'])), normalizeMetrics(client));
+        Object.assign(clientMetrics, readAbsoluteTokenMetrics(client));
         clientMetrics.credits = readDailyCredits(client);
         return { clientId: String(firstDefined(client, ['client_id', 'clientId', 'id', 'name']) || 'UNKNOWN'), metrics: clientMetrics };
       }).filter(Boolean);
-      return isValidDateKey(date) ? { date, metrics: totals, clients } : null;
+      return isValidDateKey(date) ? { date, metrics: totals, clients, clientsIncomplete, absoluteModels: normalizeAbsoluteModels(item) } : null;
     }).filter(Boolean);
   }
 
@@ -1146,17 +1259,41 @@
     };
   }
 
-  function aggregateClients(rows, startDate, endDate) {
+  function reconcileClientTotals(rows, startDate, endDate) {
     const map = new Map();
+    let reportedTokens = 0, groupedTokens = 0, unclassifiedTokens = 0, excessDays = 0, unknownDays = 0, dates = 0;
     for (const row of rows) {
       if (row.date < startDate || row.date >= endDate) continue;
+      dates += 1;
+      const reported = row.metrics.tokens;
+      let grouped = 0;
+      let unknown = !validTokenCount(reported) || row.clientsIncomplete === true;
+      if (validTokenCount(reported)) reportedTokens += reported;
       for (const client of row.clients) {
         const previous = map.get(client.clientId) || normalizeMetrics({});
         map.set(client.clientId, mergeMetricValues(previous, client.metrics));
+        if (validTokenCount(client.metrics.tokens)) grouped += client.metrics.tokens;
+        else unknown = true;
       }
+      groupedTokens += grouped;
+      if (unknown) { unknownDays += 1; continue; }
+      if (grouped > reported) excessDays += 1;
+      else unclassifiedTokens += reported - grouped;
     }
-    const totalTokens = sumOptional([...map.values()].map((metrics) => metrics.tokens)) || 0;
-    return [...map.entries()].map(([clientId, metrics]) => ({ clientId, ...metrics, tokenShare: totalTokens ? (metrics.tokens || 0) / totalTokens * 100 : null })).sort((a, b) => (b.tokens || 0) - (a.tokens || 0));
+    const denominator = dates && !unknownDays && !excessDays && reportedTokens > 0 && Number.isSafeInteger(reportedTokens) ? reportedTokens : null;
+    const clientRows = [...map.entries()].map(([clientId, metrics]) => ({
+      clientId, ...metrics,
+      tokenShare: denominator && validTokenCount(metrics.tokens) ? metrics.tokens / denominator * 100 : null
+    }));
+    if (unclassifiedTokens > 0) clientRows.push({
+      clientId: '未归类差额', ...normalizeMetrics({}), tokens: unclassifiedTokens, unclassified: true,
+      tokenShare: denominator ? unclassifiedTokens / denominator * 100 : null
+    });
+    return { rows: clientRows.sort((a, b) => (b.tokens || 0) - (a.tokens || 0)), reportedTokens, groupedTokens, unclassifiedTokens, unknownDays, excessDays, dates };
+  }
+
+  function aggregateClients(rows, startDate, endDate) {
+    return reconcileClientTotals(rows, startDate, endDate).rows;
   }
 
   function analyticsRequestRange(windows, now = Date.now()) {
@@ -1246,7 +1383,7 @@
     const covered = selected && isRangeCovered(selected.start, selected.end);
     analytics.clientRows = covered ? aggregateClients(analytics.dailyRows, selected.start, selected.end) : [];
     analytics.selectedBucketCount = covered ? selected.stats.dates : 0;
-    runtime.state.diagnostics.clientTypes = analytics.clientRows.map((item) => item.clientId);
+    runtime.state.diagnostics.clientTypes = analytics.clientRows.filter((item) => !item.unclassified).map((item) => item.clientId);
     analytics.error = rangeError(analytics, selected) || rangeError(analytics, analytics.ranges.cycle);
     runtime.state.analyticsError = analytics.error;
     const model = runtime.state.modelBreakdown;
@@ -1859,6 +1996,7 @@
     const secondary = [['cachedInputTokens', 'Cached input'], ['uncachedInputTokens', 'Uncached input'], ['outputTokens', 'Output tokens'], ['dates', '有数据的日期']].filter(([key]) => hasValue(stats[key]));
     if (secondary.length) {
       const details = el('details', 'wt-secondary-metrics');
+      details.dataset.detailKey = 'secondary-metrics';
       details.append(el('summary', '更多统计'));
       const detailGrid = el('div', 'wt-field-grid');
       secondary.forEach(([key, label]) => detailGrid.append(field(label, formatNumber(stats[key]))));
@@ -1897,16 +2035,21 @@
     node.append(el('strong', 'wt-api-equivalent-value', amount));
     const coverageText = estimate.covered
       ? `可估算日期：${estimate.pricedDays} / ${estimate.returnedDays} 个返回日期（所选范围共 ${estimate.calendarDays} 个 UTC 日期）`
-      : '需要所选范围的 Workspace Analytics 和 Model Breakdown 数据';
+      : '需要所选范围的 Workspace Analytics 数据';
     node.append(el('p', 'wt-window-meta', coverageText));
+    if (estimate.covered) {
+      node.append(el('p', 'wt-window-meta', `Token 计价覆盖率：${estimate.tokenCoveragePercent === null ? '无法确定' : formatPercent(estimate.tokenCoveragePercent)}（已计价 ${formatNumber(estimate.pricedTokens)} / 已知总量 ${formatNumber(estimate.reportedTokens)} Tokens；${estimate.unknownTokenDays} 个返回日期总量未知）`));
+      node.append(el('p', 'wt-window-meta', `模型级实测 Token：${estimate.measuredDays} 天 · ${formatNumber(estimate.measuredTokens)} Tokens；按占比分摊：${estimate.allocatedDays} 天 · ${formatNumber(estimate.allocatedTokens)} Tokens。覆盖率仅针对返回数据，不代表完整账户用量。`));
+    }
     if (estimate.valueUsd !== null && estimate.pricedDays < estimate.calendarDays) node.append(el('p', 'wt-notice wt-notice-warning', '仅为可估算日期小计；缺少数据或定价的日期未计入，不能视为整个区间总成本。'));
     const skippedReasons = new Set([...estimate.days.values()].filter((day) => day.reason).map((day) => day.reason));
     if (skippedReasons.size) node.append(el('p', 'wt-window-meta', `未估算原因：${[...skippedReasons].join('、')}。`));
     if (estimate.stale) node.append(el('p', 'wt-notice wt-notice-warning', '至少一个数据源使用该区间上次成功数据；估算可能过期。'));
-    node.append(el('p', 'wt-window-meta', '假设每日三类 Tokens 均按当日模型使用占比进行分摊（该占比并非 Token 占比）。结果是参考情景，不是实际账单、Credits 或套餐额度。'));
+    node.append(el('p', 'wt-window-meta', '优先使用逐类对账通过的模型级实际 Tokens；否则假设每日三类 Tokens 均按当日模型使用占比分摊（该占比不是已验证的 Token 占比）。所有 USD 均为 Standard API 等价估算，不是实际账单、Credits 或套餐额度。'));
     node.append(el('p', 'wt-window-meta', `Standard 短上下文文本单价快照：${MODEL_PRICING_VERIFIED_AT}；不含 Fast、长上下文、缓存写入、工具费及其他附加费用。历史日期同样按此快照换算。`));
     if (estimate.modelCosts.length) {
       const details = el('details', 'wt-api-equivalent-models');
+      details.dataset.detailKey = 'api-models';
       details.append(el('summary', '', '按模型估算明细'));
       for (const row of estimate.modelCosts) {
         const item = el('div', 'wt-daily-model-row');
@@ -1959,11 +2102,66 @@
     return wrapper;
   }
 
+  function formatAllocatedTokens(value) {
+    return Number.isFinite(value) && value >= 0 ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(value) : '未提供';
+  }
+
+  function renderDayAudit(row, day, distribution) {
+    const details = el('details', 'wt-day-audit');
+    details.dataset.detailKey = `api-day:${row.date}`;
+    details.append(el('summary', '', `${row.date} · 计价明细`));
+    const content = el('div', 'wt-day-audit-content');
+    const method = day?.method === 'model-tokens' ? '模型级实际 Token（逐类对账通过）'
+      : day?.method === 'model-share' ? '按当日原始模型占比分摊（假设）' : '无法计算';
+    content.append(el('p', 'wt-window-meta', `计算方式：${method}`));
+    content.append(el('p', 'wt-window-meta', `当日总量：Uncached ${formatNumber(row.metrics.uncachedInputTokens)} · Cached ${formatNumber(row.metrics.cachedInputTokens)} · Output ${formatNumber(row.metrics.outputTokens)} Tokens`));
+    if (day?.fallbackReason) content.append(el('p', 'wt-window-meta', day.fallbackReason));
+    if (day?.reason) content.append(el('p', 'wt-notice wt-notice-warning', day.reason));
+    const allocations = day?.allocations || [];
+    if (allocations.length) {
+      const table = el('table', 'wt-api-audit-table');
+      const head = el('thead');
+      const header = el('tr');
+      ['模型 / 速度', '原始占比', '计算权重', 'Uncached', 'Cached', 'Output', 'USD'].forEach((label) => header.append(el('th', '', label)));
+      head.append(header);
+      const body = el('tbody');
+      for (const allocation of allocations) {
+        const tr = el('tr');
+        const identity = el('td', 'wt-audit-model');
+        identity.append(el('strong', '', allocation.model), el('span', 'wt-window-meta', allocation.speed || 'unknown'));
+        const pricing = allocation.pricing;
+        if (pricing) identity.append(el('span', 'wt-audit-rate', `${pricing.id} · $${pricing.inputPerMillion} / $${pricing.cachedInputPerMillion} / $${pricing.outputPerMillion} 每百万 Tokens`));
+        else identity.append(el('span', 'wt-audit-rate', '无已知 Standard 费率'));
+        tr.append(identity);
+        const values = [
+          allocation.rawShare === null ? '—' : formatUsageShare(allocation.rawShare),
+          allocation.weight === null ? '—' : formatUsageShare(allocation.weight * 100),
+          ...TOKEN_CLASS_KEYS.map((key) => formatAllocatedTokens(allocation[key])),
+          formatApiEquivalent(allocation.valueUsd)
+        ];
+        values.forEach((value) => tr.append(el('td', '', value)));
+        body.append(tr);
+      }
+      table.append(head, body);
+      content.append(table);
+      content.append(el('p', 'wt-window-meta', '费率顺序：Uncached / Cached / Output；小数为分摊结果。未计价整日的单模型金额仅供核对，不计入区间小计。'));
+    } else if (distribution?.rows.length) {
+      content.append(el('p', 'wt-window-meta', '仅展示已识别的原始模型占比，未分摊 Tokens：'));
+      for (const item of distribution.rows) {
+        const line = el('div', 'wt-daily-model-row');
+        line.append(el('span', '', `${item.model} · ${item.speed}`), el('strong', '', formatUsageShare(item.sharePercent)));
+        content.append(line);
+      }
+    }
+    details.append(content);
+    return details;
+  }
+
   function renderDailyBreakdown(range, apiEstimate) {
     const wrapper = el('div', 'wt-subsection wt-daily-breakdown');
     wrapper.append(el('h4', 'wt-subtitle', '每日明细'));
     const rows = range?.stats?.rows || [];
-    const modelDays = modelBreakdownForRange(range).dailyRows;
+    const modelDays = new Map(modelBreakdownForRange(range).dailyRows.map((day) => [day.date, day]));
     if (!rows.length) {
       wrapper.append(el('p', 'wt-empty', '所选区间没有可显示的每日数据'));
       return wrapper;
@@ -1971,13 +2169,13 @@
     const table = el('table', 'wt-daily-table');
     const head = el('thead');
     const headerRow = el('tr');
-    ['日期', 'Tokens', 'Turns', 'Threads', '主要模型', 'API 估算 USD'].forEach((label) => headerRow.append(el('th', '', label)));
+    ['日期', 'Tokens', 'Turns', 'Threads', '主要模型（占比）', 'API 估算 USD'].forEach((label) => headerRow.append(el('th', '', label)));
     head.append(headerRow);
     const body = el('tbody');
     rows.slice().reverse().forEach((row) => {
       const tr = el('tr');
       const tokenText = row.metrics.tokens === null ? '未提供' : formatCompactNumber(row.metrics.tokens);
-      const modelDay = modelDays.find((item) => item.date === row.date);
+      const modelDay = modelDays.get(row.date);
       const model = modelDay?.rows[0];
       const mainModel = modelDay && !modelDay.complete ? '分布不完整' : model ? `${formatModelName(model.model)} · ${formatModelSpeed(model.speed)}` : '未提供';
       [row.date, tokenText, row.metrics.turns === null ? '未提供' : formatNumber(row.metrics.turns), row.metrics.threads === null ? '未提供' : formatNumber(row.metrics.threads), mainModel].forEach((value) => tr.append(el('td', '', value)));
@@ -1986,6 +2184,12 @@
       if (day?.reason) costCell.title = day.reason;
       tr.append(costCell);
       body.append(tr);
+      const auditRow = el('tr', 'wt-day-audit-row');
+      const auditCell = el('td');
+      auditCell.colSpan = 6;
+      auditCell.append(renderDayAudit(row, day, modelDay));
+      auditRow.append(auditCell);
+      body.append(auditRow);
     });
     table.append(head, body);
     wrapper.append(table);
@@ -2070,7 +2274,7 @@
     for (const dailyRow of dailyRows) {
       const day = el('div', 'wt-daily-model-day');
       day.append(el('strong', 'wt-daily-model-date', dailyRow.date));
-      if (!dailyRow.complete) day.append(el('p', 'wt-window-meta', '模型分布不完整，仅显示已识别记录，不参与区间占比及 API 估算。'));
+      if (!dailyRow.complete) day.append(el('p', 'wt-window-meta', '模型分布不完整，仅显示已识别记录，不参与区间占比或占比分摊；不影响独立对账通过的模型级 Tokens。'));
       for (const row of dailyRow.rows) {
         const item = el('div', 'wt-daily-model-row');
         item.append(el('span', 'wt-model-usage-name', `${formatModelName(row.model)} · ${formatModelSpeed(row.speed)}`), el('strong', 'wt-model-usage-share', formatUsageShare(row.sharePercent)));
@@ -2098,7 +2302,8 @@
     if (covered && range.stats.rows.length) node.append(renderStats(range.stats));
     else node.append(el('p', 'wt-empty', covered ? '所选范围没有可显示的统计数据' : '所选范围的统计数据尚未覆盖'));
     const distributions = el('div', 'wt-distributions');
-    distributions.append(renderModelUsage(range), renderClientRows(covered ? analytics.clientRows : [], covered ? range.stats.tokens : null));
+    const clientCoverage = covered ? reconcileClientTotals(range.stats.rows, range.start, range.end) : null;
+    distributions.append(renderModelUsage(range), renderClientRows(clientCoverage));
     node.append(distributions);
     if (covered) node.append(renderChart(range.stats.rows));
     return node;
@@ -2192,19 +2397,22 @@
     return ensureSelectedAnalytics();
   }
 
-  function renderClientRows(rows, totalTokens) {
+  function renderClientRows(coverage) {
     const wrapper = el('div', 'wt-subsection wt-client-distribution');
     wrapper.append(el('h4', 'wt-subtitle', '客户端分布'));
-    if (!rows.length) {
+    wrapper.append(el('p', 'wt-window-meta', '来源：Workspace Analytics 的客户端 ID。客户端不等于产品类型，无法仅凭 Web、Desktop 等标签确认是 Chat、Work 还是 Codex。总量也不保证覆盖所有 ChatGPT 对话。'));
+    if (coverage && (coverage.excessDays || coverage.unknownDays)) wrapper.append(el('p', 'wt-notice wt-notice-warning', `存在 ${coverage.excessDays} 个客户端合计超过总量的日期、${coverage.unknownDays} 个统计不完整的日期；不显示误导性的总量占比。`));
+    if (!coverage || !coverage.rows.length) {
       wrapper.append(el('p', 'wt-empty', '暂无客户端数据'));
       return wrapper;
     }
-    for (const row of rows) {
+    if (coverage.unclassifiedTokens > 0) wrapper.append(el('p', 'wt-window-meta', '未归类差额为可对账日期的总 Tokens 减去客户端合计，不代表普通 Chat 对话。'));
+    for (const row of coverage.rows) {
       const item = el('div', 'wt-client-row');
       const heading = el('div', 'wt-client-heading');
-      heading.append(el('strong', 'wt-client-name', prettyName(row.clientId, '其他未知客户端')), el('span', 'wt-client-share', formatPercent(row.tokenShare)));
-      item.append(heading, el('span', 'wt-client-value', `${formatNumber(row.tokens)} Tokens · ${formatNumber(row.threads)} Threads · ${formatNumber(row.turns)} Turns`));
-      item.append(createProgress(totalTokens ? row.tokenShare : null, `${row.clientId} Token 占比`));
+      heading.append(el('strong', 'wt-client-name', row.clientId), el('span', 'wt-client-share', formatPercent(row.tokenShare)));
+      item.append(heading, el('span', 'wt-client-value', row.unclassified ? `${formatNumber(row.tokens)} Tokens` : `${formatNumber(row.tokens)} Tokens · ${formatNumber(row.threads)} Threads · ${formatNumber(row.turns)} Turns`));
+      item.append(createProgress(row.tokenShare, `${row.clientId} Token 占比`));
       wrapper.append(item);
     }
     return wrapper;
@@ -2358,7 +2566,7 @@
       field('Thread Usage', runtime.state.threadUsageProvider.status === 'available' ? 'available' : 'unavailable'),
       field('Credit', creditDiagnosticAvailable() ? 'available' : 'unavailable'),
       field('costCapability', 'unavailable'),
-      field('API equivalent', 'model-share scenario · Standard snapshot')
+      field('API equivalent', 'reconciled model tokens / model-share scenario · Standard snapshot')
     );
     sources.append(sourceGrid);
     content.append(sources);
@@ -2397,7 +2605,7 @@
       `Analytics coverage: ${runtime.state.analytics.coverage.start ? `${runtime.state.analytics.coverage.start}..${runtime.state.analytics.coverage.end}` : '未覆盖'}`,
       `最后一次 Analytics 请求范围: ${runtime.state.analytics.lastRequest ? `${runtime.state.analytics.lastRequest.start}..${runtime.state.analytics.lastRequest.end}` : '未请求'}`,
       `命中内存 coverage: ${runtime.state.analytics.cacheHit ? '是' : '否'}`, `当前范围日期桶数: ${runtime.state.analytics.selectedBucketCount}`,
-      `Workspace Analytics=${dataSourceStatus(runtime.state.diagnostics.analyticsStatus, runtime.state.analytics.dailyRows.length > 0)}`, `Model Breakdown=${dataSourceStatus(runtime.state.diagnostics.modelBreakdownStatus, runtime.state.modelBreakdown.units === 'percent')}`, `Thread Usage=${runtime.state.threadUsageProvider.status === 'available' ? 'available' : 'unavailable'}`, `Credit=${creditDiagnosticAvailable() ? 'available' : 'unavailable'}`, 'costCapability=unavailable', 'API equivalent=model-share scenario',
+      `Workspace Analytics=${dataSourceStatus(runtime.state.diagnostics.analyticsStatus, runtime.state.analytics.dailyRows.length > 0)}`, `Model Breakdown=${dataSourceStatus(runtime.state.diagnostics.modelBreakdownStatus, runtime.state.modelBreakdown.units === 'percent')}`, `Thread Usage=${runtime.state.threadUsageProvider.status === 'available' ? 'available' : 'unavailable'}`, `Credit=${creditDiagnosticAvailable() ? 'available' : 'unavailable'}`, 'costCapability=unavailable', 'API equivalent=reconciled model tokens / model-share scenario',
       `成功解析窗口数量: ${runtime.state.diagnostics.windowCount}`, `主额度窗口数量: ${runtime.state.diagnostics.primaryWindowCount}`, `额外额度窗口数量: ${runtime.state.diagnostics.additionalWindowCount}`, `每日数据行数: ${runtime.state.diagnostics.dailyRows}`,
       `客户端类型: ${runtime.state.diagnostics.clientTypes.join(', ') || '未提供'}`, `未识别顶层字段: ${runtime.state.diagnostics.unknownFields.join(', ') || '无'}`, `错误代码: ${runtime.state.diagnostics.errors.join(', ') || '无'}`
     ];
@@ -2515,13 +2723,13 @@
       else if (active.dataset.action) focus = { type: 'action', value: active.dataset.action, section: active.dataset.sectionId };
       else if (active.classList.contains('wt-chart-select')) focus = { type: 'metric', value: active.value };
       else if (active.name) focus = { type: 'name', value: active.name };
-      else if (active.tagName === 'SUMMARY') focus = { type: 'summary' };
+      else if (active.tagName === 'SUMMARY') focus = { type: 'summary', value: active.closest('details')?.dataset.detailKey };
     }
     return {
       session: runtime.ui.panelSession,
       scrollTop: body.scrollTop,
       focus,
-      details: [...body.querySelectorAll('details')].map((detail) => detail.open),
+      details: [...body.querySelectorAll('details[data-detail-key]')].map((detail) => ({ key: detail.dataset.detailKey, open: detail.open })),
       sections: SECTION_IDS.map((id) => ({ id, collapsed: runtime.prefs.sectionCollapsed[id] === true }))
     };
   }
@@ -2530,11 +2738,12 @@
     if (!state || state.session !== runtime.ui.panelSession || runtime.prefs.collapsed) return;
     const body = runtime.shadow?.querySelector('.wt-body');
     if (!body) return;
+    const details = new Map(state.details.map((item) => [item.key, item.open]));
+    [...body.querySelectorAll('details[data-detail-key]')].forEach((detail) => {
+      if (details.has(detail.dataset.detailKey)) detail.open = details.get(detail.dataset.detailKey);
+    });
     const maxScrollTop = Math.max(0, body.scrollHeight - body.clientHeight);
     body.scrollTop = Math.min(Math.max(0, state.scrollTop), maxScrollTop);
-    [...body.querySelectorAll('details')].forEach((detail, index) => {
-      if (state.details[index] !== undefined) detail.open = state.details[index];
-    });
     for (const sectionState of state.sections || []) {
       const section = [...body.querySelectorAll('[data-section]')].find((node) => node.dataset.section === sectionState.id);
       const sectionBody = section?.querySelector('.wt-section-body');
@@ -2550,7 +2759,7 @@
     if (focus.type === 'action') target = [...runtime.shadow.querySelectorAll('[data-action]')].find((node) => node.dataset.action === focus.value && (!focus.section || node.dataset.sectionId === focus.section));
     if (focus.type === 'metric') target = body.querySelector('.wt-chart-select');
     if (focus.type === 'name') target = [...body.querySelectorAll('[name]')].find((node) => node.name === focus.value);
-    if (focus.type === 'summary') target = body.querySelector('summary');
+    if (focus.type === 'summary') target = [...body.querySelectorAll('details[data-detail-key]')].find((detail) => detail.dataset.detailKey === focus.value)?.querySelector('summary');
     target?.focus({ preventScroll: true });
   }
 
@@ -2879,6 +3088,13 @@
       .wt-api-equivalent-models { margin-top: 10px; }
       .wt-api-equivalent-models summary { cursor: pointer; color: var(--wt-color-text-secondary); }
       .wt-daily-api-cost { font-variant-numeric: tabular-nums; }
+      .wt-day-audit-row > td { text-align: left; white-space: normal; padding: 0 5px 8px; }
+      .wt-day-audit summary { cursor: pointer; color: var(--wt-color-text-secondary); font-size: 11px; padding: 4px 0; }
+      .wt-day-audit-content { background: var(--wt-color-surface); border: 1px solid var(--wt-color-border-subtle); border-radius: 8px; padding: 10px; overflow-x: auto; }
+      .wt-api-audit-table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+      .wt-api-audit-table .wt-audit-model { min-width: 120px; white-space: normal; overflow-wrap: anywhere; }
+      .wt-audit-model strong, .wt-audit-model span { display: block; }
+      .wt-audit-rate { font-size: 10px; color: var(--wt-color-text-secondary); }
       .wt-secondary-metrics { background: var(--wt-color-bg); border: 0; }
       .wt-client-name, .wt-client-value { overflow-wrap: anywhere; }
       .wt-client-row:last-child, .wt-model-pie-item:last-child { border-bottom: 0; }
