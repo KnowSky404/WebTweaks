@@ -20,13 +20,15 @@ async function runRegressionTests(source, assert, Params, test) {
     return { date, totals: { tokens, turns: i + 1, threads: 1 }, clients: [{ client_id: i < 2 ? 'CLI' : 'WEB', totals: { tokens, turns: i + 1, threads: 1 } }] };
   });
   const models = { units: 'percent', data: fixtureDays.map((date, i) => ({ date, models: [{ model: i < 2 ? 'model-a' : 'model-b', speed: 'standard', credits: 100 }] })) };
-  function load() {
+  function load(storage = new Map()) {
     const marker = '  window.wtChatgptAccountUsageCleanup = cleanup;\n  initialize();';
     assert.ok(source.includes(marker));
-    const patched = source.replace(marker, `  return { runtime, deriveRanges, analyticsRequestRange, normalizeDailyRows, normalizeModelBreakdown, aggregateModelShares, modelBreakdownForRange, selectedAnalyticsRange, rebuildAnalyticsRanges, mergeCoverage, isRangeCovered, rangeError, fetchAnalyticsRange, fetchModelBreakdown, selectAnalyticsRange, commitAnalyticsRange, applyPosition, validateCustomRange, inclusiveRangeToExclusiveRange, setRequest(fn) { requestJSON = fn; } };`).replace('(() => {', 'return (() => {');
-    const storage = new Map();
+    const patched = source.replace(marker, `  return { runtime, deriveRanges, analyticsRequestRange, normalizeDailyRows, normalizeModelBreakdown, aggregateModelShares, modelBreakdownForRange, selectedAnalyticsRange, rebuildAnalyticsRanges, mergeCoverage, isRangeCovered, rangeError, fetchAnalyticsRange, fetchModelBreakdown, selectAnalyticsRange, commitAnalyticsRange, applyPosition, validateCustomRange, inclusiveRangeToExclusiveRange, estimateApiCost, estimateDailyApiEquivalent, estimateRangeApiEquivalent, renderRangeAnalysis, isWidePanel, setWidePreference, startDrag, setRequest(fn) { requestJSON = fn; } };`).replace('(() => {', 'return (() => {');
     const localStorage = { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) };
-    const api = new Function('Date', 'URLSearchParams', 'localStorage', 'window', patched)(FixedDate, Params, localStorage, { innerWidth: 1440, innerHeight: 900 });
+    const document = { createElement(tag) {
+      return { tag, className: '', textContent: '', children: [], append(...children) { this.children.push(...children); } };
+    } };
+    const api = new Function('Date', 'URLSearchParams', 'localStorage', 'window', 'document', patched)(FixedDate, Params, localStorage, { innerWidth: 1440, innerHeight: 900 }, document);
     api.runtime.state.data = { windows: [windowFixture] };
     api.rebuildAnalyticsRanges();
     return api;
@@ -164,20 +166,129 @@ async function runRegressionTests(source, assert, Params, test) {
     const anchor = { version: 2, horizontal: 'right', vertical: 'bottom', offsetX: 20, offsetY: 96 };
     api.runtime.prefs.position = anchor;
     api.runtime.prefs.collapsed = false;
-    api.runtime.host = { style: {}, getBoundingClientRect: () => ({ width: api.runtime.ui.wide ? 1120 : 400, height: 500 }) };
+    api.runtime.host = { style: {}, getBoundingClientRect: () => ({ width: api.runtime.prefs.wide ? 1120 : 400, height: 500 }) };
     api.applyPosition();
     assert.equal(api.runtime.host.style.right, '20px');
     assert.equal(api.runtime.host.style.bottom, '96px');
-    api.runtime.ui.wide = true;
+    api.setWidePreference(true);
     api.applyPosition();
     assert.equal(api.runtime.host.style.left, '160px');
     assert.equal(api.runtime.host.style.top, '12px');
     assert.equal(api.runtime.host.style.right, 'auto');
-    api.runtime.ui.wide = false;
+    api.setWidePreference(false);
     api.applyPosition();
     assert.equal(api.runtime.host.style.right, '20px');
     assert.equal(api.runtime.host.style.bottom, '96px');
     assert.equal(api.runtime.prefs.position, anchor);
+  });
+
+  await test('remembered wide preference survives collapse and reload without disabling launcher click or drag', () => {
+    const storage = new Map();
+    const api = load(storage);
+    assert.equal(api.runtime.prefs.wide, false);
+    api.runtime.prefs.collapsed = false;
+    api.setWidePreference(true);
+    assert.equal(api.isWidePanel(), true);
+    api.runtime.prefs.collapsed = true;
+    assert.equal(api.isWidePanel(), false);
+    assert.equal(api.runtime.prefs.wide, true);
+    const next = load(storage);
+    assert.equal(next.runtime.prefs.wide, true);
+    assert.equal(next.isWidePanel(), false);
+    const rect = { width: 46, height: 46, left: 100, right: 146, top: 100, bottom: 146 };
+    next.runtime.host = { style: {}, getBoundingClientRect: () => rect };
+    const listeners = new Map();
+    const launcher = {
+      classList: { contains: (name) => name === 'wt-launcher' },
+      addEventListener(name, callback) { listeners.set(name, callback); },
+      removeEventListener(name) { listeners.delete(name); }
+    };
+    const event = { button: 0, clientX: 120, clientY: 120, pointerId: 1, target: launcher };
+    next.startDrag(event, launcher);
+    assert.ok(listeners.has('pointermove'));
+    listeners.get('pointerup')({ type: 'pointerup', pointerId: 1 });
+    assert.equal(next.runtime.prefs.collapsed, false);
+    assert.equal(next.isWidePanel(), true);
+    next.setWidePreference(false);
+    assert.equal(load(storage).runtime.prefs.wide, false);
+    storage.set('wt-chatgpt-account-usage:wide', '"invalid"');
+    assert.equal(load(storage).runtime.prefs.wide, false);
+  });
+
+  await test('standard text prices apply independently to token classes and daily model weights', () => {
+    const api = load();
+    const metrics = { tokens: 3_000_000, uncachedInputTokens: 1_000_000, cachedInputTokens: 1_000_000, outputTokens: 1_000_000 };
+    const rows = [{ model: 'gpt-6.2-sol', sharePercent: 75 }, { model: 'gpt-6.2-astra', sharePercent: 25 }];
+    const result = api.estimateDailyApiEquivalent(metrics, rows);
+    assert.ok(Math.abs(result.valueUsd - (12.1 * .75 + 48.4 * .25)) < 1e-9);
+    assert.equal(result.modelCosts.length, 2);
+    assert.equal(api.estimateApiCost({ model: 'gpt-5.6', inputTokens: 1_000_000, cachedInputTokens: 0, outputTokens: 0 }).valueUsd, 4);
+    assert.equal(api.estimateApiCost({ model: 'gpt-6.1-terra', inputTokens: 0, cachedInputTokens: 1_000_000, outputTokens: 0 }).valueUsd, .05);
+    assert.equal(api.estimateApiCost({ model: 'gpt-6-luna', inputTokens: 0, cachedInputTokens: 1_000_000, outputTokens: 0 }).valueUsd, .01);
+    assert.equal(api.estimateDailyApiEquivalent({ ...metrics, cachedInputTokens: null }, rows).valueUsd, null);
+    assert.equal(api.estimateDailyApiEquivalent({ ...metrics, tokens: 4_000_000 }, rows).valueUsd, null);
+    assert.equal(api.estimateDailyApiEquivalent(metrics, [{ ...rows[0] }, { model: 'unknown-model', sharePercent: 25 }]).valueUsd, null);
+    assert.equal(api.estimateDailyApiEquivalent(metrics, []).valueUsd, null);
+    assert.equal(api.estimateDailyApiEquivalent(metrics, [{ model: 'constructor', sharePercent: 100 }]).valueUsd, null);
+    const zero = { tokens: 0, uncachedInputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+    assert.equal(api.estimateDailyApiEquivalent(zero, rows).valueUsd, 0);
+  });
+
+  await test('range analysis uses selected dates, calculates daily before summing, and marks incomplete or stale estimates', async () => {
+    const api = load();
+    const ws = [
+      { date: '2026-10-29', totals: { tokens: 1_000_000, uncached_input_tokens: 1_000_000, cached_input_tokens: 0, output_tokens: 0, credits: 12 } },
+      { date: '2026-11-18', totals: { tokens: 1_000_000, uncached_input_tokens: 0, cached_input_tokens: 1_000_000, output_tokens: 0 } },
+      { date: '2026-11-22', totals: { tokens: 2_000_000, uncached_input_tokens: 0, cached_input_tokens: 0, output_tokens: 2_000_000, credits: 20 } },
+      { date: '2026-11-23', totals: { tokens: 1_000_000, uncached_input_tokens: 1_000_000, cached_input_tokens: 0, output_tokens: 0 } }
+    ];
+    const breakdown = { units: 'percent', data: [
+      { date: '2026-10-29', models: [{ model: 'gpt-5.6-sol', credits: 100 }] },
+      { date: '2026-11-18', models: [{ model: 'gpt-6.2-sol', credits: 100 }] },
+      { date: '2026-11-22', models: [{ model: 'gpt-6.2-astra', credits: 100 }] },
+      { date: '2026-11-23', models: [{ model: 'unknown-model', credits: 100 }] }
+    ] };
+    api.setRequest(async (url) => ok(url.includes('daily-token-usage-breakdown') ? breakdown : ws));
+    const { start, end } = api.analyticsRequestRange([windowFixture]);
+    await Promise.all([api.fetchAnalyticsRange(start, end), api.fetchModelBreakdown(start, end)]);
+    let estimate = api.estimateRangeApiEquivalent(api.selectedAnalyticsRange());
+    assert.equal(estimate.valueUsd, 80);
+    assert.equal(estimate.pricedDays, 1);
+    assert.equal(estimate.returnedDays, 2);
+    assert.equal(estimate.days.get('2026-11-23').valueUsd, null);
+    const collect = (node) => [node.textContent, ...node.children.flatMap(collect)].join(' ');
+    assert.ok(collect(api.renderRangeAnalysis()).includes('实际额度窗口 Credits 推算'));
+    await api.selectAnalyticsRange('7d');
+    estimate = api.estimateRangeApiEquivalent(api.selectedAnalyticsRange());
+    assert.ok(Math.abs(estimate.valueUsd - 80.1) < 1e-9);
+    assert.equal(estimate.pricedDays, 2);
+    assert.equal(estimate.calendarDays, 7);
+    let rendered = collect(api.renderRangeAnalysis());
+    assert.ok(rendered.includes('2026-11-18'));
+    assert.ok(!rendered.includes('2026-10-29'));
+    assert.ok(!rendered.includes('实际额度窗口 Credits 推算'));
+    assert.ok(rendered.includes('仅为可估算日期小计'));
+    assert.ok(rendered.includes('未估算原因'));
+    await api.selectAnalyticsRange('30d');
+    estimate = api.estimateRangeApiEquivalent(api.selectedAnalyticsRange());
+    assert.ok(Math.abs(estimate.valueUsd - 84.1) < 1e-9);
+    assert.equal(estimate.pricedDays, 3);
+    assert.ok(collect(api.renderRangeAnalysis()).includes('2026-10-29'));
+    api.runtime.prefs.customStart = '2026-10-29';
+    api.runtime.prefs.customEnd = '2026-10-29';
+    await api.commitAnalyticsRange('custom');
+    estimate = api.estimateRangeApiEquivalent(api.selectedAnalyticsRange());
+    assert.equal(estimate.valueUsd, 4);
+    assert.equal(estimate.calendarDays, 1);
+    assert.equal(estimate.pricedDays, 1);
+    assert.ok(!collect(api.renderRangeAnalysis()).includes('实际额度窗口 Credits 推算'));
+    api.setRequest(async () => fail);
+    await api.fetchModelBreakdown('2026-10-29', '2026-10-30', {}, true);
+    estimate = api.estimateRangeApiEquivalent(api.selectedAnalyticsRange());
+    assert.equal(estimate.stale, true);
+    assert.equal(estimate.valueUsd, 4);
+    const fresh = load();
+    assert.equal(fresh.estimateRangeApiEquivalent(fresh.selectedAnalyticsRange()).valueUsd, null);
   });
 }
 
