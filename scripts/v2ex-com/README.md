@@ -28,6 +28,8 @@ Native Markdown, code highlighting, task lists, preview, submit, reply targets, 
 
 Version 1.8.1 confines Markdown exclusions to the rendered content itself (not V2EX's outer layout table), preserving ordinary image link/bare URL expansion. An opted-in empty first-page reply list is a valid initialization target; its first native reply starts the legacy session without a reload, unless the policy or page has changed.
 
+Version 1.8.2 applies the same content-bounded ancestor check to reply-prefix inference, restoring exact and inferred historical relationships in V2EX's layout table while keeping protected Markdown mentions excluded.
+
 ### Optional historical threaded replies
 
 The script parses the rendered reply HTML, discovers actual V2EX pagination links, and fetches other pages from the current V2EX origin with same-origin credentials. Fetched pages extend the in-memory relationship dataset; they do not replace the active native page's rendering scope. A relationship is shown as:

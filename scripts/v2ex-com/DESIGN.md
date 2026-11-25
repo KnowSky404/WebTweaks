@@ -173,7 +173,7 @@ Other pages are fetched from `location.origin` with same-origin credentials. At 
 
 ## Client-side image enhancement
 
-Markdown exclusions are scoped to the current `.reply_content` or `.topic_content` using `hasContentAncestor`. A surrounding V2EX layout table is not a Markdown table; ordinary linked and bare image URLs remain eligible. Internal tables, code and quoted content are excluded.
+Markdown exclusions are scoped to the current `.reply_content` or `.topic_content` using `hasContentAncestor`. A surrounding V2EX layout table is not a Markdown table; ordinary linked and bare image URLs remain eligible. The prefix parser uses the same helper with the enclosing reply content, including paragraph-wrapped mentions, so exact and inferred historical relationships survive the outer layout table. Internal tables, code and quoted content are excluded.
 
 Display enhancement is a separate browser-only stage: V2EX server content and submission behavior are unchanged, and users without WebTweaks retain the original URL/content.
 

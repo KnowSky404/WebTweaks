@@ -699,6 +699,18 @@
           check(!scrollTop.hidden && document.querySelectorAll('.wt-v2ex-scroll-top').length === 1, 'scroll toggle duplicated the always-visible button');
           record('返回顶部在页首和滚动后均常显，点击与设置开关正常且不重复创建', true);
 
+          // Verify the parser against the real browser layout table, including
+          // paragraph-wrapped mentions and protected Markdown blocks.
+          const prefixCases = [
+            { id: '217', floor: 117, page: 2, author: 'Exact', content: '@<a href="/member/alice">Alice</a> #2 cross-page exact', count: null, canThank: false },
+            { id: '218', floor: 118, page: 2, author: 'Inferred', content: '<p>@<a href="/member/alice">Alice</a> cross-page inferred</p>', count: null, canThank: false },
+            { id: '219', floor: 119, page: 2, author: 'Quoted', content: '<blockquote>@<a href="/member/alice">Alice</a> #2 quoted</blockquote>', count: null, canThank: false },
+            { id: '220', floor: 120, page: 2, author: 'Table', content: '<table><tbody><tr><td>@<a href="/member/alice">Alice</a> #2 table</td></tr></tbody></table>', count: null, canThank: false },
+            { id: '221', floor: 121, page: 2, author: 'Code', content: '<p>@<code><a href="/member/alice">Alice</a></code> #2 code</p>', count: null, canThank: false }
+          ];
+          // Add these only after the next floor-116 Markdown case to preserve
+          // the strictly ascending native list. See assertions below.
+
           // Markdown and linked image behavior in a legacy session.
           const markdown = { id: '216', floor: 116, page: 2, author: 'Markdown', content: '<blockquote>@<a href="/member/d">D</a> #101 quoted text</blockquote><ul><li><input type="checkbox" disabled checked>done</li><li><input type="checkbox" disabled>todo</li></ul><pre><code>https://images.example/code.png</code></pre><p><a href="https://images.example/ordinary-link.png">ordinary link</a></p><p>https://images.example/ordinary-text.png</p><table><tbody><tr><td><a href="https://images.example/table-link.png">table link</a> https://images.example/table-text.png</td></tr></tbody></table><a href="https://images.example/full.png"><img src="https://images.example/thumb.png" alt="native linked image"></a>', count: null, canThank: false };
           state.replies.set(markdown.id, markdown);
@@ -706,10 +718,25 @@
           markdownHolder.innerHTML = renderPage(2);
           document.querySelector('#topic-replies .box').append(markdownHolder.querySelector('#r_216'));
           await waitFor(() => card('216'), 'Markdown reply not projected');
-          const markdownClone = card('216');
+          let markdownClone = card('216');
           const boxes = [...markdownClone.querySelectorAll('input[type="checkbox"]')];
           check(boxes.length === 2 && boxes.every((box) => box.disabled) && boxes[0].checked && !boxes[1].checked, 'Markdown task list did not survive safe clone');
           check(!markdownClone.querySelector('.wt-v2ex-relation'), 'quoted text became a false reply relationship');
+          prefixCases.forEach((reply) => state.replies.set(reply.id, reply));
+          const prefixHolder = document.createElement('div');
+          prefixHolder.innerHTML = renderPage(2);
+          const nativeBox = document.querySelector('#topic-replies .box');
+          nativeBox.append(...prefixCases.map((reply) => prefixHolder.querySelector('#r_' + reply.id)));
+          await waitFor(() => card('221'), 'prefix fixtures were not projected');
+          check(document.querySelector('#r_217 .reply_content').closest('table'), 'prefix fixture lacks the native layout table');
+          check(card('217').closest('.wt-v2ex-thread-children')?.parentElement === card('102') && card('217').querySelector('.wt-v2ex-relation-exact'), 'exact cross-page prefix was not inferred');
+          check(card('218').closest('.wt-v2ex-thread-children')?.parentElement === card('102') && card('218').querySelector('.wt-v2ex-relation-inferred'), 'Markdown paragraph cross-page prefix was not inferred');
+          for (const id of ['219', '220', '221']) {
+            check(!card(id).closest('.wt-v2ex-thread-children') && !card(id).querySelector('.wt-v2ex-relation'), 'protected Markdown prefix produced a false relationship: ' + id);
+          }
+          check(!card('101'), 'prefix regression leaked unrelated page-one reply');
+          record('普通及 Markdown 段落回复正确解析跨页关系，正文内引用、表格和代码不产生虚假关系', true);
+          markdownClone = card('216');
           check(!markdownClone.querySelector('pre .wt-v2ex-inline-image') && !markdownClone.querySelector('a img.wt-v2ex-lightbox-target'), 'code or native linked image was intercepted');
           record('Markdown 任务列表、代码块、引用与原生图片链接兼容', true);
           const checkScopedPreviews = (content) => {
