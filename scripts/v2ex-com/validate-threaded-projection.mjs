@@ -271,6 +271,7 @@ class FakeDocument {
     this.body = new FakeElement('body');
     this.head = new FakeElement('head');
     this.main = new FakeElement('main');
+    this.main.id = 'topic-replies';
     this.topicReplies = [];
     this.currentPageMarker = null;
   }
@@ -301,6 +302,7 @@ class FakeDocument {
   }
 
   querySelectorAll(selector) {
+    if (selector === '#topic-replies') return [this.main];
     if (selector === '.ps_container .page_current') {
       return this.currentPageMarker ? [this.currentPageMarker] : [];
     }
@@ -375,7 +377,15 @@ const sandbox = {
   Document: FakeDocument,
   HTMLImageElement: FakeImageElement,
   NodeFilter: { SHOW_TEXT: 4 },
-  Event: FakeEvent
+  Event: FakeEvent,
+  AbortController,
+  fetch: async () => ({ ok: true, url: 'https://www.v2ex.com/settings', text: async () => 'synthetic settings' }),
+  DOMParser: class {
+    parseFromString() {
+      const selected = { labels: [{ textContent: '楼中楼显示方式' }], selectedIndex: 0, options: [{ textContent: '经典平铺' }], closest: () => null };
+      return { querySelectorAll: (selector) => selector === 'select' ? [selected] : [] };
+    }
+  }
 };
 sandbox.globalThis = sandbox;
 vm.runInNewContext(instrumented, sandbox, { filename: userscriptPath.pathname });
@@ -550,6 +560,8 @@ assertIds(renderPage(topic, 2), renderedPage2, 'case 3 page 2 projection mismatc
 assertIds(renderPage(topic, 1), firstPageIds, 'case 3 return to page 1 retained stale page-2 content');
 
 // The actual History API hooks must invalidate and clean a coalesced ABA transition.
+// Explicitly opt into the legacy renderer and supply a synthetic classic setting.
+runtime.settings.conversationMode = 'legacy';
 runtime.navigationRevision = 0;
 runtime.navigationSchedule = 0;
 setLocation(1);
@@ -567,19 +579,18 @@ assert(windowListeners.get('popstate')?.length === 1, 'case 3 attached duplicate
 assert(windowListeners.get('wt-v2ex-navigation')?.length === 1, 'case 3 attached duplicate navigation listeners');
 assert(isCurrentTopic(stalePage1Topic), 'case 3 setup topic was not current');
 fakeWindow.history.pushState({}, '', '?p=2');
-fakeDocument.setTopicReplies([new FakeNativeReply('fresh-page-2', 51, 'FreshPage2')], 2);
+fakeDocument.setTopicReplies([new FakeNativeReply('1002', 51, 'FreshPage2')], 2);
 fakeWindow.history.pushState({}, '', '/t/4242');
-fakeDocument.setTopicReplies([new FakeNativeReply('fresh-page-1', 32, 'FreshPage1')], 1);
+fakeDocument.setTopicReplies([new FakeNativeReply('1001', 32, 'FreshPage1')], 1);
 assert(runtime.navigationRevision === 2, 'case 3 did not record both page transitions');
 assert(!isCurrentTopic(stalePage1Topic), 'case 3 revived an obsolete page-1 snapshot after ABA navigation');
 assert(!topicStateMatchesLocation(), 'case 3 would skip synchronization for an obsolete same-URL snapshot');
 assert(scheduledCallbacks.length === 1, 'case 3 did not coalesce navigation synchronization');
 scheduledCallbacks.shift()();
-await Promise.resolve();
-await Promise.resolve();
+for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
 assert(runtime.topic && runtime.topic !== stalePage1Topic, 'case 3 did not replace the obsolete topic');
 assert(isCurrentTopic(runtime.topic), 'case 3 replacement topic does not match the final page');
-assertIds(renderedIds(runtime.topic), ['fresh-page-1'], 'case 3 did not render the final page-1 DOM');
+assertIds(renderedIds(runtime.topic), ['1001'], 'case 3 did not render the final page-1 DOM');
 assert(!staleTopicHost.contains(stalePage1Topic.threadedView), 'case 3 retained the obsolete threaded container');
 assert(stalePage1Topic.nativeReplies.every((element) => !element.classList.contains('wt-v2ex-native-hidden')), 'case 3 did not restore native replies during cleanup');
 assert(stalePage1Topic.nativeReplies.every((element) => !element.hasAttribute('aria-hidden')), 'case 3 left stale native aria-hidden state');

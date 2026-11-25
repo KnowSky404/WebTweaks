@@ -2,9 +2,9 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.7.0
-// @description  Threaded cross-page replies with native thanks/hiding, image previews, unified settings, and always-visible scroll-to-top for V2EX.
-// @description:zh-CN 为 V2EX 提供跨页楼中楼、原生感谢与隐藏、图片预览、统一设置和常显返回顶部。
+// @version      1.8.0
+// @description  Native-first V2EX compatibility, optional legacy threaded replies, image enhancements, and scroll-to-top.
+// @description:zh-CN 官方功能优先、可选历史楼中楼、图片增强与返回顶部。
 // @author       KnowSky404
 // @match        https://v2ex.com/*
 // @match        https://*.v2ex.com/*
@@ -23,7 +23,7 @@
   'use strict';
 
   const LOG_PREFIX = '[WebTweaks:V2EX]';
-  const SETTINGS_VERSION = 3;
+  const SETTINGS_VERSION = 4;
   const SETTINGS_KEY = 'wt-v2ex-settings';
   const MAX_PAGE_REQUESTS = 3;
   const PAGE_TIMEOUT_MS = 12_000;
@@ -33,7 +33,8 @@
   const IMAGE_URL_TOKEN_PATTERN = /https?:\/\/[^\s<>"']+/gi;
   const SETTING_KEYS = new Set([
     'version',
-    'preferredView',
+    'conversationMode',
+    'legacyFallbackEnabled',
     'scrollTopEnabled',
     'imagePreviewEnabled',
     'imageLightboxEnabled'
@@ -57,6 +58,8 @@
   const runtime = {
     settings: loadSettings(),
     topic: null,
+    nativeModeCheck: null,
+    nativeModeResult: null,
     waitingReplyObserver: null,
     controlDock: null,
     settingsToggle: null,
@@ -66,6 +69,8 @@
     navigationAttached: false,
     navigationSchedule: 0,
     navigationSync: false,
+    navigationPending: false,
+    topicDomWaitCancel: null,
     navigationRevision: 0,
     observedTopicKey: null,
     thanksRequest: null,
@@ -73,6 +78,8 @@
     ignoredReplies: new Set(),
     thanksBlockedTokens: new Set(),
     imageDelegationAttached: false,
+    imageObserver: null,
+    imageObserverRoot: null,
     imageLightbox: null,
     imageLightboxImage: null,
     imageLightboxLink: null,
@@ -109,12 +116,15 @@
     const value = stored && typeof stored === 'object' ? stored : {};
     const settings = {
       version: SETTINGS_VERSION,
-      preferredView: value.preferredView === 'original' ? 'original' : 'threaded',
+      conversationMode: ['auto', 'native', 'legacy'].includes(value.conversationMode) ? value.conversationMode
+        : value.preferredView === 'original' ? 'native' : 'auto',
+      legacyFallbackEnabled: value.legacyFallbackEnabled === true,
       scrollTopEnabled: value.scrollTopEnabled !== false,
       imagePreviewEnabled: value.imagePreviewEnabled !== false,
       imageLightboxEnabled: value.imageLightboxEnabled !== false
     };
-    if (value.version !== SETTINGS_VERSION || Object.keys(value).some((key) => !SETTING_KEYS.has(key))) {
+    if (value.version !== SETTINGS_VERSION || Object.keys(value).some((key) => !SETTING_KEYS.has(key))
+      || Object.keys(settings).some((key) => value[key] !== settings[key])) {
       safeSet(SETTINGS_KEY, settings);
     }
     return settings;
@@ -127,7 +137,9 @@
   function setFeatureSetting(key, enabled) {
     runtime.settings[key] = enabled;
     saveSettings();
-    if (key === 'imagePreviewEnabled') {
+    if (key === 'legacyFallbackEnabled') {
+      refreshConversationPolicy();
+    } else if (key === 'imagePreviewEnabled') {
       if (enabled) scanImageContent(document);
       else {
         if (runtime.imageLightboxOpener?.classList.contains('wt-v2ex-inline-image')) closeImageLightbox();
@@ -140,6 +152,112 @@
       if (enabled) initializeScrollToTop();
       updateScrollButton();
     }
+    if (key === 'imagePreviewEnabled' || key === 'imageLightboxEnabled') {
+      if (!runtime.settings.imagePreviewEnabled && !runtime.settings.imageLightboxEnabled) {
+        runtime.imageObserver?.disconnect();
+        runtime.imageObserver = null;
+        runtime.imageObserverRoot = null;
+      } else observeImageContent();
+    }
+  }
+
+  function wantsLegacyConversation(settings = runtime.settings) {
+    return settings.conversationMode === 'legacy'
+      || (settings.conversationMode === 'auto' && settings.legacyFallbackEnabled);
+  }
+
+  // Only the documented visible option names are known. Do not guess private
+  // configuration keys or interpret an unrecognized/missing field as flat.
+  function classifyNativeMode(label) {
+    const value = String(label || '').trim().replace(/\s+/g, '').replace(/[（(]默认[）)]$|默认$/, '');
+    if (value === '经典平铺') return 'classic';
+    if (['引用条', '角标+悬浮预览', '楼中楼', '树形缩进', '对话连线', '引用楼层'].includes(value)) return 'enhanced';
+    return 'unknown';
+  }
+
+  function nativeModeFromSettings(root) {
+    const title = (node) => String(node?.textContent || '').trim().replace(/\s+/g, '').replace(/[：:]$/, '') === '楼中楼显示方式';
+    const associated = (control) => {
+      if ([...(control.labels || [])].some(title)) return true;
+      const group = control.closest('tr, fieldset, .cell');
+      return Boolean(group && [...group.querySelectorAll('label, legend, th, td:first-child, .label')].some(title));
+    };
+    const values = [];
+    root.querySelectorAll('select').forEach((control) => {
+      if (associated(control)) values.push(classifyNativeMode(control.options[control.selectedIndex]?.textContent));
+    });
+    root.querySelectorAll('input[type="radio"]:checked').forEach((control) => {
+      if (associated(control)) {
+        const labels = [...(control.labels || [])].filter((node) => !title(node));
+        values.push(labels.length === 1 ? classifyNativeMode(labels[0].textContent) : 'unknown');
+      }
+    });
+    return values.length === 1 ? values[0] : 'unknown';
+  }
+
+  function isFlatReplyList(root, replies) {
+    const list = root.querySelector('#topic-replies');
+    if (!list || !replies.length) return false;
+    const parent = replies[0].parentElement;
+    if (!parent || !list.contains(parent) || parent.closest('.cell[id^="r_"]')) return false;
+    let previousFloor = 0;
+    const ids = new Set();
+    return replies.every((cell) => {
+      if (cell.parentElement !== parent || !/^r_[1-9]\d*$/.test(cell.id) || ids.has(cell.id)) return false;
+      if (cell.querySelector('.cell[id^="r_"]')) return false;
+      const content = firstMatch(cell, SELECTORS.replyContent);
+      const header = nativeReplyHeader(cell);
+      const floor = parseFloor(header && [...header.querySelectorAll('.no')].find((node) => !node.closest('.reply_content'))?.textContent);
+      if (!content || !floor || floor <= previousFloor) return false;
+      previousFloor = floor;
+      ids.add(cell.id);
+      return true;
+    });
+  }
+
+  function cancelNativeModeCheck() {
+    runtime.nativeModeCheck?.controller.abort();
+    runtime.nativeModeCheck = null;
+    runtime.nativeModeResult = null;
+    runtime.topicDomWaitCancel?.();
+  }
+
+  async function readNativeMode(context) {
+    // Topic content is not trusted as a source of account settings.
+    const revision = runtime.navigationRevision;
+    if (runtime.nativeModeResult?.key === context.key && runtime.nativeModeResult.revision === revision) return runtime.nativeModeResult.mode;
+    if (runtime.nativeModeCheck) return 'unknown';
+    const controller = new AbortController();
+    const check = { controller, key: context.key, revision };
+    runtime.nativeModeCheck = check;
+    const timer = window.setTimeout(() => controller.abort(), PAGE_TIMEOUT_MS);
+    let mode = 'unknown';
+    try {
+      const response = await fetch(new URL('/settings', location.origin).href, {
+        credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: controller.signal
+      });
+      if (response.ok && (!response.url || (new URL(response.url).origin === location.origin && new URL(response.url).pathname === '/settings'))) {
+        const parsed = new DOMParser().parseFromString(await response.text(), 'text/html');
+        mode = nativeModeFromSettings(parsed);
+      }
+    } catch (_) { /* unavailable settings must never enable legacy mode */ }
+    finally {
+      window.clearTimeout(timer);
+      if (runtime.nativeModeCheck === check) runtime.nativeModeCheck = null;
+    }
+    if (controller.signal.aborted || revision !== runtime.navigationRevision || topicContext()?.key !== context.key) return 'unknown';
+    runtime.nativeModeResult = { key: context.key, revision, mode };
+    return mode;
+  }
+
+  function refreshConversationPolicy() {
+    runtime.navigationRevision += 1;
+    cancelNativeModeCheck();
+    runtime.waitingReplyObserver?.disconnect();
+    runtime.waitingReplyObserver = null;
+    disposeTopic();
+    updateConversationControls();
+    scheduleTopicSynchronization();
   }
 
   function firstMatch(root, selectors) {
@@ -203,8 +321,10 @@
         settled = true;
         observer.disconnect();
         window.clearTimeout(timer);
+        if (runtime.topicDomWaitCancel === cancel) runtime.topicDomWaitCancel = null;
         resolve(ready);
       };
+      const cancel = () => finish(false);
       const check = () => {
         const liveContext = topicContext();
         if (liveContext?.key !== context.key) finish(false);
@@ -213,6 +333,7 @@
       const observer = new MutationObserver(check);
       observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
       const timer = window.setTimeout(() => finish(false), timeoutMs);
+      runtime.topicDomWaitCancel = cancel;
       check();
     });
   }
@@ -254,18 +375,23 @@
   }
 
   function parseLeadingPrefix(content) {
-    const text = (content.textContent || '').replace(/\u00a0/g, ' ');
+    // A leading quoted/code/list block is not an actual reply prefix.
+    const leading = [...(content.childNodes || [])].find((node) => node.nodeType === 1 || (node.textContent || '').trim());
+    const scope = leading?.nodeType === 1 && leading.matches('p') ? leading : content;
+    const first = scope === content ? leading : [...scope.childNodes].find((node) => node.nodeType === 1 || (node.textContent || '').trim());
+    const blocked = first?.nodeType === 1 && first.matches('blockquote, pre, code, ul, ol, table, h1, h2, h3, h4, h5, h6, details');
+    const text = (blocked ? '' : scope.textContent || '').replace(/\u00a0/g, ' ');
     let rest = text.replace(/^\s+/, '');
     const mentions = [];
     let explicitReplyFloor = null;
-    const memberLinks = [...content.querySelectorAll('a[href^="/member/"]')];
+    const memberLinks = [...scope.querySelectorAll('a[href^="/member/"]')].filter((link) => !link.closest('blockquote, pre, code, ul, ol, table'));
     let memberIndex = 0;
     while (rest.startsWith('@')) {
       const match = rest.match(/^@([^\s#@]+)(?:\s+#(\d+))?/);
       if (!match) break;
       const name = match[1];
       const linked = memberLinks[memberIndex];
-      if (linked && normalizeName(linked.textContent) !== normalizeName(name)) break;
+      if (!linked || normalizeName(linked.textContent) !== normalizeName(name)) break;
       mentions.push({ name, normalized: normalizeName(name) });
       memberIndex += 1;
       explicitReplyFloor = match[2] ? Number(match[2]) : null;
@@ -318,9 +444,28 @@
     return urls;
   }
 
+  function preserveTaskCheckboxes(clone) {
+    // Recreate only inert Markdown task controls, never copy input attributes.
+    const safe = new Set();
+    clone.querySelectorAll('input[type="checkbox"][disabled]').forEach((input) => {
+      if (input.closest('form') || !input.closest('li')) return;
+      const replacement = document.createElement('input');
+      replacement.type = 'checkbox';
+      replacement.disabled = true;
+      replacement.checked = input.checked;
+      if (input.checked) replacement.setAttribute('checked', '');
+      input.replaceWith(replacement);
+      safe.add(replacement);
+    });
+    return safe;
+  }
+
   function sanitizeContent(element, base = location.href) {
     const clone = element.cloneNode(true);
-    clone.querySelectorAll('script, style, iframe, form, object, embed, template, base, meta, link, input, select, textarea, button').forEach((node) => node.remove());
+    const taskCheckboxes = preserveTaskCheckboxes(clone);
+    clone.querySelectorAll('script, style, iframe, form, object, embed, template, base, meta, link, input, select, textarea, button').forEach((node) => {
+      if (!taskCheckboxes.has(node)) node.remove();
+    });
     clone.querySelectorAll('*').forEach((node) => {
       [...node.attributes].forEach((attribute) => {
         const name = attribute.name.toLowerCase();
@@ -353,6 +498,7 @@
 
   function sanitizeReplyTemplate(element, base = location.href) {
     const clone = element.cloneNode(true);
+    const taskCheckboxes = preserveTaskCheckboxes(clone);
     // Keep the native header positions while extracting controls separately.
     const replyId = String(clone.id || '').match(/^r_([1-9]\d*)$/)?.[1] || '';
     const { image } = nativeReplyThanksNodes(clone, replyId);
@@ -368,7 +514,9 @@
       group.replaceWith(slot);
     }
     clone.removeAttribute('id');
-    clone.querySelectorAll('script, style, iframe, form, object, embed, template, base, meta, link, input, select, textarea, button, [data-action], a.reply, .reply a, .thank, .thank_area, .thanked, [id^="thank_area_"], .ignore, .moderate').forEach((node) => node.remove());
+    clone.querySelectorAll('script, style, iframe, form, object, embed, template, base, meta, link, input, select, textarea, button, [data-action], a.reply, .reply a, .thank, .thank_area, .thanked, [id^="thank_area_"], .ignore, .moderate').forEach((node) => {
+      if (!taskCheckboxes.has(node)) node.remove();
+    });
     clone.querySelectorAll('[id]').forEach((node) => node.removeAttribute('id'));
     clone.querySelectorAll('*').forEach((node) => {
       [...node.attributes].forEach((attribute) => {
@@ -881,6 +1029,10 @@
     if (!root || typeof MutationObserver !== 'function') return;
     topic.replyObserver = new MutationObserver((records) => {
       if (!isCurrentTopic(topic)) return;
+      if (!isFlatReplyList(document, allMatches(document, SELECTORS.reply))) {
+        refreshConversationPolicy();
+        return;
+      }
       const changed = records.some((record) => {
         if (record.target.closest?.('.wt-v2ex-threaded-view')) return false;
         return [...record.addedNodes, ...record.removedNodes].some((node) => node.nodeType === 1
@@ -915,6 +1067,7 @@
   function disposeThanks(topic) {
     topic.replyObserver?.disconnect();
     topic.thanksObserver?.disconnect();
+    topic.pageRequests?.forEach((controller) => controller.abort());
     topic.thanksReads?.forEach((controller) => controller.abort());
     if (runtime.thanksRequest?.topic === topic) runtime.thanksRequest.controller.abort();
   }
@@ -1217,21 +1370,24 @@
     };
   }
 
-  async function fetchPage(url, retry = 0) {
+  async function fetchPage(url, retry = 0, topic = null) {
+    if (topic && !isCurrentTopic(topic)) throw new Error('obsolete topic');
     const controller = new AbortController();
+    if (topic) (topic.pageRequests ||= new Set()).add(controller);
     const timer = window.setTimeout(() => controller.abort(), PAGE_TIMEOUT_MS);
     try {
       const response = await fetch(url, { credentials: 'same-origin', signal: controller.signal });
       if (!response.ok) {
-        if (retry < 1 && response.status >= 500) return fetchPage(url, retry + 1);
+        if (retry < 1 && (!topic || isCurrentTopic(topic)) && response.status >= 500) return fetchPage(url, retry + 1, topic);
         throw new Error(`页面加载失败（HTTP ${response.status}）`);
       }
       return await response.text();
     } catch (error) {
-      if (retry < 1 && (error.name === 'TypeError' || error.name === 'AbortError')) return fetchPage(url, retry + 1);
+      if (retry < 1 && (!topic || isCurrentTopic(topic)) && (error.name === 'TypeError' || error.name === 'AbortError')) return fetchPage(url, retry + 1, topic);
       throw error;
     } finally {
       window.clearTimeout(timer);
+      topic?.pageRequests?.delete(controller);
     }
   }
 
@@ -1240,13 +1396,18 @@
     let nextIndex = 0;
     let completed = 0;
     async function worker() {
-      while (nextIndex < pages.length) {
+      while (nextIndex < pages.length && isCurrentTopic(topic)) {
         const index = nextIndex;
         nextIndex += 1;
         const page = pages[index];
         try {
-          const html = await fetchPage(pageUrl(topic.context, page));
+          const html = await fetchPage(pageUrl(topic.context, page), 0, topic);
+          if (!isCurrentTopic(topic)) return;
           const parsed = new DOMParser().parseFromString(html, 'text/html');
+          if (!isFlatReplyList(parsed, allMatches(parsed, SELECTORS.reply))) {
+            results[index] = { page, incompatible: true };
+            return;
+          }
           const replies = parseReplies(parsed, page, pageUrl(topic.context, page));
           if (!replies.length) throw new Error('分页中未找到可解析的回复');
           results[index] = { page, replies };
@@ -1304,9 +1465,14 @@
     panel.innerHTML = `
       <fieldset class="wt-v2ex-settings-topic" hidden>
         <legend>会话视图</legend>
-        <div class="wt-v2ex-settings-panel-group">
+        <label><input type="radio" name="wt-v2ex-mode" data-mode="auto"> 自动适配（官方优先）</label>
+        <label><input type="radio" name="wt-v2ex-mode" data-mode="native"> 仅使用官方视图</label>
+        <label><input type="radio" name="wt-v2ex-mode" data-mode="legacy"> WebTweaks 历史楼中楼</label>
+        <label class="wt-v2ex-fallback"><input type="checkbox" role="switch" data-setting="legacyFallbackEnabled"> 平铺时允许历史会话增强</label>
+        <a href="/settings">V2EX 官方设置</a>
+        <div class="wt-v2ex-settings-panel-group wt-v2ex-legacy-preview" hidden>
           <label><input type="radio" name="wt-v2ex-view" data-view="threaded"> 楼中楼</label>
-          <label><input type="radio" name="wt-v2ex-view" data-view="original"> 原始顺序</label>
+          <label><input type="radio" name="wt-v2ex-view" data-view="original"> 临时原页预览</label>
         </div>
         <button type="button" class="wt-v2ex-panel-action wt-v2ex-load-pages" hidden>加载全部分页</button>
         <div class="wt-v2ex-thread-status" role="status" aria-live="polite"></div>
@@ -1324,12 +1490,15 @@
     panel.addEventListener('change', (event) => {
       const input = event.target;
       if (input.matches('[data-setting]')) setFeatureSetting(input.dataset.setting, input.checked);
-      else if (input.matches('[data-view]')) {
+      else if (input.matches('[data-mode]') && input.checked) {
+        runtime.settings.conversationMode = input.dataset.mode;
+        saveSettings();
+        refreshConversationPolicy();
+      } else if (input.matches('[data-view]')) {
         const topic = runtime.topic;
         if (!isCurrentTopic(topic)) return;
         topic.keepThanksSourceView = false;
-        runtime.settings.preferredView = input.dataset.view;
-        saveSettings();
+        topic.preferredView = input.dataset.view;
         applyTopicView(topic, input.dataset.view);
       }
     });
@@ -1366,6 +1535,23 @@
     }
   }
 
+  function updateConversationControls(message) {
+    const panel = runtime.settingsPanel;
+    if (!panel) return;
+    const section = panel.querySelector('.wt-v2ex-settings-topic');
+    section.hidden = !topicContext();
+    panel.querySelectorAll('[data-mode]').forEach((input) => {
+      input.checked = input.dataset.mode === runtime.settings.conversationMode;
+    });
+    panel.querySelector('.wt-v2ex-fallback').hidden = runtime.settings.conversationMode !== 'auto';
+    panel.querySelector('.wt-v2ex-legacy-preview').hidden = !runtime.topic;
+    if (!runtime.topic) {
+      panel.querySelector('.wt-v2ex-load-pages').hidden = true;
+      panel.querySelector('.wt-v2ex-thread-status').textContent = message || (wantsLegacyConversation()
+        ? '正在确认官方显示方式…' : '使用 V2EX 官方视图；未启动脚本会话重建');
+    }
+  }
+
   function setTopicStatus(topic, message) {
     topic.statusMessage = message;
     const status = topic.panel?.querySelector('.wt-v2ex-thread-status');
@@ -1375,7 +1561,8 @@
   function updateTopicPanel(topic) {
     const panel = topic.panel;
     if (!panel) return;
-    panel.querySelector('.wt-v2ex-settings-topic').hidden = false;
+    updateConversationControls();
+    panel.querySelector('.wt-v2ex-legacy-preview').hidden = false;
     panel.querySelectorAll('[data-view]').forEach((input) => {
       input.checked = input.dataset.view === topic.view;
     });
@@ -1428,8 +1615,14 @@
         if (reply.floor) nativeFloor.textContent = String(reply.floor);
         else nativeFloor.remove();
       }
-      if (nativeAction && !reply.floor) nativeAction.remove();
+      if (nativeAction && (!reply.floor || !/^[1-9]\d*$/.test(reply.id))) nativeAction.remove();
       else if (nativeAction) {
+        nativeAction.dataset.replyId = reply.id;
+        if (topic && reply.page !== topic.currentPage && nativeAction.matches('a')) {
+          const url = new URL(pageUrl(topic.context, reply.page));
+          url.hash = 'r_' + reply.id;
+          nativeAction.href = url.href;
+        }
         nativeAction.dataset.replyUser = reply.author;
         nativeAction.dataset.replyFloor = String(reply.floor || '');
         nativeAction.setAttribute('aria-label', `回复 ${reply.author || '该用户'} 第 ${reply.floor || ''} 楼`);
@@ -1563,9 +1756,32 @@
     if (restoreFocus) runtime.settingsToggle?.focus({ preventScroll: true });
   }
 
+  function restoreNativeAria(topic, reply) {
+    if (!topic.nativeAria?.has(reply)) return;
+    const original = topic.nativeAria.get(reply);
+    if (reply.getAttribute('aria-hidden') === 'true') {
+      if (original === null) reply.removeAttribute('aria-hidden');
+      else reply.setAttribute('aria-hidden', original);
+    }
+    topic.nativeAria.delete(reply);
+  }
+
+  function disposeTopic() {
+    const topic = runtime.topic;
+    if (!topic) return;
+    runtime.topic = null; // Invalidate callbacks before aborting requests.
+    disposeThanks(topic);
+    closeImageLightbox();
+    topic.nativeReplies.forEach((reply) => {
+      reply.classList.remove('wt-v2ex-native-hidden', 'wt-v2ex-native-ignored');
+      restoreNativeAria(topic, reply);
+    });
+    topic.threadedView.remove();
+  }
+
   function applyTopicView(topic, view) {
     if (topic.thanksObserver) synchronizeNativeThanks(topic);
-    const targetId = !topic.thanksTargetHandled && location.hash?.match(/^#wt-v2ex-thank-([1-9]\d*)$/)?.[1];
+    const targetId = !topic.thanksTargetHandled && location.hash?.match(/^#(?:wt-v2ex-thank-|r_)([1-9]\d*)$/)?.[1];
     const targetReply = targetId && topic.allReplies.find((reply) => reply.id === targetId && reply.page === topic.currentPage);
     if (targetReply) { topic.thanksTargetHandled = true; topic.keepThanksSourceView = true; }
     if (topic.keepThanksSourceView) view = 'original';
@@ -1586,14 +1802,17 @@
       if (ignored && clone) { clone.classList.add('wt-v2ex-ignored-reply'); clone.removeAttribute('aria-label'); }
       const hidden = view === 'threaded';
       reply.classList.toggle('wt-v2ex-native-hidden', hidden);
-      if (hidden) reply.setAttribute('aria-hidden', 'true');
-      else reply.removeAttribute('aria-hidden');
+      if (hidden) {
+        topic.nativeAria ||= new Map();
+        if (!topic.nativeAria.has(reply)) topic.nativeAria.set(reply, reply.getAttribute('aria-hidden'));
+        reply.setAttribute('aria-hidden', 'true');
+      } else restoreNativeAria(topic, reply);
     });
     updateTopicPanel(topic);
     if (targetReply) {
       const cell = nativeThanksReply(topic, targetReply);
       cell?.scrollIntoView({ block: 'center', behavior: 'auto' });
-      focusNativeThanks(cell?.querySelector('[id^="thank_area_"]'));
+      if (location.hash.startsWith('#wt-v2ex-thank-')) focusNativeThanks(cell?.querySelector('[id^="thank_area_"]'));
     }
   }
 
@@ -1608,6 +1827,14 @@
     });
     if (!isCurrentTopic(topic)) {
       topic.loading = false;
+      return;
+    }
+    if (results.some((result) => result?.incompatible)) {
+      // Never merge replies parsed under a different or unknown native layout.
+      topic.loading = false;
+      disposeTopic();
+      updateConversationControls('其他分页的回复结构不兼容，已保留官方视图');
+      runtime.nativeModeResult = { key: topic.key, revision: runtime.navigationRevision, mode: 'unknown' };
       return;
     }
     let failures = 0;
@@ -1642,13 +1869,21 @@
     else setTopicStatus(topic, `已加载 ${topic.models.length} 条关系数据；${visibleSummary}，关系为启发式重建`);
     updateTopicPanel(topic);
     if (failures || topic.failed) applyTopicView(topic, 'original');
-    else if (runtime.settings.preferredView === 'threaded') applyTopicView(topic, 'threaded');
+    else if (topic.preferredView !== 'original') applyTopicView(topic, 'threaded');
   }
 
   async function initializeTopic() {
     const context = topicContext();
-    if (!context) return;
-    if (runtime.topic?.key === context.key) return;
+    if (!context) { updateConversationControls(); return; }
+    updateConversationControls();
+    if (!wantsLegacyConversation() || runtime.topic?.key === context.key) return;
+    const revision = runtime.navigationRevision;
+    const nativeMode = await readNativeMode(context);
+    if (revision !== runtime.navigationRevision || topicContext()?.key !== context.key || !wantsLegacyConversation() || runtime.topic) return;
+    if (nativeMode !== 'classic') {
+      updateConversationControls(nativeMode === 'enhanced' ? '已识别官方会话模式，脚本自动避让' : '无法确认官方经典平铺模式，已安全保留原生视图');
+      return;
+    }
     const nativeReplies = allMatches(document, SELECTORS.reply);
     if (!nativeReplies.length) {
       const list = document.querySelector('#topic-replies');
@@ -1665,6 +1900,10 @@
     }
     runtime.waitingReplyObserver?.disconnect();
     runtime.waitingReplyObserver = null;
+    if (!isFlatReplyList(document, nativeReplies)) {
+      updateConversationControls('回复结构与经典平铺不兼容，已安全保留原生视图');
+      return;
+    }
     const firstReply = nativeReplies[0];
     const threadedView = document.createElement('section');
     threadedView.className = 'wt-v2ex-threaded-view';
@@ -1684,6 +1923,7 @@
       allReplies: parseReplies(document, context.page, location.href),
       models: [],
       view: 'original',
+      preferredView: 'threaded',
       loading: false,
       incomplete: false,
       failed: false,
@@ -1716,15 +1956,33 @@
       });
     } else {
       setTopicStatus(topic, `已加载 ${topic.models.length} 条回复，关系为启发式重建`);
-      applyTopicView(topic, runtime.settings.preferredView);
+      applyTopicView(topic, topic.preferredView);
     }
     const activateThreadedReply = (event) => {
-      if (!(event.target instanceof Element)) return;
+      if (!isCurrentTopic(topic) || !(event.target instanceof Element)) return;
       const action = event.target.closest('.wt-v2ex-native-reply-action');
-      if (!action || !topic.threadedView.contains(action)) return;
-      if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return;
+      if (!action || !topic.threadedView.contains(action) || action.closest('.reply_content')) return;
+      if (event.type === 'keydown' && (event.key !== ' ' || !action.matches('a') || event.repeat)) return;
+      const reply = topic.allReplies.find((item) => item.id === action.dataset.replyId);
+      if (!reply || action.closest('[data-wt-v2ex-reply-id]')?.dataset.wtV2exReplyId !== reply.id) return;
+      if (reply.page !== topic.currentPage) {
+        if (event.type === 'click' && action.matches('a')) return; // Real source-page link.
+        event.preventDefault();
+        const url = new URL(pageUrl(topic.context, reply.page));
+        url.hash = 'r_' + reply.id;
+        location.assign(url.href);
+        return;
+      }
       event.preventDefault();
-      insertReplyPrefix(findEditor(), action.dataset.replyUser, Number(action.dataset.replyFloor));
+      const cell = nativeThanksReply(topic, reply);
+      const group = cell && nativeReplyGroup(cell);
+      const liveAction = group && nativeReplyAction(group);
+      topic.keepThanksSourceView = true;
+      applyTopicView(topic, 'original');
+      // Dispatch the live site control, never synthesize a textual @ reply.
+      if (liveAction?.isConnected && !liveAction.disabled && liveAction.getAttribute('aria-disabled') !== 'true'
+        && cell.contains(liveAction) && !liveAction.closest('.reply_content')) liveAction.click();
+      else cell?.scrollIntoView({ block: 'center', behavior: 'auto' });
     };
     topic.threadedView.addEventListener('click', activateThreadedReply);
     topic.threadedView.addEventListener('keydown', activateThreadedReply);
@@ -1739,17 +1997,27 @@
     setSettingsPanelOpen(false, focused);
     const section = runtime.settingsPanel?.querySelector('.wt-v2ex-settings-topic');
     if (section) section.hidden = true;
+    updateConversationControls();
   }
 
   async function synchronizeTopicPage() {
     if (runtime.navigationSync) {
-      scheduleTopicSynchronization();
+      runtime.navigationPending = true;
       return;
     }
     const context = topicContext();
     const synchronizationRevision = runtime.navigationRevision;
-    if (topicStateMatchesLocation(context) && (!runtime.topic || (runtime.topic.threadedView.isConnected
-      && runtime.topic.nativeReplies.every((cell) => cell.isConnected)))) {
+    if (!context || !wantsLegacyConversation()) {
+      disposeTopic();
+      if (!context) resetSettingsTopic();
+      else updateConversationControls();
+      scanImageContent(document);
+      observeImageContent();
+      return;
+    }
+    if (runtime.topic && isCurrentTopic(runtime.topic, context) && runtime.topic.threadedView.isConnected
+      && runtime.topic.nativeReplies.every((cell) => cell.isConnected)
+      && isFlatReplyList(document, allMatches(document, SELECTORS.reply))) {
       scanImageContent(document);
       return;
     }
@@ -1762,12 +2030,7 @@
         ) scheduleTopicSynchronization();
         else {
           closeImageLightbox();
-          if (runtime.topic) {
-            disposeThanks(runtime.topic);
-            applyTopicView(runtime.topic, 'original');
-            runtime.topic.threadedView.remove();
-            runtime.topic = null;
-          }
+          disposeTopic();
           resetSettingsTopic();
           scanImageContent(document);
         }
@@ -1781,21 +2044,20 @@
         return;
       }
       closeImageLightbox();
-      if (runtime.topic) {
-        disposeThanks(runtime.topic);
-        applyTopicView(runtime.topic, 'original');
-        runtime.topic.threadedView.remove();
-        runtime.topic = null;
-      }
+      disposeTopic();
       resetSettingsTopic();
       if (context) {
         await initializeTopic();
         if (runtime.topic) { runtime.topic.panel = runtime.settingsPanel; updateTopicPanel(runtime.topic); }
       }
       scanImageContent(document);
+      observeImageContent();
     } finally {
       runtime.navigationSync = false;
-      if (runtime.topic && !isCurrentTopic(runtime.topic)) scheduleTopicSynchronization();
+      if (runtime.navigationPending || (runtime.topic && !isCurrentTopic(runtime.topic))) {
+        runtime.navigationPending = false;
+        scheduleTopicSynchronization();
+      }
     }
   }
 
@@ -1808,12 +2070,15 @@
   }
 
   function handleTopicNavigation() {
+    observeImageContent();
     const nextTopicKey = topicContext()?.key || null;
     if (nextTopicKey !== runtime.observedTopicKey) {
       runtime.waitingReplyObserver?.disconnect();
       runtime.waitingReplyObserver = null;
       runtime.observedTopicKey = nextTopicKey;
       runtime.navigationRevision += 1;
+      cancelNativeModeCheck();
+      disposeTopic();
     }
     scheduleTopicSynchronization();
   }
@@ -1833,52 +2098,6 @@
     });
     window.addEventListener('popstate', handleTopicNavigation);
     window.addEventListener('wt-v2ex-navigation', handleTopicNavigation);
-  }
-
-  function findEditor() {
-    const candidates = allMatches(document, SELECTORS.editor);
-    return candidates.find(isSupportedEditor) || null;
-  }
-
-  function isSupportedEditor(editor) {
-    if (!(editor instanceof HTMLTextAreaElement)) return false;
-    const id = (editor.id || '').toLowerCase();
-    const name = (editor.name || '').toLowerCase();
-    if (!['reply_content', 'topic_content'].includes(id) && name !== 'content') return false;
-    const form = editor.closest('form');
-    const action = form?.getAttribute('action') || '';
-    const nearbyEditor = editor.closest('#reply-box, #new-topic, #topic-editor, [id*="reply"], [id*="topic"]');
-    return id === 'reply_content' || id === 'topic_content' || /\/t\/\d+/.test(action) || /(?:^|\/)new(?:$|[/?#])/.test(action) || Boolean(nearbyEditor);
-  }
-
-  function insertAtSelection(editor, text) {
-    if (!editor) return false;
-    const start = editor.selectionStart ?? editor.value.length;
-    const end = editor.selectionEnd ?? start;
-    editor.focus();
-    if (typeof editor.setRangeText === 'function') {
-      editor.setRangeText(text, start, end, 'end');
-    } else {
-      editor.value = `${editor.value.slice(0, start)}${text}${editor.value.slice(end)}`;
-      editor.selectionStart = editor.selectionEnd = start + text.length;
-    }
-    editor.dispatchEvent(new Event('input', { bubbles: true }));
-    return true;
-  }
-
-  function insertReplyPrefix(editor, username, floor) {
-    if (!editor || !username || !Number.isInteger(floor)) return;
-    const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const prefixPattern = new RegExp(`^\\s*@${escaped}\\b(?:\\s+#${floor}\\b)?\\s*`, 'i');
-    if (prefixPattern.test(editor.value)) {
-      if (!new RegExp(`^\\s*@${escaped}\\s+#${floor}\\b`, 'i').test(editor.value)) {
-        editor.value = editor.value.replace(new RegExp(`^(\\s*@${escaped}\\b)`, 'i'), `$1 #${floor}`);
-        editor.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-      editor.focus();
-      return;
-    }
-    insertAtSelection(editor, `@${username} #${floor} `);
   }
 
   function imageContentContainers(root = document) {
@@ -1922,7 +2141,8 @@
     container.querySelectorAll('a[href]').forEach((anchor) => {
       if (anchor.dataset.wtV2exImageEnhanced === 'true') return;
       anchor.dataset.wtV2exImageEnhanced = 'true';
-      if (anchor.querySelector('img')) return;
+      if (anchor.querySelector('img') || anchor.closest('pre, code, blockquote, table, [contenteditable="true"]')
+        || anchor.matches('[onclick], [data-action], [download], [role="button"]')) return;
       const url = imagePreviewUrl(anchor.getAttribute('href'), anchor.baseURI);
       if (!url || adjacentImageMatches(anchor, url)) return;
       anchor.insertAdjacentElement('afterend', createInlineImage(url));
@@ -1936,7 +2156,7 @@
       acceptNode(node) {
         if (!node.nodeValue || !/https?:\/\//i.test(node.nodeValue)) return NodeFilter.FILTER_REJECT;
         const parent = node.parentElement;
-        if (!parent || parent.closest('a, code, pre, textarea, script, style, .wt-v2ex-image-lightbox')) return NodeFilter.FILTER_REJECT;
+        if (!parent || parent.closest('a, code, pre, blockquote, table, textarea, script, style, [contenteditable="true"], .wt-v2ex-image-lightbox')) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       }
     });
@@ -1952,9 +2172,16 @@
     });
   }
 
+  function nativeImageInteraction(image) {
+    if (image.closest('a, button, [onclick], [data-action], [contenteditable="true"]')) return true;
+    if (image.parentElement?.closest('[role="button"], [tabindex]')) return true;
+    if (image.hasAttribute('role') && image.dataset.wtV2exAddedRole !== 'true') return true;
+    return image.hasAttribute('tabindex') && image.dataset.wtV2exManagedTabindex !== 'true';
+  }
+
   function prepareLightboxTarget(image) {
     if (!(image instanceof HTMLImageElement) || image.classList.contains('avatar') || image.closest('.wt-v2ex-image-lightbox')) return;
-    if (!lightboxUrlForImage(image)) return;
+    if (nativeImageInteraction(image) || !lightboxUrlForImage(image)) return;
     if (image.dataset.wtV2exLightboxReady === 'true') return;
     image.dataset.wtV2exLightboxReady = 'true';
     image.classList.add('wt-v2ex-lightbox-target');
@@ -1978,6 +2205,7 @@
   }
 
   function processImageContent(container) {
+    if (container.closest('form, [contenteditable="true"]')) return;
     if (runtime.settings.imagePreviewEnabled) {
       enhanceLinkedImages(container);
       enhanceTextImages(container);
@@ -2140,11 +2368,11 @@
   }
 
   function activateContentImage(event) {
-    if (!runtime.settings.imageLightboxEnabled || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    if (event.defaultPrevented || !runtime.settings.imageLightboxEnabled || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
     if (event.type === 'click' && event.button !== 0) return;
     if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return;
     const image = contentImageFromEvent(event);
-    if (!image || !openImageLightbox(image)) return;
+    if (!image || image.dataset.wtV2exLightboxReady !== 'true' || nativeImageInteraction(image) || !openImageLightbox(image)) return;
     event.preventDefault();
   }
 
@@ -2166,6 +2394,26 @@
     if (event.target.classList.contains('wt-v2ex-inline-image')) event.target.remove();
   }
 
+  function observeImageContent() {
+    const root = document.querySelector('#topic-replies');
+    if (runtime.imageObserverRoot === root && runtime.imageObserver) return;
+    runtime.imageObserver?.disconnect();
+    runtime.imageObserver = null;
+    runtime.imageObserverRoot = null;
+    if (!root || typeof MutationObserver !== 'function' || (!runtime.settings.imagePreviewEnabled && !runtime.settings.imageLightboxEnabled)) return;
+    runtime.imageObserverRoot = root;
+    runtime.imageObserver = new MutationObserver((records) => {
+      for (const record of records) {
+        if (record.target.closest?.('.wt-v2ex-threaded-view')) continue;
+        for (const node of record.addedNodes) {
+          if (node.nodeType !== 1 || node.matches('.wt-v2ex-inline-image, .wt-v2ex-threaded-view')) continue;
+          if (!node.closest('.wt-v2ex-threaded-view')) scanImageContent(node.closest(IMAGE_CONTENT_SELECTOR) || node);
+        }
+      }
+    });
+    runtime.imageObserver.observe(root, { childList: true, subtree: true });
+  }
+
   function initializeImageEnhancement() {
     if (!runtime.imageDelegationAttached) {
       runtime.imageDelegationAttached = true;
@@ -2174,6 +2422,7 @@
       document.addEventListener('error', handleImageLoadFailure, true);
     }
     scanImageContent(document);
+    observeImageContent();
   }
 
   function updateScrollButton() {
@@ -2276,12 +2525,8 @@
       await initializeTopic();
       if (runtime.topic) { runtime.topic.panel = runtime.settingsPanel; updateTopicPanel(runtime.topic); }
     } catch (error) {
-      if (runtime.topic) {
-        runtime.topic.failed = true;
-        applyTopicView(runtime.topic, 'original');
-        runtime.topic.panel = runtime.settingsPanel;
-        updateTopicPanel(runtime.topic);
-      }
+      disposeTopic();
+      updateConversationControls('会话初始化失败，已保留官方视图');
       logError(error);
     }
     try { if (runtime.settings.scrollTopEnabled) initializeScrollToTop(); } catch (error) { logError(error); }
