@@ -2,7 +2,7 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.8.1
+// @version      1.8.2
 // @description  Native-first V2EX compatibility, optional legacy threaded replies, image enhancements, and scroll-to-top.
 // @description:zh-CN 官方功能优先、可选历史楼中楼、图片增强与返回顶部。
 // @author       KnowSky404
@@ -387,7 +387,7 @@
     let rest = text.replace(/^\s+/, '');
     const mentions = [];
     let explicitReplyFloor = null;
-    const memberLinks = [...scope.querySelectorAll('a[href^="/member/"]')].filter((link) => !link.closest('blockquote, pre, code, ul, ol, table'));
+    const memberLinks = [...scope.querySelectorAll('a[href^="/member/"]')].filter((link) => !hasContentAncestor(link, content, 'blockquote, pre, code, ul, ol, table'));
     let memberIndex = 0;
     while (rest.startsWith('@')) {
       const match = rest.match(/^@([^\s#@]+)(?:\s+#(\d+))?/);
@@ -2145,7 +2145,7 @@
   }
 
   // V2EX's native reply cells are themselves laid out in HTML tables.
-  // Only markup inside the rendered content may suppress image expansion.
+  // Only markup inside the rendered content may suppress prefix inference or image expansion.
   function hasContentAncestor(element, container, selectors) {
     const ancestor = element.closest(selectors);
     return Boolean(ancestor && container.contains(ancestor));

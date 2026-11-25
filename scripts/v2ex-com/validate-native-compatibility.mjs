@@ -3,7 +3,7 @@ import vm from 'node:vm';
 
 const source = await readFile(new URL('./conversation-enhancer.user.js', import.meta.url), 'utf8');
 const marker = '\n  initialize();\n})();';
-const instrumented = source.replace(marker, '\n  globalThis.__nativeCompatibilityTest = { runtime, classifyNativeMode, nativeModeFromSettings, wantsLegacyConversation, initializeTopic, readNativeMode, cancelNativeModeCheck, topicContext, isFlatReplyList, disposeTopic, nativeImageInteraction, hasContentAncestor, topicDomMatchesContext, synchronizeTopicPage, refreshConversationPolicy, enhanceLinkedImages, enhanceTextImages };\n})();');
+const instrumented = source.replace(marker, '\n  globalThis.__nativeCompatibilityTest = { runtime, classifyNativeMode, nativeModeFromSettings, wantsLegacyConversation, initializeTopic, readNativeMode, cancelNativeModeCheck, topicContext, isFlatReplyList, disposeTopic, nativeImageInteraction, hasContentAncestor, topicDomMatchesContext, synchronizeTopicPage, refreshConversationPolicy, enhanceLinkedImages, enhanceTextImages, parseLeadingPrefix, inferRelationships, deriveVisibleThread };\n})();');
 if (instrumented === source) throw new Error('test hook not found');
 
 let checks = 0;
@@ -266,6 +266,70 @@ for (const policy of ['legacy', 'auto']) {
   const pending = api.runtime.navigationSchedule;
   observer.callback();
   check(api.runtime.navigationSchedule === pending && api.runtime.waitingReplyObserver === null, 'stale observer revived disabled policy');
+}
+
+// Parse actual structural prefixes before inferring parents and projecting
+// pages, including V2EX's outer layout table around every reply.
+{
+  const { api } = setup();
+  const outerTable = {};
+  const innerBlock = {};
+  const textNode = (textContent) => ({ nodeType: 3, textContent });
+  const makeContent = (textContent, { paragraph = false, block = null, protectedLink = false, names = ['Alice'] } = {}) => {
+    const links = names.map((name) => ({
+      textContent: name,
+      closest: () => protectedLink || block ? innerBlock : outerTable
+    }));
+    const querySelectorAll = (selector) => selector === 'a[href^="/member/"]' ? links : [];
+    const leadingText = textNode(textContent);
+    const leading = paragraph || block ? {
+      nodeType: 1,
+      textContent,
+      childNodes: [leadingText],
+      matches: (selector) => selector.split(',').map((value) => value.trim()).includes(block || 'p'),
+      querySelectorAll
+    } : leadingText;
+    return {
+      textContent,
+      childNodes: [leading],
+      contains: (node) => node === innerBlock,
+      querySelectorAll
+    };
+  };
+  const exact = api.parseLeadingPrefix(makeContent('@Alice #2 cross-page'));
+  check(exact.hasStructuralMention && exact.explicitReplyFloor === 2 && exact.normalizedMentions[0].normalized === 'alice', 'outer table blocked exact prefix');
+  const inferred = api.parseLeadingPrefix(makeContent('@Alice response', { paragraph: true }));
+  check(inferred.hasStructuralMention && inferred.explicitReplyFloor === null, 'outer table blocked Markdown paragraph prefix');
+  const multiple = api.parseLeadingPrefix(makeContent('@Alice @Bob discussion', { names: ['Alice', 'Bob'] }));
+  check(multiple.hasMultipleStructuralMentions && multiple.explicitReplyFloor === null, 'multiple mentions lost ambiguity');
+  for (const block of ['blockquote', 'pre', 'code', 'ul', 'ol', 'table']) {
+    const result = api.parseLeadingPrefix(makeContent('@Alice #2 example', { block }));
+    check(!result.hasStructuralMention && result.explicitReplyFloor === null, 'protected leading block produced a prefix: ' + block);
+  }
+  const protectedLink = api.parseLeadingPrefix(makeContent('@Alice #2 inside inline code', { paragraph: true, protectedLink: true }));
+  check(!protectedLink.hasStructuralMention, 'protected member link inside paragraph counted as a prefix');
+  const noLink = api.parseLeadingPrefix(makeContent('@Alice #2 literal', { names: [] }));
+  check(!noLink.hasStructuralMention, 'unlinked literal counted as a structural mention');
+  const mismatched = api.parseLeadingPrefix(makeContent('@Alice #2 literal', { names: ['Bob'] }));
+  check(!mismatched.hasStructuralMention, 'mismatched member link counted as a prefix');
+  const model = (id, floor, page, author, prefix = {}) => ({
+    id, floor, page, author, normalizedAuthor: author.toLowerCase(), normalizedMentions: [],
+    explicitReplyFloor: null, hasStructuralMention: false, hasMultipleStructuralMentions: false, ...prefix
+  });
+  const models = api.inferRelationships([
+    model('101', 1, 1, 'Other'),
+    model('102', 2, 1, 'Alice'),
+    model('201', 101, 2, 'Bob', exact),
+    model('202', 102, 2, 'Carol', inferred),
+    model('203', 103, 2, 'Dan', multiple),
+    model('301', 201, 3, 'Future')
+  ]);
+  check(models.find((reply) => reply.id === '201').parentId === '102' && models.find((reply) => reply.id === '201').relationshipConfidence === 'exact', 'exact cross-page parent not restored');
+  check(models.find((reply) => reply.id === '202').parentId === '102' && models.find((reply) => reply.id === '202').relationshipConfidence === 'inferred', 'inferred cross-page parent not restored');
+  check(models.find((reply) => reply.id === '203').relationshipConfidence === 'unresolved', 'ambiguous prefix gained a parent');
+  const visible = api.deriveVisibleThread({ models, currentPage: 2 });
+  check(visible.visibleIds.has('102') && visible.visibleIds.has('201') && visible.visibleIds.has('202'), 'cross-page ancestor or current reply disappeared');
+  check(!visible.visibleIds.has('101') && !visible.visibleIds.has('301'), 'unrelated cross-page replies leaked into projection');
 }
 
 console.log('native compatibility checks passed: ' + checks);
