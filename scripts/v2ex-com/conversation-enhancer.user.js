@@ -2,7 +2,7 @@
 // @name         V2EX Conversation Enhancer
 // @name:zh-CN   V2EX 会话增强
 // @namespace    https://github.com/KnowSky404/WebTweaks
-// @version      1.8.0
+// @version      1.8.1
 // @description  Native-first V2EX compatibility, optional legacy threaded replies, image enhancements, and scroll-to-top.
 // @description:zh-CN 官方功能优先、可选历史楼中楼、图片增强与返回顶部。
 // @author       KnowSky404
@@ -306,10 +306,13 @@
   }
 
   function topicDomMatchesContext(context) {
-    if (!context || !allMatches(document, SELECTORS.reply).length) return false;
+    if (!context) return false;
     const currentPage = firstMatch(document, ['.ps_container .page_current']);
-    if (!currentPage) return true;
-    return parseFloor(currentPage.textContent) === context.page;
+    if (currentPage && parseFloor(currentPage.textContent) !== context.page) return false;
+    if (allMatches(document, SELECTORS.reply).length) return true;
+    // A real empty list is also a valid initialization target. Do not treat
+    // a missing list or a markerless later page as ready during navigation.
+    return Boolean(document.querySelector('#topic-replies') && (currentPage || context.page === 1));
   }
 
   function waitForTopicDom(context, timeoutMs = 2_000) {
@@ -1887,15 +1890,19 @@
     const nativeReplies = allMatches(document, SELECTORS.reply);
     if (!nativeReplies.length) {
       const list = document.querySelector('#topic-replies');
-      if (list && !runtime.waitingReplyObserver && typeof MutationObserver === 'function') {
-        runtime.waitingReplyObserver = new MutationObserver(() => {
-          if (topicContext()?.key !== context.key || !allMatches(list, SELECTORS.reply).length) return;
-          runtime.waitingReplyObserver.disconnect();
+      if (list && topicDomMatchesContext(context) && !runtime.waitingReplyObserver && typeof MutationObserver === 'function') {
+        const observer = new MutationObserver(() => {
+          if (runtime.waitingReplyObserver !== observer || revision !== runtime.navigationRevision
+            || topicContext()?.key !== context.key || !wantsLegacyConversation()) return;
+          if (!allMatches(list, SELECTORS.reply).length || !topicDomMatchesContext(context)) return;
+          observer.disconnect();
           runtime.waitingReplyObserver = null;
           scheduleTopicSynchronization();
         });
-        runtime.waitingReplyObserver.observe(list, { childList: true, subtree: true });
+        runtime.waitingReplyObserver = observer;
+        observer.observe(list, { childList: true, subtree: true });
       }
+      updateConversationControls('等待第一条原生回复；尚未构建楼中楼');
       return;
     }
     runtime.waitingReplyObserver?.disconnect();
@@ -2137,11 +2144,18 @@
     return siblingUrl === url;
   }
 
+  // V2EX's native reply cells are themselves laid out in HTML tables.
+  // Only markup inside the rendered content may suppress image expansion.
+  function hasContentAncestor(element, container, selectors) {
+    const ancestor = element.closest(selectors);
+    return Boolean(ancestor && container.contains(ancestor));
+  }
+
   function enhanceLinkedImages(container) {
     container.querySelectorAll('a[href]').forEach((anchor) => {
       if (anchor.dataset.wtV2exImageEnhanced === 'true') return;
       anchor.dataset.wtV2exImageEnhanced = 'true';
-      if (anchor.querySelector('img') || anchor.closest('pre, code, blockquote, table, [contenteditable="true"]')
+      if (anchor.querySelector('img') || hasContentAncestor(anchor, container, 'pre, code, blockquote, table, [contenteditable="true"]')
         || anchor.matches('[onclick], [data-action], [download], [role="button"]')) return;
       const url = imagePreviewUrl(anchor.getAttribute('href'), anchor.baseURI);
       if (!url || adjacentImageMatches(anchor, url)) return;
@@ -2156,7 +2170,7 @@
       acceptNode(node) {
         if (!node.nodeValue || !/https?:\/\//i.test(node.nodeValue)) return NodeFilter.FILTER_REJECT;
         const parent = node.parentElement;
-        if (!parent || parent.closest('a, code, pre, blockquote, table, textarea, script, style, [contenteditable="true"], .wt-v2ex-image-lightbox')) return NodeFilter.FILTER_REJECT;
+        if (!parent || hasContentAncestor(parent, container, 'a, code, pre, blockquote, table, textarea, script, style, [contenteditable="true"], .wt-v2ex-image-lightbox')) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       }
     });

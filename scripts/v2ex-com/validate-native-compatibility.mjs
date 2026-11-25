@@ -3,7 +3,7 @@ import vm from 'node:vm';
 
 const source = await readFile(new URL('./conversation-enhancer.user.js', import.meta.url), 'utf8');
 const marker = '\n  initialize();\n})();';
-const instrumented = source.replace(marker, '\n  globalThis.__nativeCompatibilityTest = { runtime, classifyNativeMode, nativeModeFromSettings, wantsLegacyConversation, initializeTopic, readNativeMode, cancelNativeModeCheck, topicContext, isFlatReplyList, disposeTopic, nativeImageInteraction };\n})();');
+const instrumented = source.replace(marker, '\n  globalThis.__nativeCompatibilityTest = { runtime, classifyNativeMode, nativeModeFromSettings, wantsLegacyConversation, initializeTopic, readNativeMode, cancelNativeModeCheck, topicContext, isFlatReplyList, disposeTopic, nativeImageInteraction, hasContentAncestor, topicDomMatchesContext, synchronizeTopicPage, refreshConversationPolicy, enhanceLinkedImages, enhanceTextImages };\n})();');
 if (instrumented === source) throw new Error('test hook not found');
 
 let checks = 0;
@@ -30,8 +30,12 @@ function setup(stored = {}, options = {}) {
   const location = { href: 'https://www.v2ex.com/t/42?p=1', origin: 'https://www.v2ex.com', pathname: '/t/42' };
   const sandbox = {
     URL, AbortController, location,
-    window: { setTimeout: () => 1, clearTimeout: () => {} },
-    document: { querySelectorAll() { throw new Error('native policy must not scan the reply DOM'); } },
+    window: options.window || { setTimeout: () => 1, clearTimeout: () => {} },
+    document: options.document || { querySelectorAll() { throw new Error('native policy must not scan the reply DOM'); } },
+    MutationObserver: options.MutationObserver,
+    Element: options.Element,
+    HTMLImageElement: options.HTMLImageElement,
+    NodeFilter: options.NodeFilter,
     GM_getValue: () => stored,
     GM_setValue: (key, value) => writes.push({ key, value }),
     fetch: async (url, init) => {
@@ -143,6 +147,125 @@ for (const label of ['引用条', '角标 + 悬浮预览', '楼中楼', '树形�
   });
   check(api.nativeImageInteraction(image(true)), 'linked image was not protected');
   check(!api.nativeImageInteraction(image(false)), 'plain image unnecessarily blocked');
+}
+
+// Exercise both actual image expansion paths with a scoped DOM double.
+{
+  const layoutTable = {};
+  const markdownTable = {};
+  const quote = {};
+  const existingImage = {};
+  const insertedLinks = [];
+  const insertedText = [];
+  const makeAnchor = (nearest, existing = false) => ({
+    dataset: {},
+    baseURI: 'https://www.v2ex.com/t/42',
+    nextElementSibling: null,
+    closest: () => nearest,
+    matches: () => false,
+    querySelector: () => existing ? existingImage : null,
+    getAttribute: () => 'https://images.example/link.png',
+    insertAdjacentElement: (_position, image) => insertedLinks.push(image.src)
+  });
+  const plainLink = makeAnchor(layoutTable);
+  const protectedLink = makeAnchor(markdownTable);
+  const renderedLink = makeAnchor(layoutTable, true);
+  const makeText = (nearest, filename) => ({
+    nodeValue: 'https://images.example/' + filename,
+    baseURI: 'https://www.v2ex.com/t/42',
+    parentElement: { closest: () => nearest },
+    parentNode: { insertBefore: (image) => insertedText.push(image.src) },
+    nextSibling: null
+  });
+  const plainText = makeText(layoutTable, 'plain.png');
+  const protectedText = makeText(markdownTable, 'table.png');
+  const quotedText = makeText(quote, 'quote.png');
+  const content = {
+    dataset: {},
+    contains: (node) => node === markdownTable || node === quote,
+    querySelectorAll: () => [plainLink, protectedLink, renderedLink]
+  };
+  const { api } = setup({}, {
+    HTMLImageElement: class {},
+    NodeFilter: { SHOW_TEXT: 4, FILTER_REJECT: 2, FILTER_ACCEPT: 1 },
+    document: {
+      createElement: () => ({ dataset: {} }),
+      createTreeWalker: (_root, _show, filter) => {
+        const accepted = [plainText, protectedText, quotedText].filter((node) => filter.acceptNode(node) === 1);
+        return { nextNode: () => accepted.shift() || null };
+      }
+    }
+  });
+  check(!api.hasContentAncestor(plainLink, content, 'table'), 'outer layout table suppressed images');
+  check(api.hasContentAncestor(protectedLink, content, 'table'), 'inner Markdown table not excluded');
+  api.enhanceLinkedImages(content);
+  api.enhanceTextImages(content);
+  check(insertedLinks.length === 1 && insertedLinks[0].endsWith('/link.png'), 'plain link expansion or protected link handling regressed');
+  check(insertedText.length === 1 && insertedText[0].endsWith('/plain.png'), 'bare URL expansion or protected text handling regressed');
+  api.enhanceLinkedImages(content);
+  api.enhanceTextImages(content);
+  check(insertedLinks.length === 1 && insertedText.length === 1, 'repeat scan duplicated previews');
+}
+
+// Starting from an already-loaded empty topic must reach initializeTopic
+// through the real policy synchronization path, without waiting for a reply.
+for (const policy of ['legacy', 'auto']) {
+  let replies = [];
+  let listPresent = true;
+  let marker = null;
+  let nextTimer = 0;
+  const timers = new Map();
+  const list = { querySelectorAll: (selector) => selector.includes('.cell[id^="r_"]') ? replies : [] };
+  const document = {
+    querySelector: (selector) => selector === '#topic-replies' && listPresent ? list
+      : selector === '.ps_container .page_current' ? marker : null,
+    querySelectorAll: (selector) => selector.includes('.cell[id^="r_"]') ? replies : []
+  };
+  const { api, requests } = setup({ version: 4, conversationMode: 'native', imagePreviewEnabled: false, imageLightboxEnabled: false }, {
+    document,
+    settings: settingsDocument([selectedMode('经典平铺')]),
+    window: {
+      setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
+      clearTimeout: (id) => timers.delete(id)
+    },
+    MutationObserver: class {
+      constructor(callback) { this.callback = callback; this.disconnected = false; }
+      observe(root) { this.root = root; }
+      disconnect() { this.disconnected = true; }
+    }
+  });
+  const context = api.topicContext();
+  check(api.topicDomMatchesContext(context), 'existing empty first-page list rejected');
+  check(!api.topicDomMatchesContext({ ...context, page: 2 }), 'markerless empty list accepted for later page');
+  marker = { textContent: '2' };
+  check(!api.topicDomMatchesContext(context), 'empty list with stale page marker accepted');
+  check(api.topicDomMatchesContext({ ...context, page: 2 }), 'matching explicit page marker rejected');
+  marker = null;
+  listPresent = false;
+  check(!api.topicDomMatchesContext(context), 'missing reply list accepted');
+  listPresent = true;
+  api.runtime.settings.conversationMode = policy;
+  api.runtime.settings.legacyFallbackEnabled = policy === 'auto';
+  api.refreshConversationPolicy();
+  // Consume the actual scheduled slot, then await its synchronization.
+  const scheduled = api.runtime.navigationSchedule;
+  check(timers.get(scheduled)?.delay === 0, 'policy did not schedule synchronization');
+  timers.delete(scheduled);
+  api.runtime.navigationSchedule = 0;
+  await api.synchronizeTopicPage();
+  const observer = api.runtime.waitingReplyObserver;
+  check(observer && observer.root === list && !observer.disconnected, 'empty topic never installed first-reply observer');
+  check(requests.length === 1 && api.runtime.topic === null && timers.size === 0, 'empty topic fetched pages or left a DOM wait timer');
+  observer.callback();
+  check(api.runtime.waitingReplyObserver === observer && timers.size === 0, 'empty mutation prematurely ended observation');
+  replies = [{}];
+  observer.callback();
+  check(observer.disconnected && api.runtime.waitingReplyObserver === null && timers.get(api.runtime.navigationSchedule)?.delay === 0, 'first reply did not trigger synchronization');
+  api.runtime.settings.conversationMode = 'native';
+  api.refreshConversationPolicy();
+  const pending = api.runtime.navigationSchedule;
+  observer.callback();
+  check(api.runtime.navigationSchedule === pending && api.runtime.waitingReplyObserver === null, 'stale observer revived disabled policy');
 }
 
 console.log('native compatibility checks passed: ' + checks);

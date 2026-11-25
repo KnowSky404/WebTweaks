@@ -10,7 +10,7 @@ The script matches `https://v2ex.com/*` and `https://*.v2ex.com/*`. Thread recon
 
 ## Features
 
-### Native-first compatibility (1.8.0)
+### Native-first compatibility (1.8.x)
 
 V2EX now records actual reply relationships when a user activates the native reply button and provides seven [native display modes](https://edge.v2ex.com/help/reply-threads), as well as [Markdown replies](https://www.v2ex.com/help/markdown#reply). WebTweaks does not render Markdown again or change the site's own configuration.
 
@@ -25,6 +25,8 @@ When legacy reconstruction is requested, the script makes a read-only same-origi
 On upgrade from settings schema 3, `original` becomes `native` and `threaded` becomes `auto`; existing image and scroll switches survive. New installations use auto with legacy fallback off. Temporary original-page preview remains available only inside a running legacy session; it is not the same as native-only mode.
 
 Native Markdown, code highlighting, task lists, preview, submit, reply targets, thanks, hide, pagination and Block behavior are owned by V2EX in native mode. In legacy mode, safe task-list checkboxes are recreated as disabled controls in sanitized clones; quoted/code blocks are not treated as leading reply prefixes, and live native reply actions are invoked rather than generating textual mentions.
+
+Version 1.8.1 confines Markdown exclusions to the rendered content itself (not V2EX's outer layout table), preserving ordinary image link/bare URL expansion. An opted-in empty first-page reply list is a valid initialization target; its first native reply starts the legacy session without a reload, unless the policy or page has changed.
 
 ### Optional historical threaded replies
 
@@ -103,7 +105,7 @@ The panel reuses the existing `wt-v2ex-settings` GM storage and version-3 keys w
 
 ## Maintainer validation
 
-Run `node scripts/v2ex-com/validate-native-compatibility.mjs` for policy, migration, semantic mode detection and cancellation checks. The browser fixture uses synthetic official mode settings; it checks all seven mode labels, unknown mode, disabling legacy during a pending page load, native control delegation and Markdown/image coexistence. This is not evidence of the real signed-in V2EX form structure.
+Run `node scripts/v2ex-com/validate-native-compatibility.mjs` for policy, migration, semantic mode detection, cancellation, first-reply initialization and content-scoped image preview checks. The browser fixture uses synthetic official mode settings; it checks all seven mode labels, unknown mode, disabling legacy during a pending page load, native control delegation and Markdown/image coexistence. This is not evidence of the real signed-in V2EX form structure.
 
 The dependency-free checks cover syntax, active-page replacement, required cross-page ancestors, duplicate rendering, rapid page 1 → page 2 → page 1 switching, delayed callback rejection, original-view restoration, and thanks state handling:
 
