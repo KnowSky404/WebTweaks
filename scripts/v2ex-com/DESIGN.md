@@ -31,7 +31,7 @@ For soft navigation, the native `.page_current` marker is used only as a DOM-rea
 
 Reply-thanks behavior was inspected on 2026-10-28 through [V2EX's public JavaScript bundle](https://www.v2ex.com/assets/59f307c984101a2d28ff6b4081507694a69c3114-combo.js?t=1793153400) and [currency documentation](https://www.v2ex.com/help/currency). The bundle's `thankReply(replyId)` posts to `/thank/reply/<reply-id>?once=<current-token>`, replaces the native `thank_area_<reply-id>` contents on success, updates the page's `once`, and calls `refreshMoney()`. It does not return the request or update the displayed heart count. Public anonymous HTML exposes counts but no authenticated thanks action. These observations justify the narrow adapter below; they do not establish authenticated userscript compatibility, which still needs live-site validation.
 
-## Native-first policy (1.8.0)
+## Native-first policy (1.8.x)
 
 The [official reply-thread help](https://edge.v2ex.com/help/reply-threads) documents seven display modes and actual parent relationships created by the native reply control. The [official Markdown help](https://www.v2ex.com/help/markdown#reply) documents native Markdown for new replies. The old relationship engine remains an explicit fallback, not an alternative default renderer.
 
@@ -53,7 +53,7 @@ Handlers resolve `runtime.topic` at activation and verify `isCurrentTopic`; they
 
 The public 2026-11-13 V2EX bundle implements `setupAjaxReplyForm`: it fetches the new source page, replaces the children of `#topic-replies`, and calls `history.replaceState` with the new reply fragment. A narrow observer therefore watches that stable list, rather than only the inner `.box` that V2EX replaces. Legacy/fixture lists fall back to the first native reply's parent. Native appends merge new IDs into the active relationship model, preserve operation state, recompute its visible projection, and scan new image content. A removed native list/threaded container schedules normal lifecycle synchronization even when the URL/page has not changed.
 
-A separate temporary observer can initialize an empty `#topic-replies` when the first reply arrives. Both observers disconnect on disposal/navigation; there is no polling, submit interception, or timeout pretending that a reply succeeded. Existing page/revision guards reject stale work. The custom renderer's own mutations are ignored. Browser fixtures cover both appends and replacement of the entire inner `.box`.
+An existing empty `#topic-replies` is a valid readiness target on the first page (or a page with a matching explicit pagination marker); missing lists and mismatched markers are not. This lets policy changes reach `initializeTopic` before the first reply. Its temporary list observer captures the topic key, navigation revision and observer identity, rechecks the active legacy policy and page readiness before scheduling reconstruction, and ignores stale callbacks. Both observers disconnect on disposal/navigation; there is no polling, submit interception, or timeout pretending that a reply succeeded. Existing page/revision guards reject stale work. The custom renderer's own mutations are ignored. Browser fixtures cover both appends and replacement of the entire inner `.box`.
 
 ## Reply model and parsing
 
@@ -172,6 +172,8 @@ The former per-branch and global branch-state machinery has been removed. The pa
 Other pages are fetched from `location.origin` with same-origin credentials. At most three page GET requests run concurrently; each has a timeout and one retry for network/abort or 5xx failures. This read retry policy is not used for thanks writes. Up to 10 pages load automatically. Each reply uses only its own sanitized controls. Missing/unrecognized actions remain unavailable; a native floor left outside a recognized group is retained. No number is generated from a reply ID. Larger topics remain partial until the panel's explicit full-load button is activated. Results are merged by reply ID into `topic.allReplies`, relationships are recalculated globally, and `deriveVisibleThread(topic)` projects only the active native page plus required ancestors before the custom tree is rendered. Any partial failure reports in the panel and switches to the original reply list so the user never receives an invisibly empty topic. An async page load applies results only while its topic identity, URL key, `currentPage`, and monotonic navigation revision still match the live runtime topic; a stale load is discarded rather than changing view or page state after navigation. Navigation synchronization is coalesced, but every distinct topic/page transition advances the revision synchronously, so a page 1 → page 2 → page 1 sequence cannot make the original page-1 snapshot current again.
 
 ## Client-side image enhancement
+
+Markdown exclusions are scoped to the current `.reply_content` or `.topic_content` using `hasContentAncestor`. A surrounding V2EX layout table is not a Markdown table; ordinary linked and bare image URLs remain eligible. Internal tables, code and quoted content are excluded.
 
 Display enhancement is a separate browser-only stage: V2EX server content and submission behavior are unchanged, and users without WebTweaks retain the original URL/content.
 

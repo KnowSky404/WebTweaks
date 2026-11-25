@@ -700,7 +700,7 @@
           record('返回顶部在页首和滚动后均常显，点击与设置开关正常且不重复创建', true);
 
           // Markdown and linked image behavior in a legacy session.
-          const markdown = { id: '216', floor: 116, page: 2, author: 'Markdown', content: '<blockquote>@<a href="/member/d">D</a> #101 quoted text</blockquote><ul><li><input type="checkbox" disabled checked>done</li><li><input type="checkbox" disabled>todo</li></ul><pre><code>https://images.example/code.png</code></pre><a href="https://images.example/full.png"><img src="https://images.example/thumb.png" alt="native linked image"></a>', count: null, canThank: false };
+          const markdown = { id: '216', floor: 116, page: 2, author: 'Markdown', content: '<blockquote>@<a href="/member/d">D</a> #101 quoted text</blockquote><ul><li><input type="checkbox" disabled checked>done</li><li><input type="checkbox" disabled>todo</li></ul><pre><code>https://images.example/code.png</code></pre><p><a href="https://images.example/ordinary-link.png">ordinary link</a></p><p>https://images.example/ordinary-text.png</p><table><tbody><tr><td><a href="https://images.example/table-link.png">table link</a> https://images.example/table-text.png</td></tr></tbody></table><a href="https://images.example/full.png"><img src="https://images.example/thumb.png" alt="native linked image"></a>', count: null, canThank: false };
           state.replies.set(markdown.id, markdown);
           const markdownHolder = document.createElement('div');
           markdownHolder.innerHTML = renderPage(2);
@@ -712,6 +712,23 @@
           check(!markdownClone.querySelector('.wt-v2ex-relation'), 'quoted text became a false reply relationship');
           check(!markdownClone.querySelector('pre .wt-v2ex-inline-image') && !markdownClone.querySelector('a img.wt-v2ex-lightbox-target'), 'code or native linked image was intercepted');
           record('Markdown 任务列表、代码块、引用与原生图片链接兼容', true);
+          const checkScopedPreviews = (content) => {
+            check(content.closest('table'), 'fixture does not reproduce V2EX outer layout table');
+            const previews = [...content.querySelectorAll('.wt-v2ex-inline-image')].map((image) => image.dataset.wtV2exImageUrl).sort();
+            check(previews.length === 2 && previews[0].endsWith('/ordinary-link.png') && previews[1].endsWith('/ordinary-text.png'), 'normal image link or bare URL was suppressed by the outer layout table, or protected content expanded');
+            check(!content.querySelector('table .wt-v2ex-inline-image, pre .wt-v2ex-inline-image, blockquote .wt-v2ex-inline-image'), 'protected Markdown content gained an image preview');
+          };
+          // Rebuild generated previews synchronously from both content trees.
+          const previewToggle = document.querySelector('[data-setting="imagePreviewEnabled"]');
+          if (previewToggle.checked) previewToggle.click();
+          previewToggle.click();
+          checkScopedPreviews(document.querySelector('#r_216 .reply_content'));
+          checkScopedPreviews(markdownClone.querySelector('.reply_content'));
+          selectMode('native');
+          if (previewToggle.checked) previewToggle.click();
+          previewToggle.click();
+          checkScopedPreviews(document.querySelector('#r_216 .reply_content'));
+          record('原生及历史楼中楼均展开外层布局表格中的普通图片 URL，仅跳过正文内 Markdown 表格', true);
 
           // All six enhanced official modes, and unknown, must prevent legacy activation.
           for (const label of ['引用条', '角标 + 悬浮预览', '楼中楼', '树形缩进', '对话连线', '引用楼层', null]) {
@@ -742,6 +759,48 @@
           await delay(500);
           check(!document.querySelector('.wt-v2ex-threaded-view') && !untouched.classList.contains('wt-v2ex-native-hidden'), 'late load revived a disabled legacy view');
           record('切换原生模式取消分页、恢复 DOM，过期响应不能重新激活', true);
+
+          // Reproduce enabling legacy/fallback on an existing empty topic.
+          for (const policy of ['legacy', 'auto']) {
+            selectMode('native');
+            history.pushState({}, '', '/t/42?p=1');
+            const firstReplyHolder = document.createElement('div');
+            firstReplyHolder.innerHTML = renderPage(1);
+            const first = firstReplyHolder.querySelector('#r_101');
+            const main = document.querySelector('#Main');
+            main.innerHTML = '<div id="topic-replies"><div class="box"></div></div>';
+            const before = topicReads().length;
+            if (policy === 'legacy') selectMode('legacy');
+            else {
+              selectMode('auto');
+              const fallback = document.querySelector('[data-setting="legacyFallbackEnabled"]');
+              if (!fallback.checked) fallback.click();
+            }
+            await waitFor(() => document.querySelector('.wt-v2ex-thread-status').textContent.includes('等待第一条'), 'empty topic did not initialize a first-reply observer');
+            await delay(2_100); // beyond the old DOM-readiness timeout
+            check(!document.querySelector('.wt-v2ex-threaded-view') && topicReads().length === before, 'empty topic built a premature view or fetched pages');
+            const box = main.querySelector('#topic-replies .box');
+            box.append(first);
+            await waitFor(() => card('101') && !document.querySelector('.wt-v2ex-threaded-view').hidden, 'first reply did not start the opted-in legacy view');
+            check(document.querySelectorAll('.wt-v2ex-threaded-view').length === 1, 'first reply created duplicate views');
+            selectMode('native');
+            check(!document.querySelector('.wt-v2ex-threaded-view') && !first.classList.contains('wt-v2ex-native-hidden'), 'native mode did not restore first reply');
+          }
+          record('空主题启用历史楼中楼或自动回退后，首条回复无需刷新即可初始化', true);
+
+          // Turning native-only back on before the first reply must cancel the observer.
+          const emptyMain = document.querySelector('#Main');
+          const disabledFixtureHolder = document.createElement('div');
+          disabledFixtureHolder.innerHTML = renderPage(1);
+          emptyMain.innerHTML = '<div id="topic-replies"><div class="box"></div></div>';
+          selectMode('legacy');
+          await waitFor(() => document.querySelector('.wt-v2ex-thread-status').textContent.includes('等待第一条'), 'empty observer did not start');
+          selectMode('native');
+          const readsBeforeFirst = topicReads().length;
+          emptyMain.querySelector('#topic-replies .box').append(disabledFixtureHolder.querySelector('#r_101'));
+          await delay(100);
+          check(!document.querySelector('.wt-v2ex-threaded-view') && topicReads().length === readsBeforeFirst, 'disabled empty observer revived legacy view');
+          record('停用会话后，首条回复不会重新激活历史楼中楼', true);
 
           check(state.calls.filter((call) => call.method === 'POST').every((call) => call.credentials === 'same-origin'), 'some write requests omitted same-origin credentials');
           document.body.dataset.fixtureState = 'passed';
