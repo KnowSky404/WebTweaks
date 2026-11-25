@@ -1,6 +1,6 @@
 # V2EX Conversation Enhancer
 
-`conversation-enhancer.user.js` is a standalone Tampermonkey/Violentmonkey userscript for V2EX. It adds a conservative threaded view for cross-page replies, reply thanks and their counts, browser-side image previews and a lightbox, and an accessible scroll-to-top button. The native V2EX reply list remains in the document as a fallback.
+`conversation-enhancer.user.js` is a standalone Tampermonkey/Violentmonkey userscript for V2EX. It prioritizes V2EX's native reply-thread layouts and Markdown editor, while retaining optional historical cross-page conversation reconstruction, image enhancements, and an accessible scroll-to-top button. Native functionality is the default.
 
 ## Installation
 
@@ -10,7 +10,23 @@ The script matches `https://v2ex.com/*` and `https://*.v2ex.com/*`. Thread recon
 
 ## Features
 
-### Threaded replies
+### Native-first compatibility (1.8.0)
+
+V2EX now records actual reply relationships when a user activates the native reply button and provides seven [native display modes](https://edge.v2ex.com/help/reply-threads), as well as [Markdown replies](https://www.v2ex.com/help/markdown#reply). WebTweaks does not render Markdown again or change the site's own configuration.
+
+The unified lower-right settings panel offers three conversation policies:
+
+- **自动适配（官方优先）** (default): leaves the native layout and editor intact. Enable **平铺时允许历史会话增强** to opt into the legacy reconstruction only when the official preference and reply structure are confirmed compatible.
+- **仅使用官方视图**: does not parse or clone replies, create a threaded container, fetch other reply pages, or attach conversation observers. Switching to this mode disposes an active legacy session and aborts its reads.
+- **WebTweaks 历史楼中楼**: explicitly requests the previous heuristic view. It is still blocked unless the official setting is recognized as classic flat mode and the replies are flat, unique and ordered.
+
+When legacy reconstruction is requested, the script makes a read-only same-origin GET to `/settings`, inspects the actual selected option associated with the documented Chinese label **楼中楼显示方式**, and keeps only the classification for the current topic lifecycle. The response is not stored, logged, transmitted, or changed; redirects, missing/ambiguous fields, unknown labels, and incompatible DOM fail closed. There is no settings request in default auto or native-only mode. The exact authenticated V2EX field structure and localized labels have not yet been verified in a signed-in browser: legacy mode may deliberately remain unavailable until a recognizable settings form is present. The native settings link is available in the panel.
+
+On upgrade from settings schema 3, `original` becomes `native` and `threaded` becomes `auto`; existing image and scroll switches survive. New installations use auto with legacy fallback off. Temporary original-page preview remains available only inside a running legacy session; it is not the same as native-only mode.
+
+Native Markdown, code highlighting, task lists, preview, submit, reply targets, thanks, hide, pagination and Block behavior are owned by V2EX in native mode. In legacy mode, safe task-list checkboxes are recreated as disabled controls in sanitized clones; quoted/code blocks are not treated as leading reply prefixes, and live native reply actions are invoked rather than generating textual mentions.
+
+### Optional historical threaded replies
 
 The script parses the rendered reply HTML, discovers actual V2EX pagination links, and fetches other pages from the current V2EX origin with same-origin credentials. Fetched pages extend the in-memory relationship dataset; they do not replace the active native page's rendering scope. A relationship is shown as:
 
@@ -19,20 +35,20 @@ The script parses the rendered reply HTML, discovers actual V2EX pagination link
 - **unresolved** (`关系未确定`): an explicit floor is invalid, multiple leading users make the parent ambiguous, or no earlier matching author exists;
 - **root**: no structural reply prefix was found.
 
-V2EX does not expose a reliable public parent-reply identifier. Inferred relationships are therefore a heuristic, not a guarantee. Replies are never discarded when inference fails. The visual indentation is capped while the logical tree remains intact, and rendering uses an iterative stack so unusually deep content does not require recursive JavaScript calls.
+The historical engine does not consume V2EX's official parent-reply data. Its inferred relationships remain a heuristic, not a guarantee; the native relationship system always takes precedence when a non-flat mode is selected. Replies are never discarded when inference fails. The visual indentation is capped while the logical tree remains intact, and rendering uses an iterative stack so unusually deep content does not require recursive JavaScript calls.
 
 For topics of up to 10 pages, the script loads the remaining pages automatically with at most three concurrent requests. These read-only page requests have a timeout and may be retried once for a transient/network or 5xx failure. Progress is shown in the lower-right settings panel, and partial failures leave the native list available. Topics over 10 pages are not fetched in full automatically; use `加载全部 N 页并构建楼中楼` when desired. In either case, threaded mode shows every reply from the active native page plus only the ancestor chain needed to explain cross-page relationships; unrelated earlier-page and future-page replies remain hidden. History API topic transitions carry a monotonic revision, so a delayed load from an older page cannot become current again after a rapid return to the same URL.
 
 The lower-right `设置` entry opens a single, non-modal settings panel, available even when scroll-to-top is disabled. It is closed by default and closes with Escape, an outside click, focus leaving the dock, or topic navigation. Opening focuses its first available control without scrolling; Escape returns focus to the settings button. The open state is not persisted. The panel fits narrow viewports and supports light/dark themes.
 
-Its **会话视图** section appears only when a topic has usable replies, with loading status, the optional full-page loading action, and two mutually exclusive view choices:
+On a topic, the **会话视图** section exposes the conversation policy and status. When a legacy session is active, it additionally exposes the optional full-page loading action and two temporary preview choices:
 
 - **楼中楼**: shows the inferred hierarchy in a custom container. All loaded pages contribute to relationship inference, while the visible projection contains every reply from the active native page plus only the required cross-page ancestors. Exact and inferred children appear beneath their detected parent; unresolved replies remain roots. Children are rendered iteratively with capped visual indentation and a guide line, with no per-branch state.
-- **原始顺序**: hides the custom container and restores V2EX's flat chronological reply list. The native floor, reply action, event behavior, and `aria-hidden` state are restored; switching views does not refetch or rebuild the threaded model. Confirmed thanks state is synchronized between the two views.
+- **临时原页预览**: hides the legacy container and restores V2EX's flat chronological list and prior accessibility attributes, without refetching the legacy model. Select **仅使用官方视图** for complete disposal. Confirmed thanks state is synchronized between the two previews.
 
 Threaded replies reuse sanitized clones of V2EX's native `.cell` and `.reply_content`. Public HTML inspected on 2026-11-13 uses a `.flex-one-row` header with separate author/badges/time/count and action/floor groups. The script keeps that structure and the native `.no` floor element in its original position; older `.fr` groups remain supported. Previously, `.fr`-only extraction failed on the new header, and cleanup deleted the surviving floor before inserting an empty legacy group.
 
-Each reply supplies its own controls. Recognition uses V2EX-owned reply image assets, native action classes, or a narrowly inspected `replyOne(...)` handler within the header. Sanitized clones preserve native classes, image sources/dimensions, text, wrappers, and spacing. Delegation inserts `@username #floor ` into the editor with focus, selection, and an input event. No reply action or floor is borrowed from another reply or fabricated from an ID. Unrecognized controls remain unavailable, and an untrustworthy floor is omitted. Original mode keeps V2EX's own handlers unchanged. Relationship labels remain separate from native controls.
+Each reply supplies its own controls. Recognition uses V2EX-owned reply image assets, native action classes, or a narrowly inspected `replyOne(...)` handler within the header. Sanitized clones preserve native classes, image sources/dimensions, text, wrappers, and spacing. Delegation restores the live native list and invokes the exact matching current-page native control once, leaving official reply-target and editor behavior to V2EX. Cross-page ancestors link to the source reply's actual `r_` anchor. No reply action or floor is borrowed from another reply or fabricated from an ID. Unrecognized controls remain unavailable, and an untrustworthy floor is omitted. Original mode keeps V2EX's own handlers unchanged. Relationship labels remain separate from native controls.
 
 New native replies are merged by ID and projected into the existing hierarchy. A list-scoped observer also detects V2EX's current `#topic-replies.replaceChildren(...)` refresh, including replacement of its inner `.box`, and rebuilds the disposed model using existing navigation guards. Empty topic lists can initialize when the first native reply arrives. No submission is intercepted, no phantom reply is generated, and no polling is used.
 
@@ -54,9 +70,9 @@ Version 1.7.0 restores V2EX's native **隐藏** control when the active-page rep
 
 Hiding suppresses the selected reply's own header/content in both views and retains its child discussion. Hidden state survives redraws and soft navigation for this document. Original-view hiding remains native and is reflected when switching views. V2EX's helper hides optimistically and exposes no server result; WebTweaks does not claim server confirmation or retry automatically. Account persistence after reload depends on V2EX accepting its native request.
 
-### Reply prefixes
+### Reply targets
 
-The preserved native-looking reply action inserts `@username #floor` at the current selection and focuses a supported reply editor. The threaded-view delegation prevents the detached clone's default navigation and reuses the existing prefix path. Original mode leaves the native action unchanged. If the current authenticated DOM does not expose a reliable native action, native behavior is left untouched.
+The legacy reply action restores the native list and dispatches the matching live V2EX control. Cross-page replies link to their own source page instead. The userscript never synthesizes an `@username #floor` prefix or official association; if the live control is unavailable it only reveals the native reply.
 
 ### Client-side image previews and lightbox
 
@@ -64,9 +80,9 @@ Topic and reply content is scanned locally for HTTP(S) image links ending in `.j
 
 The original URL or link remains in the V2EX content. WebTweaks inserts a lazy, asynchronously decoded `.wt-v2ex-inline-image` after it with `referrerpolicy="no-referrer"`. Initial scanning plus threaded-render and soft-navigation hooks cover topic content, native replies, threaded clones, and cross-page results; view switching reuses those already processed nodes. Per-link and per-container markers prevent duplicate previews, and a failed generated image is removed while its original link remains.
 
-Clicking an image inside `.topic_content` or `.reply_content` opens a dependency-free fullscreen lightbox. This includes existing external images and generated previews, but excludes avatars and interface icons outside content. A supported image URL wrapping an existing thumbnail is used as its full-size source. Escape, the close button, or the overlay background closes it; keyboard activation, focus return, an original-image link, and exact background scroll-position restoration are supported. Ctrl, Cmd, Shift, and Alt clicks retain normal browser behavior.
+Clicking a prepared, non-interactive image inside `.topic_content` or `.reply_content` opens a dependency-free fullscreen lightbox. Images inside links, buttons, or recognized native interaction controls, avatars, and interface icons are left alone; an already prevented event is never intercepted. Generated images remain eligible. Escape, the close button, or the overlay background closes it; keyboard activation, focus return, an original-image link, and exact background scroll-position restoration are supported. Ctrl, Cmd, Shift, and Alt clicks retain normal browser behavior.
 
-Both features default to enabled. The settings panel’s **图片增强** group has **评论图片自动展开** and **图片点击放大** switches. Disabling previews removes only generated images and leaves original links; disabling the lightbox removes only attributes owned by WebTweaks. Repeated toggles apply immediately without duplicating listeners or images.
+Both features default to enabled. Existing native image markup and linked images are not re-rendered; image auto-expansion skips code, quotes, tables, editor content, and recognized interactive links. The settings panel’s **图片增强** group has **评论图片自动展开** and **图片点击放大** switches. Disabling previews removes only generated images and leaves original links; disabling the lightbox removes only attributes owned by WebTweaks. Repeated toggles apply immediately without duplicating listeners or images.
 
 Images are loaded directly from the original image host. WebTweaks does not track viewed images. V2EX server content is unchanged, and users without this script continue to see the original URL/content.
 
@@ -87,6 +103,8 @@ The panel reuses the existing `wt-v2ex-settings` GM storage and version-3 keys w
 
 ## Maintainer validation
 
+Run `node scripts/v2ex-com/validate-native-compatibility.mjs` for policy, migration, semantic mode detection and cancellation checks. The browser fixture uses synthetic official mode settings; it checks all seven mode labels, unknown mode, disabling legacy during a pending page load, native control delegation and Markdown/image coexistence. This is not evidence of the real signed-in V2EX form structure.
+
 The dependency-free checks cover syntax, active-page replacement, required cross-page ancestors, duplicate rendering, rapid page 1 → page 2 → page 1 switching, delayed callback rejection, original-view restoration, and thanks state handling:
 
 ```bash
@@ -104,7 +122,7 @@ Fixture results are separate from authenticated V2EX verification. Real signed-i
 - A reply containing only an ambiguous `@username` cannot guarantee a hierarchy; the UI marks that relationship inferred or unresolved rather than presenting it as fact.
 - Current public HTML uses `.cell[id^="r_"]` inside `#topic-replies .box`, with a Flex header and `.no`, `strong > a.dark[href^="/member/"]`, `.ago[title]`, `.reply_content`, and `.ps_container` pagination. These selectors may need maintenance after another redesign. Authenticated controls remain conservatively detected from each reply's own header; unknown markup fails closed.
 - Public anonymous pages do not expose the reply textarea or native reply button. The script uses defensive candidates (`#reply_content`, `#topic_content`, `textarea[name="content"]`) for reply-prefix behavior; authenticated editor behavior still needs browser verification.
-- A topic with more than 10 pages is intentionally partial until the user starts the full load. If a page fails, switch to `原始顺序` to use the native list.
+- In an opted-in compatible legacy session, a topic with more than 10 pages is intentionally partial until the user starts the full load. If a page fails, use the temporary original-page preview or native-only policy.
 - External preview availability, hotlink protection, CSP, and host-side blocking remain controlled by the original image host. Failed generated previews are removed and leave the original URL usable.
 - Direct reply thanks requires recognized native controls and current page-context access. Unknown outcomes are never silently retried. Cross-page ancestors use their source-page thanks link.
 - This version does not implement V2EX submission, moderation, topic thanks, or image compression.
@@ -119,6 +137,6 @@ Fixture results are separate from authenticated V2EX verification. Real signed-i
 
 回复或主题正文中的 HTTP(S) 图片链接会在浏览器侧自动展开，支持 JPG、JPEG、PNG、GIF、WebP 和 AVIF；原始链接与 V2EX 服务端内容不会被修改。点击正文图片可打开全屏预览，Escape、关闭按钮或点击遮罩空白处可以关闭，按住 Ctrl/Cmd/Shift/Alt 点击时保留浏览器原行为。图片直接由原始图片站点加载，WebTweaks 不跟踪查看记录。
 
-所有匹配页面右下角统一使用“设置”入口，面板默认关闭；Escape、点击外部或主题导航均可关闭，Escape 会把焦点还给设置按钮。主题页的“会话视图”提供互斥的“楼中楼 / 原始顺序”、分页加载状态与手动加载按钮；非主题页隐藏不可用的会话操作。“图片增强”包含“评论图片自动展开 / 图片点击放大”，“页面工具”包含“返回顶部”，均即时生效并沿用原有 GM 偏好。关闭返回顶部仍可打开设置，不再提供重复的脚本菜单开关。异步提交后新增或整体刷新回复列表时，会按当前分页更新线程，不接管提交或生成虚构回复。
+所有匹配页面右下角统一使用“设置”入口，面板默认关闭；Escape、点击外部或主题导航均可关闭，Escape 会把焦点还给设置按钮。主题页的“会话视图”提供“自动适配（官方优先）/ 仅使用官方视图 / WebTweaks 历史楼中楼”；仅在确认官方经典平铺且结构兼容时允许启用历史楼中楼。默认不重建会话、不额外请求分页；历史会话运行时才提供临时原页预览、分页加载状态与手动加载按钮。非主题页隐藏会话操作。“图片增强”包含“评论图片自动展开 / 图片点击放大”，“页面工具”包含“返回顶部”，均即时生效并沿用原有 GM 偏好。关闭返回顶部仍可打开设置，不再提供重复的脚本菜单开关。异步提交后新增或整体刷新回复列表时，会按当前分页更新线程，不接管提交或生成虚构回复。
 
 1.7.0 恢复回复旁边原生的“隐藏”：只对当前页具有自身原生入口的回复开放，确认后调用网站原生功能；取消不发送，隐藏父回复时保留其下的讨论。隐藏状态在本次文档的重绘和软导航中保留，但原生接口不返回服务端结果，刷新后是否持久生效取决于网站请求是否成功。返回顶部开启后始终展示，位于页首也不再自动隐藏；仍可在设置中关闭。

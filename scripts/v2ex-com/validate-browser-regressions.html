@@ -73,6 +73,8 @@
         moneyRefreshes: 0,
         serverOnce: 1000,
         maxPage: 2,
+        nativeModeLabel: '经典平铺',
+        replyCalls: [],
         holdInitialPageTwo: true,
         releaseInitialPageTwo: null,
         pageDelay: new Map([[1, 40], [2, 450]])
@@ -84,7 +86,7 @@
         const ignore = reply.canHide ? `<a class="thank ignore" href="#;" onclick="if (confirm('确定隐藏这条回复吗？')) { ignoreReply(${reply.id}, 'fixture-${reply.id}'); } return false;">隐藏</a>` : '';
         const area = reply.canThank === false && !reply.ignoreInside ? '' : `<span id="thank_area_${reply.id}" class="thank_area${reply.thanked ? ' thanked' : ''}">${reply.thanked ? '感谢已发送' : (reply.ignoreInside ? ignore + ' &nbsp; ' : '') + (reply.canThank === false ? '' : `<a class="thank" href="#" onclick="if (confirm('发送感谢？')) { thankReply(${reply.id}); } return false;">感谢</a>`)}</span>`;
         const hide = reply.ignoreInside ? '' : ignore;
-        const arrow = reply.id === '210' ? '' : reply.id === '211' ? '<a class="reply" href="#reply">原生回复</a>' : `<a class="reply" href="#reply"><img src="${replyAsset}" alt="Reply" width="20" align="absmiddle" border="0"></a>`;
+        const arrow = reply.id === '210' ? '' : `<a class="reply" href="#reply" onclick="fixtureReply('${reply.id}'); return false;">${reply.id === '211' ? '原生回复' : `<img src="${replyAsset}" alt="Reply" width="20" align="absmiddle" border="0">`}</a>`;
         const count = reply.count === null || reply.count === 0 ? '' : `<span class="small fade flex-one-row gap5"><img src="${heartAsset}" width="14" align="absmiddle" alt="❤️"> ${reply.count}</span>`;
         const actions = `${hide}${area} &nbsp; ${arrow} &nbsp; &nbsp; <span class="no">${reply.floor}</span>`;
         const controls = reply.id === '205' ? `<span class="fixture-native-wrapper">${actions}</span>` : actions;
@@ -115,6 +117,7 @@
           reply.count = (reply.count || 0) + 1;
         }
       };
+      localStorage.setItem('wt-v2ex-settings', JSON.stringify({ version: 4, conversationMode: 'auto', legacyFallbackEnabled: false, scrollTopEnabled: true, imagePreviewEnabled: true, imageLightboxEnabled: true }));
       window.GM_getValue = (key, fallback) => JSON.parse(localStorage.getItem(key) || 'null') || fallback;
       window.GM_setValue = (key, value) => localStorage.setItem(key, JSON.stringify(value));
       window.GM_addStyle = (css) => {
@@ -138,12 +141,23 @@
         if (cell) cell.style.display = 'none';
       };
       window.refreshMoney = () => { state.moneyRefreshes += 1; };
+      window.fixtureReply = (id) => {
+        state.replyCalls.push(String(id));
+        const editor = document.querySelector('#reply_content');
+        editor.dataset.nativeParentId = String(id);
+        editor.focus();
+      };
       window.fetch = async (input, options = {}) => {
         const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
         const method = String(options.method || input?.method || 'GET').toUpperCase();
         if (url.origin !== location.origin) throw new Error(`fixture blocked external request: ${url.origin}`);
         const call = { method, pathname: url.pathname, search: url.search, credentials: options.credentials };
         state.calls.push(call);
+        options.signal?.addEventListener('abort', () => { call.aborted = true; }, { once: true });
+        if (method === 'GET' && url.pathname === '/settings') {
+          const body = state.nativeModeLabel === null ? '<p>settings not available</p>' : `<label for="fixture-native-mode">楼中楼显示方式</label><select id="fixture-native-mode"><option selected>${escapeHtml(state.nativeModeLabel)}</option></select>`;
+          return new Response(body, { headers: { 'content-type': 'text/html' } });
+        }
         if (method === 'POST') {
           const id = url.pathname.match(/^\/thank\/reply\/(\d+)$/)?.[1];
           if (!id) throw new Error(`fixture blocked unexpected POST: ${url.pathname}`);
@@ -244,6 +258,13 @@
         check(button, `view button missing: ${view}`);
         button.click();
       };
+      const selectMode = (mode) => {
+        const panel = document.querySelector('.wt-v2ex-settings-panel');
+        if (panel.hidden) document.querySelector('.wt-v2ex-settings-toggle').click();
+        const input = panel.querySelector(`[data-mode="${mode}"]`);
+        if (!input.checked) input.click();
+      };
+      const topicReads = () => state.calls.filter((call) => call.method === 'GET' && call.pathname === '/t/42');
       const waitForThanked = async (id) => {
         await waitFor(() => nativeThanked(id) && !actionable(id) && status(id).trim() === '感谢已发送', `reply ${id} did not synchronize its confirmed thanked state`);
       };
@@ -274,6 +295,11 @@
         results.replaceChildren();
         runButton.disabled = true;
         try {
+          await waitFor(() => document.querySelector('.wt-v2ex-settings-panel'), 'settings did not initialize');
+          check(!document.querySelector('.wt-v2ex-threaded-view') && state.calls.length === 0, 'default auto mode touched legacy conversation or requested settings/pages');
+          check(document.querySelector('#r_101') && !document.querySelector('#r_101').classList.contains('wt-v2ex-native-hidden'), 'default mode hid native replies');
+          record('新安装默认原生优先且不读取配置或分页', true);
+          selectMode('legacy');
           await waitFor(() => card('101'), 'initial page-one projection did not initialize');
           await waitFor(() => state.releaseInitialPageTwo, 'initial page-two request did not begin');
           await goToPage(2, 60);
@@ -334,18 +360,20 @@
           record('感谢、计数、回复箭头和楼层的原生样式、尺寸及间距一致，楼中楼保留', true);
 
           const editor = document.querySelector('#reply_content');
+          const replyCallsBefore = state.replyCalls.length;
           card('201').querySelector('.wt-v2ex-native-reply-action').click();
-          check(editor.value === '@D #101 ' && document.activeElement === editor, 'preserved reply arrow did not insert and focus the expected reply prefix');
+          check(editor.dataset.nativeParentId === '201' && document.activeElement === editor && state.replyCalls.length === replyCallsBefore + 1, 'cloned action did not delegate once to the live native reply');
+          check(document.querySelector('.wt-v2ex-threaded-view').hidden, 'native reply target did not restore native view');
+          selectView('threaded');
           editor.value = 'before after';
           editor.setSelectionRange(7, 7);
-          let inputs = 0;
-          editor.addEventListener('input', () => { inputs += 1; }, { once: true });
-          card('211').querySelector('.wt-v2ex-native-reply-action').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
-          check(editor.value === 'before @M #111 after' && inputs === 1 && editor.selectionStart === 15, 'native text action lost selection or duplicated input');
+          card('211').querySelector('.wt-v2ex-native-reply-action').dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+          check(editor.dataset.nativeParentId === '211' && editor.value === 'before after' && state.replyCalls.length === replyCallsBefore + 2, 'keyboard activation did not delegate once without editing the draft');
+          selectView('threaded');
           check(card('211').querySelector('.wt-v2ex-native-reply-action').textContent === '原生回复', 'native text action was replaced');
           check(card('206').querySelector('.fixture-flex-wrapper .wt-v2ex-thank-action'), 'nested Flex action wrapper lost');
           editor.value = '';
-          record('保留的原生回复箭头仍插入准确的用户及楼层前缀', true);
+          record('克隆回复入口仅调用对应楼层的原生回复控件，保留草稿和关联身份', true);
 
           check(count('201') === 3 && count('203') === 4, 'existing thanks counts are missing or wrong');
           check(actionable('201'), 'eligible active-page reply has no usable thanks action');
@@ -479,13 +507,13 @@
           await goToPage(2, 30);
           await waitFor(() => document.querySelector('.wt-v2ex-thread-status')?.textContent.includes('当前线程投影'), 'page-two setup for the large-topic case did not finish');
           state.maxPage = 11;
-          const readsBeforeLargeTopic = state.calls.filter((call) => call.method === 'GET').length;
+          const readsBeforeLargeTopic = topicReads().length;
           await goToPage(1, 30, 'wt-v2ex-thank-102');
           await delay(80);
           check(document.querySelector('.wt-v2ex-threaded-view').hidden, 'large-topic source landing left both projections visible');
           check(!document.querySelector('#r_102').hasAttribute('aria-hidden'), 'large-topic source target remained inaccessible');
           check(document.activeElement?.closest('#thank_area_102'), 'large-topic source landing did not focus the native thanks control');
-          check(state.calls.filter((call) => call.method === 'GET').length === readsBeforeLargeTopic, 'a large topic fetched pages before explicit activation');
+          check(topicReads().length === readsBeforeLargeTopic, 'a large topic fetched pages before explicit activation');
           selectView('threaded');
           check(!document.querySelector('.wt-v2ex-threaded-view').hidden, 'large-topic source landing trapped explicit threaded selection');
           check([...document.querySelectorAll('#Main .cell[id^="r_"]')].every((node) => node.classList.contains('wt-v2ex-native-hidden')), 'large-topic explicit threaded selection duplicated visible native replies');
@@ -670,6 +698,50 @@
           scrollSetting.click();
           check(!scrollTop.hidden && document.querySelectorAll('.wt-v2ex-scroll-top').length === 1, 'scroll toggle duplicated the always-visible button');
           record('返回顶部在页首和滚动后均常显，点击与设置开关正常且不重复创建', true);
+
+          // Markdown and linked image behavior in a legacy session.
+          const markdown = { id: '216', floor: 116, page: 2, author: 'Markdown', content: '<blockquote>@<a href="/member/d">D</a> #101 quoted text</blockquote><ul><li><input type="checkbox" disabled checked>done</li><li><input type="checkbox" disabled>todo</li></ul><pre><code>https://images.example/code.png</code></pre><a href="https://images.example/full.png"><img src="https://images.example/thumb.png" alt="native linked image"></a>', count: null, canThank: false };
+          state.replies.set(markdown.id, markdown);
+          const markdownHolder = document.createElement('div');
+          markdownHolder.innerHTML = renderPage(2);
+          document.querySelector('#topic-replies .box').append(markdownHolder.querySelector('#r_216'));
+          await waitFor(() => card('216'), 'Markdown reply not projected');
+          const markdownClone = card('216');
+          const boxes = [...markdownClone.querySelectorAll('input[type="checkbox"]')];
+          check(boxes.length === 2 && boxes.every((box) => box.disabled) && boxes[0].checked && !boxes[1].checked, 'Markdown task list did not survive safe clone');
+          check(!markdownClone.querySelector('.wt-v2ex-relation'), 'quoted text became a false reply relationship');
+          check(!markdownClone.querySelector('pre .wt-v2ex-inline-image') && !markdownClone.querySelector('a img.wt-v2ex-lightbox-target'), 'code or native linked image was intercepted');
+          record('Markdown 任务列表、代码块、引用与原生图片链接兼容', true);
+
+          // All six enhanced official modes, and unknown, must prevent legacy activation.
+          for (const label of ['引用条', '角标 + 悬浮预览', '楼中楼', '树形缩进', '对话连线', '引用楼层', null]) {
+            selectMode('native');
+            state.nativeModeLabel = label;
+            const before = topicReads().length;
+            selectMode('legacy');
+            await waitFor(() => /自动避让|安全保留/.test(document.querySelector('.wt-v2ex-thread-status').textContent), 'mode check did not settle');
+            check(!document.querySelector('.wt-v2ex-threaded-view') && topicReads().length === before, 'non-flat/unknown setting initiated legacy reconstruction');
+            check([...document.querySelectorAll('#Main .cell[id^="r_"]')].every((node) => !node.classList.contains('wt-v2ex-native-hidden')), 'legacy disposal left native replies hidden');
+          }
+          record('六种官方增强模式及未知配置均阻止脚本接管', true);
+          selectMode('native');
+          state.nativeModeLabel = '经典平铺';
+          state.holdInitialPageTwo = true;
+          state.releaseInitialPageTwo = null;
+          history.pushState({}, '', '/t/42?p=1');
+          document.querySelector('#Main').innerHTML = renderPage(1);
+          const untouched = document.querySelector('#r_101');
+          untouched.setAttribute('aria-hidden', 'false');
+          selectMode('legacy');
+          await waitFor(() => state.releaseInitialPageTwo, 'legacy page read did not begin');
+          const pendingRead = topicReads().at(-1);
+          selectMode('native');
+          check(pendingRead.aborted && !document.querySelector('.wt-v2ex-threaded-view'), 'native-only mode did not cancel pending page load and remove the custom view');
+          check(untouched.getAttribute('aria-hidden') === 'false', 'native aria attribute was not preserved');
+          state.releaseInitialPageTwo();
+          await delay(500);
+          check(!document.querySelector('.wt-v2ex-threaded-view') && !untouched.classList.contains('wt-v2ex-native-hidden'), 'late load revived a disabled legacy view');
+          record('切换原生模式取消分页、恢复 DOM，过期响应不能重新激活', true);
 
           check(state.calls.filter((call) => call.method === 'POST').every((call) => call.credentials === 'same-origin'), 'some write requests omitted same-origin credentials');
           document.body.dataset.fixtureState = 'passed';
